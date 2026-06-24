@@ -1,0 +1,26 @@
+[package]
+name = "muna-server"
+version = "0.0.1"
+edition = "2021"
+description = "OpenAI-compatible HTTP server backed by a local Muna predictor (smollm2-360m)."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+axum = { version = "0.8.9", features = ["json"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
+dotenvy = "0.15.7"
+futures-util = "0.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1"
+muna = "0.0.11"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = true

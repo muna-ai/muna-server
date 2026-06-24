@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+
+# Virtual environments
+.venv
+
+# Build
+target/
+.cargo/
+
+# Environment variables
+.env*
+!.env.example
+
+# Rust
+target/
+
+# Misc
+.DS_Store
