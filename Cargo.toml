@@ -1,6 +1,6 @@
 [package]
 name = "muna-server"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "OpenAI-compatible HTTP server backed by a local Muna predictor (smollm2-360m)."
 license = "Apache-2.0"
