@@ -10,30 +10,17 @@ travels in each request's `model` field, so one server can serve any predictor o
 
 | Method | Path                   | Description                                              |
 | ------ | ---------------------- | -------------------------------------------------------- |
-| `GET`  | `/` , `/health`        | Health check (`{"status":"ok"}`).                        |
+| `GET`  |  `/health`             | Health check (`{"status":"ok"}`).                        |
 | `GET`  | `/v1/models`           | Lists models this process has loaded so far.             |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat completion (JSON or SSE stream).  |
+| `POST` | `/v1/embeddings`       | OpenAI-compatible embeddings.                            |
 
-## Setup
-
-The `muna` crate links a native `libFunction.so` (fetched by its `build.rs` from `cdn.fxn.ai`),
-so the binary needs that library reachable at runtime via `LD_LIBRARY_PATH`. Muna reads the
-access key from `$MUNA_ACCESS_KEY`.
+## Start the Server
 
 ```bash
-# Build (downloads libFunction.so into target/.../out/ as a side effect)
-cargo build
-
-# Point the loader at the bundled libFunction.so
-export LD_LIBRARY_PATH="$(dirname "$(find target -name libFunction.so | head -1)")"
-
 # Provide your Muna access key (or put it in a .env file)
-export MUNA_ACCESS_KEY=fxn_...
-```
+export MUNA_ACCESS_KEY=muna_***
 
-## Run
-
-```bash
 # Start the server (defaults to PORT=8000)
 cargo run -- serve
 
@@ -41,7 +28,7 @@ cargo run -- serve
 cargo run -- preload @huggingface/smollm2-360m
 ```
 
-## Request example
+## Creating Chat Completions
 
 The `model` field is the Muna predictor tag — e.g. `@huggingface/smollm2-360m`.
 
