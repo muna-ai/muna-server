@@ -89,6 +89,7 @@ async fn serve(port: u16) -> Result<(), String> {
         .route("/v1/models", get(handlers::models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/embeddings", post(handlers::embeddings))
+        .route("/predictions/remote", post(handlers::predictions))
         .fallback(handlers::not_found)
         .with_state(state);
 

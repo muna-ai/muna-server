@@ -767,6 +767,7 @@ name = "muna-server"
 version = "0.0.2"
 dependencies = [
  "axum",
+ "base64",
  "clap",
  "dotenvy",
  "futures-util",

@@ -2,12 +2,13 @@
 name = "muna-server"
 version = "0.0.2"
 edition = "2021"
-description = "OpenAI-compatible HTTP server backed by a local Muna predictor (smollm2-360m)."
+description = "OpenAI-compatible Muna inference server."
 license = "Apache-2.0"
 publish = false
 
 [dependencies]
 axum = { version = "0.8.9", features = ["json"] }
+base64 = "0.22.1"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 dotenvy = "0.15.7"
 futures-util = "0.3"
