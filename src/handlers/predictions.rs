@@ -9,13 +9,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use futures_util::StreamExt;
 use muna::c;
 use muna::types::{
     Acceleration, Dtype, Prediction, RemotePrediction,
@@ -23,9 +21,11 @@ use muna::types::{
 };
 use muna::MunaError;
 use serde::Deserialize;
-use serde_json::{json, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
-use crate::AppState;
+use super::error::AppError;
+use crate::serving::predict;
+use crate::state::AppState;
 
 /// Prediction request.
 #[derive(Deserialize)]
@@ -43,11 +43,16 @@ pub(crate) struct CreatePredictionRequest {
     stream: bool,
 }
 
-/// Create a prediction
+/// Create a prediction (routed control-plane traffic and raw clients).
+/// Non-streaming requests go through the dispatcher, so buffered models get
+/// cross-request batching here.
 pub(crate) async fn predictions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreatePredictionRequest>,
 ) -> Result<Response, AppError> {
+    if state.is_draining() {
+        return Err(AppError::unavailable("node is draining".into(), 30));
+    }
     let acceleration = local_acceleration(req.acceleration.as_ref());
     let tag = req.tag;
     // Parse each remote value input into a native value.
@@ -55,61 +60,56 @@ pub(crate) async fn predictions(
     for (name, remote) in &req.inputs {
         inputs.insert(name.clone(), parse_remote_value(remote)?);
     }
+    let model = state.registry.ensure_ready(&tag).await?;
+    state.check_in_if_due(&tag).await;
+    state.mark_model_loaded(tag.clone()).await;
     if req.stream {
-        stream_prediction(state, tag, inputs, acceleration).await
+        stream_prediction(state, tag, model, inputs, acceleration).await
     } else {
-        create_prediction(state, tag, inputs, acceleration).await
+        let prediction = state.dispatcher
+            .create(&tag, &model, inputs, acceleration)
+            .await?;
+        let remote = to_remote_prediction(prediction)?;
+        Ok(Json(remote).into_response())
     }
-}
-
-async fn create_prediction(
-    state: Arc<AppState>,
-    tag: String,
-    inputs: HashMap<String, Value>,
-    acceleration: Acceleration,
-) -> Result<Response, AppError> {
-    let _guard = state.predict_lock.clone().lock_owned().await;
-    let prediction = state
-        .muna
-        .predictions
-        .create(&tag, Some(inputs), Some(acceleration), None, None)
-        .await?;
-    mark_model_loaded(&state, tag).await;
-    let remote = to_remote_prediction(prediction)?;
-    Ok(Json(remote).into_response())
 }
 
 async fn stream_prediction(
     state: Arc<AppState>,
     tag: String,
+    model: Arc<crate::serving::registry::ReadyModel>,
     inputs: HashMap<String, Value>,
     acceleration: Acceleration,
 ) -> Result<Response, AppError> {
-    // Held for the whole Muna stream. Dropping the response body releases the guard.
-    let guard = state.predict_lock.clone().lock_owned().await;
-    let muna_stream = state
-        .muna
-        .predictions
-        .stream(&tag, inputs, Some(acceleration))
-        .await?;
-    mark_model_loaded(&state, tag.clone()).await;
-    let event_stream = muna_stream.map(move |result| {
-        let _guard = &guard;
-        let remote = match result {
-            Ok(prediction) => to_remote_prediction(prediction)
-                .unwrap_or_else(|e| error_prediction(&tag, &e.to_string())),
-            Err(e) => {
-                tracing::warn!("muna prediction stream error: {e}");
-                error_prediction(&tag, &e.to_string())
-            }
-        };
-        let data = serde_json::to_string(&remote).unwrap_or_default();
-        Ok::<Event, Infallible>(Event::default().event("prediction").data(data))
+    // Streams bypass batching (per-request token streams cannot merge);
+    // sequential models still hold their guard for the whole stream.
+    let guard = state.dispatcher.acquire(&tag, &model).await;
+    let muna = state.muna.clone();
+    let stream_tag = tag.clone();
+    let rx = predict::stream(move || async move {
+        muna.predictions.stream(&stream_tag, inputs, Some(acceleration)).await
     });
+    let event_stream = futures_util::stream::unfold(
+        (rx, guard, tag),
+        |(mut rx, guard, tag)| async move {
+            let result = rx.recv().await?;
+            let remote = match result {
+                Ok(prediction) => to_remote_prediction(prediction)
+                    .unwrap_or_else(|e| error_prediction(&tag, &e.to_string())),
+                Err(e) => {
+                    tracing::warn!("muna prediction stream error: {e}");
+                    error_prediction(&tag, &e.to_string())
+                }
+            };
+            let data = serde_json::to_string(&remote).unwrap_or_default();
+            let event = Event::default().event("prediction").data(data);
+            Some((Ok::<Event, Infallible>(event), (rx, guard, tag)))
+        }
+    );
     Ok(Sse::new(event_stream).into_response())
 }
 
-/// Map a requested acceleration onto a local one, mirroring `rpc.py`:
+/// Map a requested acceleration onto a local one:
 /// `remote_cpu` runs on the local CPU, everything else on the local GPU.
 fn local_acceleration(acceleration: Option<&Acceleration>) -> Acceleration {
     match acceleration {
@@ -145,7 +145,7 @@ fn error_prediction(tag: &str, message: &str) -> RemotePrediction {
     RemotePrediction {
         id: create_prediction_id(),
         tag: tag.to_string(),
-        created: now().to_string(),
+        created: crate::state::unix_now().to_string(),
         results: None,
         latency: None,
         error: Some(message.to_string()),
@@ -322,47 +322,10 @@ fn is_tensor_dtype(dtype: Dtype) -> bool {
     )
 }
 
-async fn mark_model_loaded(state: &AppState, model: String) {
-    let mut loaded_models = state.loaded_models.write().await;
-    loaded_models.entry(model).or_insert_with(now);
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn create_prediction_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("pred_{nanos}")
-}
-
-pub(crate) struct AppError {
-    status: StatusCode,
-    body: JsonValue,
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        (self.status, Json(self.body)).into_response()
-    }
-}
-
-impl From<MunaError> for AppError {
-    fn from(e: MunaError) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: json!({
-                "error": {
-                    "message": e.to_string(),
-                    "type": "muna_error",
-                }
-            }),
-        }
-    }
 }

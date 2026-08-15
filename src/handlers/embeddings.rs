@@ -4,18 +4,17 @@
 */
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use muna::beta::openai::EncodingFormat;
 use muna::types::Acceleration;
 use serde::Deserialize;
-use serde_json::{json, Value};
 
-use crate::AppState;
+use super::error::AppError;
+use crate::serving::predict;
+use crate::state::AppState;
 
 #[derive(Deserialize)]
 pub(crate) struct EmbeddingsRequest {
@@ -45,26 +44,28 @@ pub(crate) async fn embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbeddingsRequest>,
 ) -> Result<Response, AppError> {
-    let model = req.model;
+    if state.is_draining() {
+        return Err(AppError::unavailable("node is draining".into(), 30));
+    }
     let input = req.input.into_vec();
     let encoding_format = parse_encoding_format(req.encoding_format.as_deref())?;
-
-    let _guard = state.predict_lock.clone().lock_owned().await;
-    let response = state
-        .muna
-        .beta
-        .openai
-        .embeddings
-        .create(
+    let model = state.registry.ensure_ready(&req.model).await?;
+    state.check_in_if_due(&req.model).await;
+    state.mark_model_loaded(req.model.clone()).await;
+    let guard = state.dispatcher.acquire(&req.model, &model).await;
+    let muna = state.muna.clone();
+    let tag = req.model;
+    let dimensions = req.dimensions;
+    let response = predict::run(move || async move {
+        muna.beta.openai.embeddings.create(
             input,
-            &model,
-            req.dimensions,
+            &tag,
+            dimensions,
             encoding_format,
-            Some(Acceleration::LocalGpu),
-        )
-        .await?;
-    mark_model_loaded(&state, model).await;
-
+            Some(Acceleration::LocalGpu)
+        ).await
+    }).await?;
+    drop(guard);
     Ok(Json(response).into_response())
 }
 
@@ -76,56 +77,5 @@ fn parse_encoding_format(value: Option<&str>) -> Result<Option<EncodingFormat>, 
             "unsupported encoding_format `{value}`"
         ))),
         None => Ok(None),
-    }
-}
-
-async fn mark_model_loaded(state: &AppState, model: String) {
-    let mut loaded_models = state.loaded_models.write().await;
-    loaded_models.entry(model).or_insert_with(now);
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-pub(crate) struct AppError {
-    status: StatusCode,
-    body: Value,
-}
-
-impl AppError {
-    fn bad_request(message: String) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            body: json!({
-                "error": {
-                    "message": message,
-                    "type": "invalid_request_error",
-                }
-            }),
-        }
-    }
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        (self.status, Json(self.body)).into_response()
-    }
-}
-
-impl From<muna::MunaError> for AppError {
-    fn from(e: muna::MunaError) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: json!({
-                "error": {
-                    "message": e.to_string(),
-                    "type": "muna_error",
-                }
-            }),
-        }
     }
 }
