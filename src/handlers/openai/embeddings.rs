@@ -12,7 +12,7 @@ use muna::beta::openai::EncodingFormat;
 use muna::types::Acceleration;
 use serde::Deserialize;
 
-use super::error::AppError;
+use crate::handlers::error::AppError;
 use crate::serving::predict;
 use crate::state::AppState;
 

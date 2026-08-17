@@ -8,8 +8,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::routing::{get, post};
-use axum::Router;
 use clap::{Parser, Subcommand};
 use muna::types::Acceleration;
 use muna::Muna;
@@ -106,22 +104,7 @@ async fn serve(cli: &Cli) -> Result<(), String> {
         tokio::spawn(control::kv_relay::run(state.clone()));
         tracing::info!("control-plane mode: heartbeat + KV relay enabled");
     }
-    let app = Router::new()
-        // Health and management
-        .route("/", get(handlers::health))
-        .route("/health", get(handlers::health))
-        .route("/status", get(handlers::status))
-        .route("/drain", post(handlers::drain))
-        // Muna remote prediction
-        .route("/v1/predictions/remote", post(handlers::predictions))
-        // OpenAI compatibility
-        .route("/v1/models", get(handlers::models))
-        .route("/v1/chat/completions", post(handlers::chat_completions))
-        .route("/v1/embeddings", post(handlers::embeddings))
-        .route("/v1/images/generations", post(handlers::image_generations))
-        // Fallbacks
-        .fallback(handlers::not_found)
-        .with_state(state);
+    let app = handlers::router().with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
     let listener = tokio::net::TcpListener::bind(addr)

@@ -16,14 +16,16 @@ use muna::types::{BatchMode, Signature, Value};
 pub(crate) enum BatchPlan {
     /// No batch config on any input: one prediction at a time (with a per-model mutex).
     Sequential,
-    /// Static or dynamic batching: buffer into a queue, merge up to capacity.
+    /// Static or dynamic batching: buffer into a queue, merge up to capacity,
+    /// flush at capacity or deadline. The server never pads a partial batch --
+    /// it cannot know a valid pad value for opaque inputs. A predictor
+    /// compiled with a rigid batch shape must pad internally,
+    /// so both modes dispatch identically here.
     Buffered {
         /// Input parameters that are merged across requests.
         params: HashSet<String>,
         /// Maximum total item count across merged requests.
         capacity: usize,
-        /// Static mode: prefer waiting for a full batch before invoking.
-        wait_full: bool,
     },
     /// Continuous batching: submit concurrently, the compiled engine batches
     /// internally. No lock, ever.
@@ -52,19 +54,15 @@ impl BatchPlan {
             .filter_map(|p| p.batch.as_ref().and_then(|b| b.capacity))
             .min()
             .unwrap_or(1);
-        let wait_full = batched.iter().all(|p| {
-            p.batch.as_ref().is_some_and(|b| b.mode == BatchMode::Static)
-        });
-        Self::Buffered { params, capacity, wait_full }
+        Self::Buffered { params, capacity }
     }
 
     /// Wire name for status reporting.
     pub(crate) fn mode_name(&self) -> &'static str {
         match self {
-            Self::Sequential                        => "sequential",
-            Self::Buffered { wait_full: true, .. }  => "static",
-            Self::Buffered { wait_full: false, .. } => "dynamic",
-            Self::Continuous                        => "continuous",
+            Self::Sequential      => "sequential",
+            Self::Buffered { .. } => "buffered",
+            Self::Continuous      => "continuous",
         }
     }
 }
@@ -193,43 +191,35 @@ mod tests {
             param("dimensions", Dtype::Int32, None),
         ]);
         match BatchPlan::from_signature(&sig) {
-            BatchPlan::Buffered { params, capacity, wait_full } => {
+            BatchPlan::Buffered { params, capacity } => {
                 assert_eq!(params, HashSet::from(["texts".into(), "images".into()]));
                 assert_eq!(capacity, 32);
-                assert!(!wait_full);
             }
             other => panic!("expected Buffered, got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_all_static_waits_full() {
-        let sig = signature(vec![
+    fn plan_static_and_dynamic_derive_identical_plans() {
+        // Static and dynamic differ only in the compiled predictor's shape
+        // contract (a static predictor pads internally); the server
+        // dispatches both identically.
+        let static_sig = signature(vec![
             param("texts", Dtype::List, Some(BatchConfig {
                 mode: BatchMode::Static,
                 capacity: Some(4),
             })),
         ]);
-        match BatchPlan::from_signature(&sig) {
-            BatchPlan::Buffered { wait_full, .. } => assert!(wait_full),
-            other => panic!("expected Buffered, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn plan_mixed_static_dynamic_is_dynamic() {
-        let sig = signature(vec![
+        let dynamic_sig = signature(vec![
             param("texts", Dtype::List, Some(BatchConfig {
-                mode: BatchMode::Static,
-                capacity: Some(4),
-            })),
-            param("images", Dtype::List, Some(BatchConfig {
                 mode: BatchMode::Dynamic,
                 capacity: Some(4),
             })),
         ]);
-        match BatchPlan::from_signature(&sig) {
-            BatchPlan::Buffered { wait_full, .. } => assert!(!wait_full),
+        let static_plan = BatchPlan::from_signature(&static_sig);
+        assert_eq!(static_plan, BatchPlan::from_signature(&dynamic_sig));
+        match static_plan {
+            BatchPlan::Buffered { capacity, .. } => assert_eq!(capacity, 4),
             other => panic!("expected Buffered, got {other:?}"),
         }
     }

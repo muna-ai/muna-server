@@ -15,7 +15,7 @@ use muna::beta::openai::{ChatCompletionCreateParams, ChatCompletionMessage};
 use muna::types::Acceleration;
 use serde::Deserialize;
 
-use super::error::{muna_error_value, AppError};
+use crate::handlers::error::{muna_error_value, AppError};
 use crate::serving::predict;
 use crate::state::AppState;
 

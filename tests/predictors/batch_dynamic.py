@@ -7,9 +7,10 @@
 Dynamic batching probe.
 
 The `items` parameter carries `BatchConfig(mode="dynamic", capacity=4)`,
-so muna-server's `BatchPlan::from_signature` derives `Buffered` with 
-`wait_full: false`: requests are merged up to capacity or until the 
-flush deadline (100ms) elapses, whichever comes  first, then split back per caller.
+so muna-server's `BatchPlan::from_signature` derives
+`Buffered { capacity: 4 }`: requests are merged up to capacity or until
+the flush deadline (100ms) elapses, whichever comes first, then split
+back per caller.
 
 The predictor echoes each item (prefixed with the broadcast `prefix`
 param) into a dict stamped with the invocation's shared `start`/`end`

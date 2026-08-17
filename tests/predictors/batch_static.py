@@ -7,10 +7,12 @@
 Static batching probe.
 
 The `items` parameter carries `BatchConfig(mode="static", capacity=4)`,
-so muna-server's `BatchPlan::from_signature` derives 
-`Buffered { capacity: 4, wait_full }`: compatible concurrent requests
-are merged into one invocation and the list output is split back per
-caller by item count.
+so muna-server's `BatchPlan::from_signature` derives
+`Buffered { capacity: 4 }`: compatible concurrent requests are merged
+into one invocation and the list output is split back per caller by
+item count. Static and dynamic dispatch identically on the server --
+the server never pads a partial batch; a predictor compiled with a
+rigid batch shape must pad internally.
 
 The predictor echoes each item into a dict stamped with the invocation's
 shared `start`/`end` timestamps. Requests merged into the same batch
