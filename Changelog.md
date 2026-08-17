@@ -1,3 +1,6 @@
+## 0.0.4
+*INCOMPLETE*
+
 ## 0.0.3
 + Added support for OpenAI-compatible image generation at `/v1/images/generations`.
 + Added support for KV-aware routed compiled models.
