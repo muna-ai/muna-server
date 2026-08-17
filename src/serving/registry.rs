@@ -316,11 +316,16 @@ async fn load_model(
     muna: &Arc<Muna>,
     tag: &str
 ) -> Result<Signature, String> {
-    // Warmup sentinel: `{ "_": Null }` is the client convention for an
-    // actual engine load without a meaningful inference.
+    // Preload convention: create a prediction that deliberately excludes
+    // the predictor's required inputs. Loading the predictor runs all
+    // constructors and initializers (the actual engine load); the
+    // prediction itself then exits early on the missing argument, so
+    // `prediction.error` is expected and deliberately ignored. Genuine
+    // load failures (download, native predictor creation) surface as an
+    // `Err` from `create` itself.
     let warm_muna = muna.clone();
     let warm_tag = tag.to_string();
-    let prediction = predict::run(move || async move {
+    predict::run(move || async move {
         let inputs = HashMap::from([("_".to_string(), Value::Null)]);
         warm_muna.predictions.create(
             &warm_tag,
@@ -330,9 +335,6 @@ async fn load_model(
             None
         ).await
     }).await.map_err(|e| e.to_string())?;
-    if let Some(error) = prediction.error {
-        return Err(error);
-    }
     let sig_muna = muna.clone();
     let sig_tag = tag.to_string();
     let predictor = predict::run(move || async move {

@@ -12,7 +12,7 @@
 //!   compatible requests (same batch key) up to the plan capacity, invokes
 //!   once, then splits the results back per request.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -228,9 +228,11 @@ struct BufferedWorker {
 impl BufferedWorker {
 
     async fn run(self) {
-        let mut held: Option<PredictItem> = None;
+        // Requests deferred out of an in-progress batch (mismatched key or
+        // capacity overflow) wait here for a later batch.
+        let mut pending: VecDeque<PredictItem> = VecDeque::new();
         loop {
-            let first = match held.take() {
+            let first = match pending.pop_front() {
                 Some(item) => item,
                 None => match self.rx.recv().await {
                     Ok(item) => {
@@ -244,6 +246,18 @@ impl BufferedWorker {
             let first_key = first.batch_key.clone();
             let mut total_items = first.item_count;
             let mut batch = vec![first];
+            // Absorb previously deferred requests compatible with this batch.
+            let mut index = 0;
+            while index < pending.len() && total_items < self.capacity {
+                if pending[index].batch_key == first_key &&
+                    total_items + pending[index].item_count <= self.capacity {
+                    let item = pending.remove(index).unwrap();
+                    total_items += item.item_count;
+                    batch.push(item);
+                } else {
+                    index += 1;
+                }
+            }
             // Static (`wait_full`) and dynamic currently share the flush
             // behavior: accumulate until capacity or deadline. They diverge
             // once padding lands (static pads a partial batch to capacity).
@@ -255,12 +269,15 @@ impl BufferedWorker {
                         self.stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
                         if item.batch_key != first_key ||
                             total_items + item.item_count > self.capacity {
-                            // Mismatched key or overflow: hold for next batch.
-                            held = Some(item);
-                            break;
+                            // Mismatched key or overflow: defer to a later
+                            // batch WITHOUT ending accumulation, so an
+                            // interleaved arrival cannot stop same-key
+                            // requests still in flight from merging.
+                            pending.push_back(item);
+                        } else {
+                            total_items += item.item_count;
+                            batch.push(item);
                         }
-                        total_items += item.item_count;
-                        batch.push(item);
                     }
                     _ => break,
                 }
@@ -673,5 +690,28 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), vec![1, 1]);
         assert!(a_result.error.is_none());
         assert!(b_result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn buffered_interleaved_mismatch_does_not_split_batch() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let tx = spawn_worker(8, false, calls.clone());
+        let (a, a_rx) = make_item(text_inputs(&["a"]), 1, "dims=10");
+        let (c, c_rx) = make_item(text_inputs(&["c"]), 1, "dims=20");
+        let (b, b_rx) = make_item(text_inputs(&["b"]), 1, "dims=10");
+        // The mismatched key arrives BETWEEN two same-key requests: it must
+        // be deferred to its own batch, not end the current accumulation.
+        tx.send(a).await.unwrap();
+        tx.send(c).await.unwrap();
+        tx.send(b).await.unwrap();
+        let a_result = a_rx.await.unwrap().unwrap();
+        let b_result = b_rx.await.unwrap().unwrap();
+        let c_result = c_rx.await.unwrap().unwrap();
+        // Same-key requests merge into one 2-item invocation; the
+        // mismatched key gets its own 1-item invocation afterwards.
+        assert_eq!(*calls.lock().unwrap(), vec![2, 1]);
+        assert!(a_result.error.is_none());
+        assert!(b_result.error.is_none());
+        assert!(c_result.error.is_none());
     }
 }
