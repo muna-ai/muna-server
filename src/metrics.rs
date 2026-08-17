@@ -38,6 +38,32 @@ pub(crate) struct GpuMetrics {
     pub temperature_c: Option<u32>,
 }
 
+/// Free and total space in MB of the filesystem containing `path`, walking
+/// up to the nearest existing ancestor. Feeds capacity reporting: resources
+/// are never deleted, so the control plane must see remaining disk to know
+/// when to stop placing models on this node.
+pub(crate) fn disk_space_mb(path: &std::path::Path) -> Option<(u64, u64)> {
+    path.ancestors().find_map(statvfs_mb)
+}
+
+#[cfg(unix)]
+fn statvfs_mb(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let frsize = if stat.f_frsize > 0 { stat.f_frsize } else { stat.f_bsize } as u64;
+    let to_mb = |blocks: u64| blocks.saturating_mul(frsize) / (1024 * 1024);
+    Some((to_mb(stat.f_bavail as u64), to_mb(stat.f_blocks as u64)))
+}
+
+#[cfg(not(unix))]
+fn statvfs_mb(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
+}
+
 pub(crate) fn collect_gpu_metrics() -> Vec<GpuMetrics> {
     let mut metrics = Vec::new();
     #[cfg(target_os = "linux")]

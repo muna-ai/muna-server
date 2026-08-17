@@ -63,6 +63,12 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
     for tag in &reconcile.load_models {
         state.registry.warm(tag);
     }
+    // Prefetch = ensure cached (download resources, no engine load). Runs
+    // in the background on the blocking pool; single-flight per tag inside
+    // the store, so repeating the directive every beat is free.
+    for tag in &reconcile.prefetch_models {
+        state.manifests.prefetch(state.muna.clone(), tag);
+    }
     for tag in &reconcile.unload_models {
         state.dispatcher.remove(tag);
         state.registry.unload(tag).await;

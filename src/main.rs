@@ -42,8 +42,24 @@ struct Cli {
     /// KV relay flush cadence in seconds.
     #[arg(long, default_value = "1", env = "MUNA_KV_FLUSH_INTERVAL", global = true)]
     kv_flush_interval: u64,
+    /// Server state directory (holds `predictors.json`, the recorded
+    /// cached-tier manifest). Defaults to `~/.muna/server`, on the same
+    /// volume as the muna resource cache the manifest describes.
+    #[arg(long, env = "MUNA_SERVER_DATA_DIR", global = true)]
+    data_dir: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+impl Cli {
+    /// Path of the recorded cached-tier manifest.
+    fn manifest_path(&self) -> std::path::PathBuf {
+        let data_dir = self.data_dir.clone().unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            std::path::PathBuf::from(home).join(".muna").join("server")
+        });
+        data_dir.join("predictors.json")
+    }
 }
 
 #[derive(Subcommand)]
@@ -78,7 +94,9 @@ async fn run() -> Result<(), String> {
     let mut cli = Cli::parse();
     match cli.command.take().unwrap_or(Command::Serve) {
         Command::Serve => serve(&cli).await,
-        Command::Preload { tags } => preload(tags).await.map_err(|e| e.to_string()),
+        Command::Preload { tags } => {
+            preload(tags, cli.manifest_path()).await.map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -98,7 +116,8 @@ async fn serve(cli: &Cli) -> Result<(), String> {
     };
     // access_key=None -> muna falls back to $MUNA_ACCESS_KEY.
     let muna = Arc::new(Muna::new(None, None));
-    let state = Arc::new(AppState::new(muna, node));
+    let manifests = serving::cache::ManifestStore::open(cli.manifest_path());
+    let state = Arc::new(AppState::new(muna, manifests, node));
     if state.node.is_some() {
         tokio::spawn(control::heartbeat::run(state.clone()));
         tokio::spawn(control::kv_relay::run(state.clone()));
@@ -119,9 +138,15 @@ async fn serve(cli: &Cli) -> Result<(), String> {
 }
 
 /// Download-only preload (empty inputs): embeds predictor resources into a
-/// deploy image at build time without loading the engine.
-async fn preload(tags: Vec<String>) -> Result<(), muna::MunaError> {
+/// deploy image at build time without loading the engine. Each download is
+/// recorded in the manifest, so baked images boot already reporting the
+/// preloaded tags as `cached`.
+async fn preload(
+    tags: Vec<String>,
+    manifest_path: std::path::PathBuf
+) -> Result<(), muna::MunaError> {
     let muna = Muna::new(None, None);
+    let manifests = serving::cache::ManifestStore::open(manifest_path);
     for tag in tags {
         println!("Preloading {tag}");
         let prediction = muna
@@ -134,6 +159,7 @@ async fn preload(tags: Vec<String>) -> Result<(), muna::MunaError> {
                 None,
             )
             .await?;
+        manifests.record(&tag, &prediction);
         let resource_count = prediction.resources.as_ref().map_or(0, Vec::len);
         println!("Preloaded {tag} ({resource_count} resources)");
     }

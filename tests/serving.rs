@@ -23,8 +23,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use common::{
-    decode_remote_json, remote_list, remote_string, wait_for,
-    ServerGuard, StubControlPlane,
+    decode_remote_json, fresh_data_dir, remote_list, remote_string,
+    wait_for, ServerGuard, StubControlPlane,
 };
 
 // Fake predictor tags (pushed from tests/predictors/, see its README).
@@ -92,6 +92,9 @@ async fn boot_health_status_heartbeats() {
     assert!(status["version"].as_str().is_some_and(|v| !v.is_empty()));
     assert!(status["uptime_s"].is_u64());
     assert!(status["gpus"].is_array());
+    // Disk capacity on the data volume (statvfs works on macOS + Linux).
+    assert!(status["disk_free_mb"].is_u64());
+    assert!(status["disk_total_mb"].is_u64());
 
     // Heartbeats arrive at ~1s cadence carrying the same payload.
     wait_for(Duration::from_secs(5), || async {
@@ -218,8 +221,12 @@ async fn loading_window_returns_503_with_retry_after() {
     .await
     .expect("slow-coldstart load never started");
 
-    // The warmup sleeps ~12s (past the registry's 10s hold threshold), so a
-    // request that arrives mid-load must give up with 503 + Retry-After.
+    // The predictor is parameterless, so the registry's warmup sentinel runs
+    // the full body: the ~12s sleep executes during load, past the registry's
+    // 10s hold threshold. A request that arrives mid-load must give up with
+    // 503 + Retry-After. The dummy input keeps the inputs map non-empty
+    // (empty inputs would take muna's raw-prediction path if timing slipped
+    // past the load); the runtime ignores unknown inputs.
     let response = client
         .post(format!("{}/v1/predictions/remote", server.url()))
         .json(&json!({
@@ -597,4 +604,80 @@ async fn continuous_dispatch_overlaps() {
         windows_overlap(window_a, window_b),
         "continuous dispatch must overlap: {window_a:?} vs {window_b:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cached tier
+// ---------------------------------------------------------------------------
+
+/// Finds `tag` in a status payload's `models` array.
+fn model_in<'a>(status: &'a Value, tag: &str) -> Option<&'a Value> {
+    status["models"].as_array().unwrap().iter().find(|m| m["tag"] == json!(tag))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prefetch_directive_reports_cached() {
+    skip_without_access_key!();
+    skip_if_unpushed!(TAG_BATCH_SEQUENTIAL);
+    let stub = StubControlPlane::start().await;
+    let server = ServerGuard::spawn(&stub).await;
+    let client = reqwest::Client::new();
+    let status_url = format!("{}/status", server.url());
+
+    // Prefetch downloads resources without loading the engine: the tag must
+    // surface as `cached`, never passing through `loading` or `ready`.
+    stub.state().directives.prefetch_models = vec![TAG_BATCH_SEQUENTIAL.to_string()];
+    wait_for(LOAD_TIMEOUT, || async {
+        let status: Value = client
+            .get(&status_url).send().await.unwrap()
+            .json().await.unwrap();
+        model_in(&status, TAG_BATCH_SEQUENTIAL)
+            .is_some_and(|m| m["state"] == json!("cached"))
+    })
+    .await
+    .expect("prefetched tag never reported cached");
+
+    // No engine was loaded, so the model list endpoint stays empty.
+    let models: Value = client
+        .get(format!("{}/v1/models", server.url()))
+        .send().await.unwrap()
+        .json().await.unwrap();
+    assert_eq!(models["data"], json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_state_survives_restart() {
+    skip_without_access_key!();
+    skip_if_unpushed!(TAG_BATCH_SEQUENTIAL);
+    let stub = StubControlPlane::start().await;
+    let client = reqwest::Client::new();
+    let data_dir = fresh_data_dir();
+
+    // First process: prefetch and wait for the cached record.
+    {
+        let server = ServerGuard::spawn_with_data_dir(&stub, "test-node", &data_dir).await;
+        let status_url = format!("{}/status", server.url());
+        stub.state().directives.prefetch_models = vec![TAG_BATCH_SEQUENTIAL.to_string()];
+        wait_for(LOAD_TIMEOUT, || async {
+            let status: Value = client
+                .get(&status_url).send().await.unwrap()
+                .json().await.unwrap();
+            model_in(&status, TAG_BATCH_SEQUENTIAL)
+                .is_some_and(|m| m["state"] == json!("cached"))
+        })
+        .await
+        .expect("prefetched tag never reported cached");
+    } // guard drop kills the first process
+
+    // Second process on the same data dir: predictors.json seeds the cached
+    // tier immediately, without any directive or download.
+    stub.state().directives.prefetch_models = vec![];
+    let server = ServerGuard::spawn_with_data_dir(&stub, "test-node", &data_dir).await;
+    let status: Value = client
+        .get(format!("{}/status", server.url()))
+        .send().await.unwrap()
+        .json().await.unwrap();
+    let model = model_in(&status, TAG_BATCH_SEQUENTIAL)
+        .expect("restarted server lost the cached record");
+    assert_eq!(model["state"], json!("cached"));
 }

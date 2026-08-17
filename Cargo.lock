@@ -1106,6 +1106,7 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "futures-util",
+ "libc",
  "muna",
  "nvml-wrapper",
  "objc2",

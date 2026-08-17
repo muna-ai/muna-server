@@ -22,6 +22,7 @@ use muna::Muna;
 
 use crate::metrics;
 use crate::serving::batch::BatchPlan;
+use crate::serving::cache::ManifestStore;
 use crate::serving::predict;
 use crate::serving::stats::ModelStats;
 
@@ -90,11 +91,12 @@ struct RegistryInner {
 impl ModelRegistry {
 
     /// Create a model registry.
-    pub(crate) fn new(muna: Arc<Muna>) -> Self {
+    pub(crate) fn new(muna: Arc<Muna>, manifests: ManifestStore) -> Self {
         let loader_muna = muna.clone();
         let loader: Loader = Arc::new(move |tag| {
             let muna = loader_muna.clone();
-            Box::pin(async move { load_model(&muna, &tag).await })
+            let manifests = manifests.clone();
+            Box::pin(async move { load_model(&muna, &manifests, &tag).await })
         });
         Self::with_loader(muna, loader)
     }
@@ -314,6 +316,7 @@ async fn delete_predictor(muna: &Arc<Muna>, tag: &str) {
 
 async fn load_model(
     muna: &Arc<Muna>,
+    manifests: &ManifestStore,
     tag: &str
 ) -> Result<Signature, String> {
     // Preload convention: create a prediction that deliberately excludes
@@ -325,7 +328,7 @@ async fn load_model(
     // `Err` from `create` itself.
     let warm_muna = muna.clone();
     let warm_tag = tag.to_string();
-    predict::run(move || async move {
+    let warm_prediction = predict::run(move || async move {
         let inputs = HashMap::from([("_".to_string(), Value::Null)]);
         warm_muna.predictions.create(
             &warm_tag,
@@ -335,6 +338,9 @@ async fn load_model(
             None
         ).await
     }).await.map_err(|e| e.to_string())?;
+    // A successful load proves the resources are on disk: record the
+    // cached tier. Survives unload -- the engine goes, the disk keeps.
+    manifests.record(tag, &warm_prediction);
     let sig_muna = muna.clone();
     let sig_tag = tag.to_string();
     let predictor = predict::run(move || async move {

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use muna::Muna;
 
+use crate::serving::cache::ManifestStore;
 use crate::serving::dispatch::Dispatcher;
 use crate::serving::registry::ModelRegistry;
 
@@ -38,6 +39,8 @@ pub(crate) struct AppState {
     pub registry: ModelRegistry,
     /// Per-model prediction dispatcher.
     pub dispatcher: Dispatcher,
+    /// Recorded cached-tier state (which predictors are downloaded).
+    pub manifests: ManifestStore,
     /// Control-plane wiring; `None` in standalone mode.
     pub node: Option<NodeContext>,
     /// Process start, for uptime reporting.
@@ -53,11 +56,16 @@ impl AppState {
     const CHECKIN_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
     const CHECKIN_RETRY_SECONDS: u64 = 60 * 60;
 
-    pub(crate) fn new(muna: Arc<Muna>, node: Option<NodeContext>) -> Self {
+    pub(crate) fn new(
+        muna: Arc<Muna>,
+        manifests: ManifestStore,
+        node: Option<NodeContext>
+    ) -> Self {
         Self {
-            registry: ModelRegistry::new(muna.clone()),
+            registry: ModelRegistry::new(muna.clone(), manifests.clone()),
             dispatcher: Dispatcher::new(muna.clone()),
             muna,
+            manifests,
             node,
             start_time: Instant::now(),
             draining: AtomicBool::new(false),

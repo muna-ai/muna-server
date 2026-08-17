@@ -56,15 +56,6 @@ impl BatchPlan {
             .unwrap_or(1);
         Self::Buffered { params, capacity }
     }
-
-    /// Wire name for status reporting.
-    pub(crate) fn mode_name(&self) -> &'static str {
-        match self {
-            Self::Sequential      => "sequential",
-            Self::Buffered { .. } => "buffered",
-            Self::Continuous      => "continuous",
-        }
-    }
 }
 
 /// Compute a deterministic key from broadcast (i.e. non-batch) parameter values.

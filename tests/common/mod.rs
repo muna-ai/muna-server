@@ -37,6 +37,7 @@ use serde_json::{json, Value};
 #[derive(Default)]
 pub struct Directives {
     pub load_models: Vec<String>,
+    pub prefetch_models: Vec<String>,
     pub unload_models: Vec<String>,
     pub event_callback_urls: Vec<String>,
     pub drain: bool,
@@ -111,6 +112,7 @@ async fn heartbeat(
     let directives = &state.directives;
     Json(json!({
         "load_models": directives.load_models,
+        "prefetch_models": directives.prefetch_models,
         "unload_models": directives.unload_models,
         "event_callback_urls": directives.event_callback_urls,
         "drain": directives.drain,
@@ -149,6 +151,18 @@ impl ServerGuard {
         stub: &StubControlPlane,
         node_id: &str
     ) -> Self {
+        // Fresh data dir per guard so tests never touch (or observe) the
+        // developer's real ~/.muna/server manifest.
+        Self::spawn_with_data_dir(stub, node_id, &fresh_data_dir()).await
+    }
+
+    /// Spawn with an explicit `--data-dir`: restart tests reuse one dir
+    /// across guards to prove the manifest survives the process.
+    pub async fn spawn_with_data_dir(
+        stub: &StubControlPlane,
+        node_id: &str,
+        data_dir: &std::path::Path
+    ) -> Self {
         let port = ephemeral_port();
         let mut command = Command::new(env!("CARGO_BIN_EXE_muna-server"));
         command
@@ -157,6 +171,7 @@ impl ServerGuard {
             .arg("--node-id").arg(node_id)
             .arg("--heartbeat-interval").arg("1")
             .arg("--kv-flush-interval").arg("1")
+            .arg("--data-dir").arg(data_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         // muna-rs only reads $MUNA_ACCESS_KEY; splice in the key from the
@@ -231,6 +246,17 @@ pub fn stored_access_key() -> Option<String> {
         let value = value.trim().trim_matches('"').trim_matches('\'');
         (!value.is_empty()).then(|| value.to_string())
     })
+}
+
+/// A unique server data dir under the OS temp dir (holds `predictors.json`).
+pub fn fresh_data_dir() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static UNIQUE: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "muna-server-test-data-{}-{}",
+        std::process::id(),
+        UNIQUE.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn ephemeral_port() -> u16 {

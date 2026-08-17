@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::metrics::{collect_gpu_metrics, GpuMetrics};
+use crate::serving::batch::BatchPlan;
+use crate::serving::cache::ManifestStore;
 use crate::serving::registry::{ModelRegistry, ModelState};
 use crate::state::AppState;
 
@@ -29,24 +31,73 @@ pub(crate) struct NodeStatus {
     pub uptime_s: u64,
     /// Whether the node is rejecting new inference requests.
     pub draining: bool,
+    /// Free space in MB on the data volume (resource cache + manifest).
+    /// Resources are never deleted, so this only shrinks; the control plane
+    /// uses it to stop placing models on a full node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_free_mb: Option<u64>,
+    /// Total space in MB on the data volume.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_total_mb: Option<u64>,
     /// Per-device GPU metrics (system RAM fallback on CPU-only nodes).
     pub gpus: Vec<GpuMetrics>,
-    /// Lifecycle state and counters for every known model.
+    /// Warmth tier and counters for every known model.
     pub models: Vec<ModelStatus>,
+}
+
+/// Warmth tier of a model on this node. Serializes as a lowercase string
+/// on the wire (`"cached"`, `"loading"`, `"ready"`, `"failed"`).
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ModelLifecycle {
+    /// Resources on disk, engine not loaded.
+    Cached,
+    /// Model load in progress.
+    Loading,
+    /// Model loaded and serving.
+    Ready,
+    /// Last load attempt failed; see `ModelStatus::error`.
+    Failed,
+}
+
+/// How the node dispatches predictions for a loaded model, derived from
+/// the predictor signature's batch config. Serializes as a lowercase string
+/// on the wire (`"sequential"`, `"buffered"`, `"continuous"`). Distinct from
+/// `muna::types::BatchMode`: signature-level static and dynamic both dispatch
+/// as `Buffered` (the server never pads a partial batch).
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum DispatchMode {
+    /// One prediction at a time, behind a per-model mutex.
+    Sequential,
+    /// Requests merged up to capacity or deadline, then split per caller.
+    Buffered,
+    /// Submitted concurrently; the compiled engine batches internally.
+    Continuous,
+}
+
+impl From<&BatchPlan> for DispatchMode {
+    fn from(plan: &BatchPlan) -> Self {
+        match plan {
+            BatchPlan::Sequential      => Self::Sequential,
+            BatchPlan::Buffered { .. } => Self::Buffered,
+            BatchPlan::Continuous      => Self::Continuous,
+        }
+    }
 }
 
 #[derive(Serialize)]
 pub(crate) struct ModelStatus {
     /// Predictor tag.
     pub tag: String,
-    /// Lifecycle state: `loading`, `ready`, or `failed`.
-    pub state: &'static str,
+    /// Model lifecycle state.
+    pub state: ModelLifecycle,
     /// Load failure message, when `state` is `failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Batch mode, when `state` is `ready`.
+    /// Dispatch mode, when `state` is `ready`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub batch_mode: Option<&'static str>,
+    pub batch_mode: Option<DispatchMode>,
     /// Number of predictions currently waiting in the model's dispatch queue.
     pub queue_depth: u32,
     /// Total predictions made.
@@ -69,7 +120,13 @@ pub(crate) struct HeartbeatResponse {
     /// Tags to warm (sentinel prediction through the registry).
     #[serde(default)]
     pub load_models: Vec<String>,
-    /// Tags to unload.
+    /// Tags to prefetch: download resources to disk (the `cached` tier)
+    /// without loading the engine. Cheap and speculative, in contrast to
+    /// `load_models` which commits VRAM.
+    #[serde(default)]
+    pub prefetch_models: Vec<String>,
+    /// Tags to unload. Removes the engine only; downloaded resources are
+    /// never deleted, so the tag drops back to `cached`.
     #[serde(default)]
     pub unload_models: Vec<String>,
     /// Edge indexer callbacks for the KV relay; refreshed every beat.
@@ -111,24 +168,48 @@ pub(crate) struct EdgeResponse {
 
 impl NodeStatus {
     pub(crate) fn collect(state: &AppState) -> NodeStatus {
+        let disk = crate::metrics::disk_space_mb(state.manifests.path());
         NodeStatus {
             node_id: state.node.as_ref().map(|n| n.node_id.clone()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_s: state.start_time.elapsed().as_secs(),
             draining: state.is_draining(),
+            disk_free_mb: disk.map(|(free, _)| free),
+            disk_total_mb: disk.map(|(_, total)| total),
             gpus: collect_gpu_metrics(),
-            models: collect_model_status(&state.registry),
+            models: collect_model_status(&state.registry, &state.manifests),
         }
     }
 }
 
-fn collect_model_status(registry: &ModelRegistry) -> Vec<ModelStatus> {
-    registry.snapshot()
+fn collect_model_status(
+    registry: &ModelRegistry,
+    manifests: &ManifestStore
+) -> Vec<ModelStatus> {
+    let snapshot = registry.snapshot();
+    // Registry lifecycle wins per tag (loading/ready/failed subsume cached);
+    // manifest-only tags append as `cached` -- resources on disk, no engine.
+    let cached: Vec<ModelStatus> = manifests.cached()
+        .into_iter()
+        .filter(|tag| !snapshot.iter().any(|(known, _)| known == tag))
+        .map(|tag| ModelStatus {
+            tag,
+            state: ModelLifecycle::Cached,
+            error: None,
+            batch_mode: None,
+            queue_depth: 0,
+            total_predictions: 0,
+            avg_latency_ms: 0.0,
+            load_time_ms: 0.0,
+            vram_mb: None,
+        })
+        .collect();
+    snapshot
         .into_iter()
         .map(|(tag, state)| match state {
             ModelState::Loading { .. } => ModelStatus {
                 tag,
-                state: "loading",
+                state: ModelLifecycle::Loading,
                 error: None,
                 batch_mode: None,
                 queue_depth: 0,
@@ -139,9 +220,9 @@ fn collect_model_status(registry: &ModelRegistry) -> Vec<ModelStatus> {
             },
             ModelState::Ready(model) => ModelStatus {
                 tag,
-                state: "ready",
+                state: ModelLifecycle::Ready,
                 error: None,
-                batch_mode: Some(model.plan.mode_name()),
+                batch_mode: Some((&model.plan).into()),
                 queue_depth: model.stats.queue_depth.load(Ordering::Relaxed),
                 total_predictions: model.stats.total_predictions.load(Ordering::Relaxed),
                 avg_latency_ms: model.stats.avg_latency_ms(),
@@ -150,7 +231,7 @@ fn collect_model_status(registry: &ModelRegistry) -> Vec<ModelStatus> {
             },
             ModelState::Failed { error, .. } => ModelStatus {
                 tag,
-                state: "failed",
+                state: ModelLifecycle::Failed,
                 error: Some(error),
                 batch_mode: None,
                 queue_depth: 0,
@@ -160,5 +241,6 @@ fn collect_model_status(registry: &ModelRegistry) -> Vec<ModelStatus> {
                 vram_mb: None,
             },
         })
+        .chain(cached)
         .collect()
 }
