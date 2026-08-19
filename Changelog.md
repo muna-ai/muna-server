@@ -1,3 +1,6 @@
+## 0.0.5
+*INCOMPLETE*
+
 ## 0.0.4
 + Added `--models` CLI option to eagerly load and restrict the models that can be served.
 
