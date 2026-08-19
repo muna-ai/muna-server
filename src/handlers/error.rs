@@ -14,7 +14,7 @@ use crate::serving::registry::RegistryError;
 pub(crate) struct AppError {
     status: StatusCode,
     body: Value,
-    /// `Retry-After` seconds, set for 503 responses.
+    /// `Retry-After` seconds, set for 429 (loading) and 503 (draining).
     retry_after: Option<u64>,
 }
 
@@ -32,6 +32,7 @@ impl AppError {
         }
     }
 
+    /// 503: the node itself cannot serve (draining).
     pub(crate) fn unavailable(message: String, retry_after: u64) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -42,6 +43,38 @@ impl AppError {
                 }
             }),
             retry_after: Some(retry_after),
+        }
+    }
+
+    /// 429 with a `Retry-After` header: the model exists but cannot serve
+    /// yet (loading). Mirrors OpenAI's rate-limit error shape so clients
+    /// with standard backoff handling retry automatically.
+    pub(crate) fn retry_later(message: String, retry_after: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: json!({
+                "error": {
+                    "message": message,
+                    "type": "rate_limit_error",
+                }
+            }),
+            retry_after: Some(retry_after),
+        }
+    }
+
+    /// 404 with OpenAI's `model_not_found` error shape: the tag is not in
+    /// this server's pinned model set (`--models`).
+    pub(crate) fn model_not_found(model: &str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            body: json!({
+                "error": {
+                    "message": format!("model '{model}' is not served by this deployment"),
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                }
+            }),
+            retry_after: None,
         }
     }
 
@@ -80,13 +113,14 @@ impl From<muna::MunaError> for AppError {
 impl From<RegistryError> for AppError {
     fn from(e: RegistryError) -> Self {
         match e {
-            RegistryError::Loading { retry_after } => Self::unavailable(
+            RegistryError::Loading { retry_after } => Self::retry_later(
                 "model is loading".into(),
                 retry_after
             ),
             RegistryError::Failed(error) => Self::internal(
                 format!("model failed to load: {error}")
             ),
+            RegistryError::NotServed(model) => Self::model_not_found(&model),
         }
     }
 }

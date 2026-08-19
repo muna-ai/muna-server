@@ -76,7 +76,7 @@ async fn gpu_real_load_chat_and_cached_tokens() {
     let client = reqwest::Client::new();
 
     // Real loading window: the engine takes minutes; a chat that arrives
-    // mid-load must 503 with Retry-After.
+    // mid-load must 429 with Retry-After.
     stub.state().directives.load_models = vec![tag.clone()];
     wait_for(Duration::from_secs(30), || {
         let client = client.clone();
@@ -93,7 +93,7 @@ async fn gpu_real_load_chat_and_cached_tokens() {
         .post(format!("{}/v1/chat/completions", server.url()))
         .json(&chat_request(&tag, "hello"))
         .send().await.unwrap();
-    assert_eq!(mid_load.status(), 503, "chat mid-load must 503");
+    assert_eq!(mid_load.status(), 429, "chat mid-load must 429");
     assert!(mid_load.headers().contains_key("Retry-After"));
 
     wait_until_ready(&client, &server.url(), &tag).await;

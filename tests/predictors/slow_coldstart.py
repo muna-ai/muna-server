@@ -13,11 +13,11 @@ required inputs that warmup prediction runs the full function body -- the
 `Loading` sentinel past its 10-second hold threshold (requests wait on a
 loading model up to `HOLD_THRESHOLD` before giving up), so the Rust test can
 deterministically observe the loading window: requests that arrive mid-load
-must be rejected with `503` and a `Retry-After` header, and `/status` must
+must be rejected with `429` and a `Retry-After` header, and `/status` must
 report the model as `loading` before it flips to `ready`.
 
 Consumed by muna-server `tests/serving.rs`: the loading-window test
-(503 + Retry-After during load, then eventual readiness).
+(429 + Retry-After during load, then eventual readiness).
 """
 
 # /// script

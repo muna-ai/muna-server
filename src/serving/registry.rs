@@ -9,9 +9,9 @@
 //! server tracks each model's lifecycle explicitly: `Loading` (single-flight
 //! warmup in progress), `Ready` (signature + batch plan known), or `Failed`.
 //! Requests arriving during `Loading` wait up to a hold threshold, then get
-//! `503` with a `Retry-After` derived from load-time history.
+//! `429` with a `Retry-After` derived from load-time history.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,11 +22,10 @@ use muna::Muna;
 
 use crate::metrics;
 use crate::serving::batch::BatchPlan;
-use crate::serving::cache::ManifestStore;
 use crate::serving::predict;
 use crate::serving::stats::ModelStats;
 
-/// How long a request waits on a `Loading` model before giving up with 503.
+/// How long a request waits on a `Loading` model before giving up with 429.
 const HOLD_THRESHOLD: Duration = Duration::from_secs(10);
 
 /// Retry-After fallback before any load has completed.
@@ -34,22 +33,44 @@ const DEFAULT_LOAD_SECS: u64 = 30;
 
 /// A model whose engine is warm and whose signature is known.
 pub(crate) struct ReadyModel {
+    /// When the load completed (reported as the model's `created` age by
+    /// the OpenAI-compatible `/v1/models` handler).
     pub loaded_at: Instant,
     /// Kept for future handler validation (the plan is derived from it now).
     #[allow(dead_code)]
     pub signature: Signature,
+    /// How the dispatcher batches predictions for this model, derived from
+    /// the signature's batch config.
     pub plan: BatchPlan,
+    /// Live counters (queue depth, prediction totals, latency, load time,
+    /// VRAM), shared with the dispatcher and reported in heartbeats.
     pub stats: Arc<ModelStats>,
 }
 
+/// Lifecycle state of one model. Absent-from-map is the implicit fourth
+/// state (never requested, or unloaded); `Failed` is cleared on read so the
+/// next request retries the load.
 pub(crate) enum ModelState {
+    /// Single-flight warmup in progress since the given instant (used to
+    /// derive `Retry-After` for requests that give up waiting).
     Loading { since: Instant },
+    /// Engine warm, signature and batch plan known; shared with every
+    /// request currently predicting against the model.
     Ready(Arc<ReadyModel>),
+    /// The warmup failed at the given instant; `error` is surfaced to the
+    /// requester (and the control plane) verbatim.
     Failed { error: String, at: Instant },
 }
 
+/// One tag's entry in the registry map: the model's current lifecycle state
+/// plus the coordination bits that make loads single-flight.
 struct Slot {
+    /// Current lifecycle state (`Loading` -> `Ready` | `Failed`).
     state: ModelState,
+    /// Notifies requests waiting out a `Loading` state. The load task sends
+    /// on completion; `ensure_ready` waiters subscribe and then re-read
+    /// `state` from the map. Dropping the slot drops the sender, which also
+    /// wakes waiters (they find the entry vacant and re-warm organically).
     watch: tokio::sync::watch::Sender<()>,
     /// An unload arrived while the load was in flight. The load cannot be
     /// cancelled (the sentinel prediction is executing inside native FFI on
@@ -65,6 +86,8 @@ pub(crate) enum RegistryError {
     Loading { retry_after: u64 },
     /// The warmup prediction failed.
     Failed(String),
+    /// The tag is not in this server's pinned model set (`--models`).
+    NotServed(String),
 }
 
 #[derive(Clone)]
@@ -80,10 +103,18 @@ type Loader = Arc<
         + Sync
 >;
 
+/// Shared state behind the cloneable `ModelRegistry` handle.
 struct RegistryInner {
+    /// Muna client, used to delete predictors on unload.
     muna: Arc<Muna>,
+    /// Per-tag slots; a tag's absence means it was never loaded (or was
+    /// unloaded).
     models: DashMap<String, Slot>,
+    /// Warmup delegate invoked by `spawn_load` (injectable for tests).
     loader: Loader,
+    /// Pinned model set (`--models`): the only tags this server will load.
+    /// `None` means open behavior (any tag loadable on demand).
+    pinned: Option<HashSet<String>>,
     /// Most recent successful load duration in seconds, for Retry-After.
     last_load_secs: AtomicU64,
 }
@@ -91,22 +122,29 @@ struct RegistryInner {
 impl ModelRegistry {
 
     /// Create a model registry.
-    pub(crate) fn new(muna: Arc<Muna>, manifests: ManifestStore) -> Self {
+    pub(crate) fn new(
+        muna: Arc<Muna>,
+        pinned: Option<HashSet<String>>
+    ) -> Self {
         let loader_muna = muna.clone();
         let loader: Loader = Arc::new(move |tag| {
             let muna = loader_muna.clone();
-            let manifests = manifests.clone();
-            Box::pin(async move { load_model(&muna, &manifests, &tag).await })
+            Box::pin(async move { load_model(&muna, &tag).await })
         });
-        Self::with_loader(muna, loader)
+        Self::with_loader(muna, loader, pinned)
     }
 
-    fn with_loader(muna: Arc<Muna>, loader: Loader) -> Self {
+    fn with_loader(
+        muna: Arc<Muna>,
+        loader: Loader,
+        pinned: Option<HashSet<String>>
+    ) -> Self {
         Self {
             inner: Arc::new(RegistryInner {
                 muna,
                 models: DashMap::new(),
                 loader,
+                pinned,
                 last_load_secs: AtomicU64::new(DEFAULT_LOAD_SECS)
             })
         }
@@ -122,6 +160,9 @@ impl ModelRegistry {
         &self,
         tag: &str
     ) -> Result<Arc<ReadyModel>, RegistryError> {
+        if !self.serves(tag) {
+            return Err(RegistryError::NotServed(tag.to_string()));
+        }
         let deadline = Instant::now() + HOLD_THRESHOLD;
         loop {
             // Map access is synchronous; waiting happens outside the shard lock.
@@ -173,10 +214,26 @@ impl ModelRegistry {
         }
     }
 
+    /// Whether this server serves the tag (member of the pinned set, or no
+    /// pinned set configured).
+    fn serves(&self, tag: &str) -> bool {
+        self.inner
+            .pinned
+            .as_ref()
+            .is_none_or(|pinned| pinned.contains(tag))
+    }
+
     /// Warm a model without waiting for it (heartbeat reconciliation path).
     /// Idempotent: a `Ready` or `Loading` tag is a no-op; a stale failure is
     /// cleared so reconciliation can retry.
+    ///
+    /// A warm directive for a tag outside the pinned set is a control-plane
+    /// misconfiguration: logged and ignored.
     pub(crate) fn warm(&self, tag: &str) {
+        if !self.serves(tag) {
+            tracing::warn!(tag = %tag, "warm ignored: tag is not in this server's --models set");
+            return;
+        }
         match self.inner.models.entry(tag.to_string()) {
             dashmap::Entry::Occupied(entry) => {
                 if matches!(entry.get().state, ModelState::Failed { .. }) {
@@ -316,7 +373,6 @@ async fn delete_predictor(muna: &Arc<Muna>, tag: &str) {
 
 async fn load_model(
     muna: &Arc<Muna>,
-    manifests: &ManifestStore,
     tag: &str
 ) -> Result<Signature, String> {
     // Preload convention: create a prediction that deliberately excludes
@@ -328,7 +384,7 @@ async fn load_model(
     // `Err` from `create` itself.
     let warm_muna = muna.clone();
     let warm_tag = tag.to_string();
-    let warm_prediction = predict::run(move || async move {
+    predict::run(move || async move {
         let inputs = HashMap::from([("_".to_string(), Value::Null)]);
         warm_muna.predictions.create(
             &warm_tag,
@@ -338,9 +394,6 @@ async fn load_model(
             None
         ).await
     }).await.map_err(|e| e.to_string())?;
-    // A successful load proves the resources are on disk: record the
-    // cached tier. Survives unload -- the engine goes, the disk keeps.
-    manifests.record(tag, &warm_prediction);
     let sig_muna = muna.clone();
     let sig_tag = tag.to_string();
     let predictor = predict::run(move || async move {
@@ -361,6 +414,15 @@ mod tests {
         fail: bool,
         delay: Duration
     ) -> ModelRegistry {
+        registry_pinned(loads, fail, delay, None)
+    }
+
+    fn registry_pinned(
+        loads: Arc<AtomicUsize>,
+        fail: bool,
+        delay: Duration,
+        pinned: Option<HashSet<String>>
+    ) -> ModelRegistry {
         let loader: Loader = Arc::new(move |_tag| {
             let loads = loads.clone();
             Box::pin(async move {
@@ -373,7 +435,7 @@ mod tests {
                 }
             })
         });
-        ModelRegistry::with_loader(Arc::new(Muna::new(None, None)), loader)
+        ModelRegistry::with_loader(Arc::new(Muna::new(None, None)), loader, pinned)
     }
 
     #[tokio::test]
@@ -429,6 +491,28 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(registry.ready_tags().is_empty());
         assert!(registry.snapshot().is_empty());
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pinned_set_rejects_unlisted_tag() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let pinned = HashSet::from(["@test/served".to_string()]);
+        let registry = registry_pinned(
+            loads.clone(),
+            false,
+            Duration::from_millis(10),
+            Some(pinned)
+        );
+        let other = registry.ensure_ready("@test/other").await;
+        assert!(matches!(other, Err(RegistryError::NotServed(_))));
+        // A warm directive for an unlisted tag is ignored, not loaded.
+        registry.warm("@test/other");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
+        // The pinned member loads normally.
+        let served = registry.ensure_ready("@test/served").await;
+        assert!(served.is_ok());
         assert_eq!(loads.load(Ordering::SeqCst), 1);
     }
 

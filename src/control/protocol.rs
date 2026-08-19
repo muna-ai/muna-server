@@ -16,7 +16,6 @@ use serde_json::Value as JsonValue;
 
 use crate::metrics::{collect_gpu_metrics, GpuMetrics};
 use crate::serving::batch::BatchPlan;
-use crate::serving::cache::ManifestStore;
 use crate::serving::registry::{ModelRegistry, ModelState};
 use crate::state::AppState;
 
@@ -31,9 +30,9 @@ pub(crate) struct NodeStatus {
     pub uptime_s: u64,
     /// Whether the node is rejecting new inference requests.
     pub draining: bool,
-    /// Free space in MB on the data volume (resource cache + manifest).
-    /// Resources are never deleted, so this only shrinks; the control plane
-    /// uses it to stop placing models on a full node.
+    /// Free space in MB on the resource-cache volume. Resources are never
+    /// deleted, so this only shrinks; the control plane uses it to stop
+    /// placing models on a full node.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_free_mb: Option<u64>,
     /// Total space in MB on the data volume.
@@ -45,13 +44,11 @@ pub(crate) struct NodeStatus {
     pub models: Vec<ModelStatus>,
 }
 
-/// Warmth tier of a model on this node. Serializes as a lowercase string
-/// on the wire (`"cached"`, `"loading"`, `"ready"`, `"failed"`).
+/// Lifecycle state of a model on this node. Serializes as a lowercase
+/// string on the wire (`"loading"`, `"ready"`, `"failed"`).
 #[derive(Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ModelLifecycle {
-    /// Resources on disk, engine not loaded.
-    Cached,
     /// Model load in progress.
     Loading,
     /// Model loaded and serving.
@@ -120,13 +117,8 @@ pub(crate) struct HeartbeatResponse {
     /// Tags to warm (sentinel prediction through the registry).
     #[serde(default)]
     pub load_models: Vec<String>,
-    /// Tags to prefetch: download resources to disk (the `cached` tier)
-    /// without loading the engine. Cheap and speculative, in contrast to
-    /// `load_models` which commits VRAM.
-    #[serde(default)]
-    pub prefetch_models: Vec<String>,
     /// Tags to unload. Removes the engine only; downloaded resources are
-    /// never deleted, so the tag drops back to `cached`.
+    /// never deleted and persist on disk.
     #[serde(default)]
     pub unload_models: Vec<String>,
     /// Edge indexer callbacks for the KV relay; refreshed every beat.
@@ -168,7 +160,7 @@ pub(crate) struct EdgeResponse {
 
 impl NodeStatus {
     pub(crate) fn collect(state: &AppState) -> NodeStatus {
-        let disk = crate::metrics::disk_space_mb(state.manifests.path());
+        let disk = crate::metrics::disk_space_mb(state.muna.client.cache_path());
         NodeStatus {
             node_id: state.node.as_ref().map(|n| n.node_id.clone()),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -177,34 +169,14 @@ impl NodeStatus {
             disk_free_mb: disk.map(|(free, _)| free),
             disk_total_mb: disk.map(|(_, total)| total),
             gpus: collect_gpu_metrics(),
-            models: collect_model_status(&state.registry, &state.manifests),
+            models: collect_model_status(&state.registry),
         }
     }
 }
 
-fn collect_model_status(
-    registry: &ModelRegistry,
-    manifests: &ManifestStore
-) -> Vec<ModelStatus> {
-    let snapshot = registry.snapshot();
-    // Registry lifecycle wins per tag (loading/ready/failed subsume cached);
-    // manifest-only tags append as `cached` -- resources on disk, no engine.
-    let cached: Vec<ModelStatus> = manifests.cached()
-        .into_iter()
-        .filter(|tag| !snapshot.iter().any(|(known, _)| known == tag))
-        .map(|tag| ModelStatus {
-            tag,
-            state: ModelLifecycle::Cached,
-            error: None,
-            batch_mode: None,
-            queue_depth: 0,
-            total_predictions: 0,
-            avg_latency_ms: 0.0,
-            load_time_ms: 0.0,
-            vram_mb: None,
-        })
-        .collect();
-    snapshot
+fn collect_model_status(registry: &ModelRegistry) -> Vec<ModelStatus> {
+    registry
+        .snapshot()
         .into_iter()
         .map(|(tag, state)| match state {
             ModelState::Loading { .. } => ModelStatus {
@@ -241,6 +213,5 @@ fn collect_model_status(
                 vram_mb: None,
             },
         })
-        .chain(cached)
         .collect()
 }

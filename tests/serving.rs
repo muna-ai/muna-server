@@ -23,7 +23,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use common::{
-    decode_remote_json, fresh_data_dir, remote_list, remote_string,
+    decode_remote_json, remote_list, remote_string,
     wait_for, ServerGuard, StubControlPlane,
 };
 
@@ -200,7 +200,7 @@ async fn failed_load_reported_then_cleared_by_unload() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn loading_window_returns_503_with_retry_after() {
+async fn loading_window_returns_429_with_retry_after() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_SLOW_COLDSTART);
     let stub = StubControlPlane::start().await;
@@ -224,7 +224,7 @@ async fn loading_window_returns_503_with_retry_after() {
     // The predictor is parameterless, so the registry's warmup sentinel runs
     // the full body: the ~12s sleep executes during load, past the registry's
     // 10s hold threshold. A request that arrives mid-load must give up with
-    // 503 + Retry-After. The dummy input keeps the inputs map non-empty
+    // 429 + Retry-After. The dummy input keeps the inputs map non-empty
     // (empty inputs would take muna's raw-prediction path if timing slipped
     // past the load); the runtime ignores unknown inputs.
     let response = client
@@ -240,8 +240,8 @@ async fn loading_window_returns_503_with_retry_after() {
     if response_status == 500 && body.to_lowercase().contains("failed to load") {
         panic!("slow-coldstart load failed instead of loading: {body}");
     }
-    assert_eq!(response_status, 503, "expected 503 mid-load, got {response_status}: {body}");
-    let retry_after = retry_after.expect("503 must carry Retry-After");
+    assert_eq!(response_status, 429, "expected 429 mid-load, got {response_status}: {body}");
+    let retry_after = retry_after.expect("429 must carry Retry-After");
     assert!(retry_after.to_str().unwrap().parse::<u64>().unwrap() >= 1);
 
     // Eventually ready.
@@ -607,7 +607,7 @@ async fn continuous_dispatch_overlaps() {
 }
 
 // ---------------------------------------------------------------------------
-// Cached tier
+// Pinned model set (--models)
 // ---------------------------------------------------------------------------
 
 /// Finds `tag` in a status payload's `models` array.
@@ -616,68 +616,42 @@ fn model_in<'a>(status: &'a Value, tag: &str) -> Option<&'a Value> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn prefetch_directive_reports_cached() {
+async fn pinned_models_eager_load_and_reject_unlisted() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_BATCH_SEQUENTIAL);
     let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_with_models(&stub, &[TAG_BATCH_SEQUENTIAL]).await;
     let client = reqwest::Client::new();
     let status_url = format!("{}/status", server.url());
 
-    // Prefetch downloads resources without loading the engine: the tag must
-    // surface as `cached`, never passing through `loading` or `ready`.
-    stub.state().directives.prefetch_models = vec![TAG_BATCH_SEQUENTIAL.to_string()];
+    // Eager load: the pinned tag reaches `ready` with no request and no
+    // control-plane directive.
     wait_for(LOAD_TIMEOUT, || async {
         let status: Value = client
             .get(&status_url).send().await.unwrap()
             .json().await.unwrap();
         model_in(&status, TAG_BATCH_SEQUENTIAL)
-            .is_some_and(|m| m["state"] == json!("cached"))
+            .is_some_and(|m| m["state"] == json!("ready"))
     })
     .await
-    .expect("prefetched tag never reported cached");
+    .expect("pinned tag never eager-loaded to ready");
 
-    // No engine was loaded, so the model list endpoint stays empty.
-    let models: Value = client
-        .get(format!("{}/v1/models", server.url()))
-        .send().await.unwrap()
-        .json().await.unwrap();
-    assert_eq!(models["data"], json!([]));
-}
+    // An unlisted tag is rejected with OpenAI's model_not_found shape,
+    // without touching the registry (immediate, not a doomed load).
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.url()))
+        .json(&json!({ "model": TAG_CHAT, "messages": [{ "role": "user", "content": "hi" }] }))
+        .send().await.unwrap();
+    assert_eq!(response.status(), 404);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], json!("model_not_found"));
 
-#[tokio::test(flavor = "multi_thread")]
-async fn cached_state_survives_restart() {
-    skip_without_access_key!();
-    skip_if_unpushed!(TAG_BATCH_SEQUENTIAL);
-    let stub = StubControlPlane::start().await;
-    let client = reqwest::Client::new();
-    let data_dir = fresh_data_dir();
-
-    // First process: prefetch and wait for the cached record.
-    {
-        let server = ServerGuard::spawn_with_data_dir(&stub, "test-node", &data_dir).await;
-        let status_url = format!("{}/status", server.url());
-        stub.state().directives.prefetch_models = vec![TAG_BATCH_SEQUENTIAL.to_string()];
-        wait_for(LOAD_TIMEOUT, || async {
-            let status: Value = client
-                .get(&status_url).send().await.unwrap()
-                .json().await.unwrap();
-            model_in(&status, TAG_BATCH_SEQUENTIAL)
-                .is_some_and(|m| m["state"] == json!("cached"))
-        })
-        .await
-        .expect("prefetched tag never reported cached");
-    } // guard drop kills the first process
-
-    // Second process on the same data dir: predictors.json seeds the cached
-    // tier immediately, without any directive or download.
-    stub.state().directives.prefetch_models = vec![];
-    let server = ServerGuard::spawn_with_data_dir(&stub, "test-node", &data_dir).await;
+    // A control-plane warm directive for an unlisted tag is ignored: the
+    // tag never appears in status.
+    stub.state().directives.load_models = vec![TAG_CHAT.to_string()];
+    tokio::time::sleep(Duration::from_secs(3)).await;
     let status: Value = client
-        .get(format!("{}/status", server.url()))
-        .send().await.unwrap()
+        .get(&status_url).send().await.unwrap()
         .json().await.unwrap();
-    let model = model_in(&status, TAG_BATCH_SEQUENTIAL)
-        .expect("restarted server lost the cached record");
-    assert_eq!(model["state"], json!("cached"));
+    assert!(model_in(&status, TAG_CHAT).is_none());
 }

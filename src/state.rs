@@ -3,14 +3,13 @@
 *   Copyright © 2026 NatML Inc. All Rights Reserved.
 */
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use muna::Muna;
 
-use crate::serving::cache::ManifestStore;
 use crate::serving::dispatch::Dispatcher;
 use crate::serving::registry::ModelRegistry;
 
@@ -39,8 +38,6 @@ pub(crate) struct AppState {
     pub registry: ModelRegistry,
     /// Per-model prediction dispatcher.
     pub dispatcher: Dispatcher,
-    /// Recorded cached-tier state (which predictors are downloaded).
-    pub manifests: ManifestStore,
     /// Control-plane wiring; `None` in standalone mode.
     pub node: Option<NodeContext>,
     /// Process start, for uptime reporting.
@@ -58,14 +55,13 @@ impl AppState {
 
     pub(crate) fn new(
         muna: Arc<Muna>,
-        manifests: ManifestStore,
+        pinned: Option<HashSet<String>>,
         node: Option<NodeContext>
     ) -> Self {
         Self {
-            registry: ModelRegistry::new(muna.clone(), manifests.clone()),
+            registry: ModelRegistry::new(muna.clone(), pinned),
             dispatcher: Dispatcher::new(muna.clone()),
             muna,
-            manifests,
             node,
             start_time: Instant::now(),
             draining: AtomicBool::new(false),

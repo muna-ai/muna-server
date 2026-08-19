@@ -31,7 +31,7 @@ pub(crate) struct ChatCompletionsRequest {
 }
 
 /// Chat completions via the muna-rs OpenAI client, wrapped with the model
-/// registry (503-on-loading), the sequential dispatch guard, and the
+/// registry (429-on-loading), the sequential dispatch guard, and the
 /// blocking prediction executor.
 pub(crate) async fn chat_completions(
     State(state): State<Arc<AppState>>,

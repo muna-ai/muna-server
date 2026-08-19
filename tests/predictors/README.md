@@ -15,7 +15,7 @@ documents the contract it satisfies and the Rust tests that consume it.
 | `batch_static.py` | `@muna/test-batch-static` | Buffered merge/split (static) |
 | `batch_dynamic.py` | `@muna/test-batch-dynamic` | Buffered merge/split (dynamic) |
 | `batch_continuous.py` | `@muna/test-batch-continuous` | Continuous dispatch (no serialization) |
-| `slow_coldstart.py` | `@muna/test-slow-coldstart` | Loading window: 503 + `Retry-After` |
+| `slow_coldstart.py` | `@muna/test-slow-coldstart` | Loading window: 429 + `Retry-After` |
 
 ## Compiling and pushing
 

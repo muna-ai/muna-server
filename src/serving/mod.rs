@@ -9,7 +9,6 @@
 //! model's batch plan), which executes through `predict`.
 
 pub(crate) mod batch;
-pub(crate) mod cache;
 pub(crate) mod dispatch;
 pub(crate) mod predict;
 pub(crate) mod registry;

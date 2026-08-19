@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use muna::types::Acceleration;
 use muna::Muna;
 
+mod client;
 mod control;
 mod handlers;
 mod metrics;
@@ -31,35 +32,24 @@ struct Cli {
     #[arg(long, default_value = "8000", env = "PORT", global = true)]
     port: u16,
     /// Control plane base URL. Enables the heartbeat loop and KV event relay.
-    #[arg(long, env = "MUNA_CONTROL_PLANE_URL", global = true)]
+    #[arg(long, env = "MUNA_SERVER_CONTROL_PLANE_URL", global = true)]
     control_plane_url: Option<String>,
     /// Node identity assigned by the control plane at provision time.
-    #[arg(long, env = "MUNA_NODE_ID", global = true)]
+    #[arg(long, env = "MUNA_SERVER_ID", global = true)]
     node_id: Option<String>,
     /// Heartbeat cadence in seconds.
-    #[arg(long, default_value = "5", env = "MUNA_HEARTBEAT_INTERVAL", global = true)]
+    #[arg(long, default_value = "5", env = "MUNA_SERVER_HEARTBEAT_INTERVAL", global = true)]
     heartbeat_interval: u64,
     /// KV relay flush cadence in seconds.
-    #[arg(long, default_value = "1", env = "MUNA_KV_FLUSH_INTERVAL", global = true)]
+    #[arg(long, default_value = "1", env = "MUNA_SERVER_KV_FLUSH_INTERVAL", global = true)]
     kv_flush_interval: u64,
-    /// Server state directory (holds `predictors.json`, the recorded
-    /// cached-tier manifest). Defaults to `~/.muna/server`, on the same
-    /// volume as the muna resource cache the manifest describes.
-    #[arg(long, env = "MUNA_SERVER_DATA_DIR", global = true)]
-    data_dir: Option<std::path::PathBuf>,
+    /// Predictor tags this server serves (comma-separated). When set, the
+    /// models are loaded eagerly at boot and requests for any other tag are
+    /// rejected with 404. Unset leaves any tag loadable on demand.
+    #[arg(long, env = "MUNA_SERVER_MODELS", value_delimiter = ',', global = true)]
+    models: Vec<String>,
     #[command(subcommand)]
     command: Option<Command>,
-}
-
-impl Cli {
-    /// Path of the recorded cached-tier manifest.
-    fn manifest_path(&self) -> std::path::PathBuf {
-        let data_dir = self.data_dir.clone().unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            std::path::PathBuf::from(home).join(".muna").join("server")
-        });
-        data_dir.join("predictors.json")
-    }
 }
 
 #[derive(Subcommand)]
@@ -94,9 +84,7 @@ async fn run() -> Result<(), String> {
     let mut cli = Cli::parse();
     match cli.command.take().unwrap_or(Command::Serve) {
         Command::Serve => serve(&cli).await,
-        Command::Preload { tags } => {
-            preload(tags, cli.manifest_path()).await.map_err(|e| e.to_string())
-        }
+        Command::Preload { tags } => preload(tags).await.map_err(|e| e.to_string()),
     }
 }
 
@@ -114,10 +102,21 @@ async fn serve(cli: &Cli) -> Result<(), String> {
         }
         _ => None,
     };
-    // access_key=None -> muna falls back to $MUNA_ACCESS_KEY.
-    let muna = Arc::new(Muna::new(None, None));
-    let manifests = serving::cache::ManifestStore::open(cli.manifest_path());
-    let state = Arc::new(AppState::new(muna, manifests, node));
+    // ServerClient resolves $MUNA_ACCESS_KEY / $MUNA_API_URL itself and adds
+    // download single-flight + progress presentation on top of MunaClient.
+    let muna = Arc::new(Muna::with_client(Arc::new(client::ServerClient::new())));
+    let pinned: Option<std::collections::HashSet<String>> = if cli.models.is_empty() {
+        None
+    } else {
+        Some(cli.models.iter().cloned().collect())
+    };
+    let state = Arc::new(AppState::new(muna, pinned, node));
+    // Eager load: fire-and-forget warms so the port binds immediately;
+    // mid-load requests get 429 + Retry-After.
+    for tag in &cli.models {
+        tracing::info!(tag = %tag, "eager-loading pinned model");
+        state.registry.warm(tag);
+    }
     if state.node.is_some() {
         tokio::spawn(control::heartbeat::run(state.clone()));
         tokio::spawn(control::kv_relay::run(state.clone()));
@@ -138,15 +137,9 @@ async fn serve(cli: &Cli) -> Result<(), String> {
 }
 
 /// Download-only preload (empty inputs): embeds predictor resources into a
-/// deploy image at build time without loading the engine. Each download is
-/// recorded in the manifest, so baked images boot already reporting the
-/// preloaded tags as `cached`.
-async fn preload(
-    tags: Vec<String>,
-    manifest_path: std::path::PathBuf
-) -> Result<(), muna::MunaError> {
-    let muna = Muna::new(None, None);
-    let manifests = serving::cache::ManifestStore::open(manifest_path);
+/// deploy image at build time without loading the engine.
+async fn preload(tags: Vec<String>) -> Result<(), muna::MunaError> {
+    let muna = Muna::with_client(Arc::new(client::ServerClient::new()));
     for tag in tags {
         println!("Preloading {tag}");
         let prediction = muna
@@ -159,7 +152,6 @@ async fn preload(
                 None,
             )
             .await?;
-        manifests.record(&tag, &prediction);
         let resource_count = prediction.resources.as_ref().map_or(0, Vec::len);
         println!("Preloaded {tag} ({resource_count} resources)");
     }

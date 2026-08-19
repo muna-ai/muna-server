@@ -1,5 +1,5 @@
 ## 0.0.4
-*INCOMPLETE*
++ Added `--models` CLI option to eagerly load and restrict the models that can be served.
 
 ## 0.0.3
 + Added support for OpenAI-compatible image generation at `/v1/images/generations`.

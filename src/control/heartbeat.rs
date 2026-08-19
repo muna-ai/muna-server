@@ -23,7 +23,7 @@ pub(crate) async fn run(state: Arc<AppState>) {
         node.control_plane_url.trim_end_matches('/'),
         node.node_id
     );
-    let token = std::env::var("MUNA_NODE_TOKEN").ok();
+    let token = std::env::var("MUNA_SERVER_TOKEN").ok();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -62,12 +62,6 @@ pub(crate) async fn run(state: Arc<AppState>) {
 async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
     for tag in &reconcile.load_models {
         state.registry.warm(tag);
-    }
-    // Prefetch = ensure cached (download resources, no engine load). Runs
-    // in the background on the blocking pool; single-flight per tag inside
-    // the store, so repeating the directive every beat is free.
-    for tag in &reconcile.prefetch_models {
-        state.manifests.prefetch(state.muna.clone(), tag);
     }
     for tag in &reconcile.unload_models {
         state.dispatcher.remove(tag);
