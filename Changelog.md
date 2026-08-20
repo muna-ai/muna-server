@@ -1,3 +1,6 @@
+## 0.0.6
+*INCOMPLETE*
+
 ## 0.0.5
 + Added `reasoning_content` passthrough for reasoning models in OpenAI-compatible chat completions.
 + Added download progress reporting for model resources.
