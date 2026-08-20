@@ -302,6 +302,17 @@ async fn chat_completion_streaming_and_unload() {
         json!(1)
     );
     assert!(completion["usage"]["prompt_tokens"].as_i64().unwrap() > 0);
+    // The fake emits a reasoning delta before its content deltas; the merged
+    // message must surface it (DeepSeek `reasoning_content` convention),
+    // along with the reasoning token count in usage.
+    assert_eq!(
+        completion["choices"][0]["message"]["reasoning_content"],
+        json!("thinking really hard")
+    );
+    assert_eq!(
+        completion["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        json!(3)
+    );
 
     // Ready model shows up in /v1/models and /status.
     let models: Value = client
@@ -325,13 +336,28 @@ async fn chat_completion_streaming_and_unload() {
     assert!(frames.len() >= 3, "expected several SSE frames, got: {sse}");
     assert_eq!(*frames.last().unwrap(), "[DONE]");
     let mut streamed_text = String::new();
+    let mut streamed_reasoning = String::new();
     for frame in &frames[..frames.len() - 1] {
         let chunk: Value = serde_json::from_str(frame).unwrap();
-        if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
+        let delta = &chunk["choices"][0]["delta"];
+        // Deltas carry `reasoning_content` XOR `content` (DeepSeek clients
+        // break when both appear in one chunk).
+        assert!(
+            !(
+                delta["content"].as_str().is_some_and(|c| !c.is_empty()) &&
+                delta["reasoning_content"].as_str().is_some()
+            ),
+            "delta carries both content and reasoning_content: {delta}"
+        );
+        if let Some(content) = delta["content"].as_str() {
             streamed_text.push_str(content);
+        }
+        if let Some(reasoning) = delta["reasoning_content"].as_str() {
+            streamed_reasoning.push_str(reasoning);
         }
     }
     assert_eq!(streamed_text, expected_text);
+    assert_eq!(streamed_reasoning, "thinking really hard");
 
     // Unload directive removes the model from /v1/models and /status.
     stub.state().directives.unload_models = vec![TAG_CHAT.to_string()];

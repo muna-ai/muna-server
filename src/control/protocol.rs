@@ -159,6 +159,7 @@ pub(crate) struct EdgeResponse {
 }
 
 impl NodeStatus {
+
     pub(crate) fn collect(state: &AppState) -> NodeStatus {
         let disk = crate::metrics::disk_space_mb(state.muna.client.cache_path());
         NodeStatus {

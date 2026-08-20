@@ -1,5 +1,12 @@
 ## 0.0.5
-*INCOMPLETE*
++ Added `reasoning_content` passthrough for reasoning models in OpenAI-compatible chat completions.
++ Added download progress reporting for model resources.
++ Fixed parallel-safe resource downloads: concurrent model loads sharing a resource file no longer race.
++ Updated requests for a model that is still loading to return `429` with `Retry-After` instead of `503`.
++ Updated requests for models not in the `--models` allowlist to return `404` with OpenAI's `model_not_found` error shape.
++ Updated model loading to begin eagerly at boot for models pinned via `--models`.
++ Renamed server environment variables to the `MUNA_SERVER_` prefix (e.g. `MUNA_SERVER_MODELS`, `MUNA_SERVER_ID`, `MUNA_SERVER_TOKEN`).
++ Upgraded `muna` to 0.0.16.
 
 ## 0.0.4
 + Added `--models` CLI option to eagerly load and restrict the models that can be served.
