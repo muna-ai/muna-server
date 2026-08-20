@@ -1,5 +1,6 @@
 ## 0.0.6
-*INCOMPLETE*
++ Removed the `preload` subcommand. Pin models with `--models` to load them eagerly at boot instead.
++ Removed the `serve` subcommand. Serving is now the sole top-level command: `muna-server [flags]`.
 
 ## 0.0.5
 + Added `reasoning_content` passthrough for reasoning models in OpenAI-compatible chat completions.

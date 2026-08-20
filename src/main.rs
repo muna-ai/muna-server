@@ -3,13 +3,11 @@
 *   Copyright © 2026 NatML Inc. All Rights Reserved.
 */
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
-use muna::types::Acceleration;
+use clap::Parser;
 use muna::Muna;
 
 mod client;
@@ -29,39 +27,25 @@ use state::{AppState, NodeContext};
 )]
 struct Cli {
     /// Port the HTTP server listens on.
-    #[arg(long, default_value = "8000", env = "PORT", global = true)]
+    #[arg(long, default_value = "8000", env = "PORT")]
     port: u16,
     /// Control plane base URL. Enables the heartbeat loop and KV event relay.
-    #[arg(long, env = "MUNA_SERVER_CONTROL_PLANE_URL", global = true)]
+    #[arg(long, env = "MUNA_SERVER_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
     /// Node identity assigned by the control plane at provision time.
-    #[arg(long, env = "MUNA_SERVER_ID", global = true)]
+    #[arg(long, env = "MUNA_SERVER_ID")]
     node_id: Option<String>,
     /// Heartbeat cadence in seconds.
-    #[arg(long, default_value = "5", env = "MUNA_SERVER_HEARTBEAT_INTERVAL", global = true)]
+    #[arg(long, default_value = "5", env = "MUNA_SERVER_HEARTBEAT_INTERVAL")]
     heartbeat_interval: u64,
     /// KV relay flush cadence in seconds.
-    #[arg(long, default_value = "1", env = "MUNA_SERVER_KV_FLUSH_INTERVAL", global = true)]
+    #[arg(long, default_value = "1", env = "MUNA_SERVER_KV_FLUSH_INTERVAL")]
     kv_flush_interval: u64,
     /// Predictor tags this server serves (comma-separated). When set, the
     /// models are loaded eagerly at boot and requests for any other tag are
     /// rejected with 404. Unset leaves any tag loadable on demand.
-    #[arg(long, env = "MUNA_SERVER_MODELS", value_delimiter = ',', global = true)]
+    #[arg(long, env = "MUNA_SERVER_MODELS", value_delimiter = ',')]
     models: Vec<String>,
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Run the OpenAI-compatible HTTP server.
-    Serve,
-    /// Preload one or more predictor tags and exit.
-    Preload {
-        /// Predictor tags to preload.
-        #[arg(required = true)]
-        tags: Vec<String>,
-    },
 }
 
 #[tokio::main]
@@ -74,17 +58,9 @@ async fn main() {
         )
         .init();
 
-    if let Err(e) = run().await {
+    if let Err(e) = serve(&Cli::parse()).await {
         eprintln!("{e}");
         std::process::exit(1);
-    }
-}
-
-async fn run() -> Result<(), String> {
-    let mut cli = Cli::parse();
-    match cli.command.take().unwrap_or(Command::Serve) {
-        Command::Serve => serve(&cli).await,
-        Command::Preload { tags } => preload(tags).await.map_err(|e| e.to_string()),
     }
 }
 
@@ -134,28 +110,6 @@ async fn serve(cli: &Cli) -> Result<(), String> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| format!("server error: {e}"))
-}
-
-/// Download-only preload (empty inputs): embeds predictor resources into a
-/// deploy image at build time without loading the engine.
-async fn preload(tags: Vec<String>) -> Result<(), muna::MunaError> {
-    let muna = Muna::with_client(Arc::new(client::ServerClient::new()));
-    for tag in tags {
-        println!("Preloading {tag}");
-        let prediction = muna
-            .predictions
-            .create(
-                &tag,
-                Some(HashMap::<String, muna::types::Value>::new()),
-                Some(Acceleration::LocalGpu),
-                None,
-                None,
-            )
-            .await?;
-        let resource_count = prediction.resources.as_ref().map_or(0, Vec::len);
-        println!("Preloaded {tag} ({resource_count} resources)");
-    }
-    Ok(())
 }
 
 async fn shutdown_signal() {

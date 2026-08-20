@@ -22,10 +22,10 @@ travels in each request's `model` field, so one server can serve any predictor o
 export MUNA_ACCESS_KEY=muna_***
 
 # Start the server (defaults to PORT=8000)
-cargo run -- serve
+cargo run
 
-# Optionally warm a predictor ahead of time so the first request is fast
-cargo run -- preload @huggingface/smollm2-360m
+# Optionally pin models to load eagerly at boot (also restricts serving to them)
+cargo run -- --models @huggingface/smollm2-360m
 ```
 
 ## Creating Chat Completions
@@ -66,8 +66,9 @@ Response:
 ```
 
 The response's `model` field is the predictor's internal display name, not the tag you passed.
-The first request to a tag downloads and loads the model, so it is slower than warm requests;
-use `preload` to avoid that latency.
+The first request to a tag downloads and loads the model; requests arriving mid-load receive
+`429` with a `Retry-After` header. Start the server with `--models` to load eagerly at boot
+instead, and watch `GET /v1/models` for the model to appear once it is ready.
 
 ### Streaming
 
