@@ -1,3 +1,6 @@
+## 0.0.7
+*INCOMPLETE*
+
 ## 0.0.6
 + Removed the `preload` subcommand. Pin models with `--models` to load them eagerly at boot instead.
 + Removed the `serve` subcommand. Serving is now the sole top-level command: `muna-server [flags]`.
