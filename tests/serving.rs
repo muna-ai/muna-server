@@ -444,6 +444,128 @@ async fn image_generations_b64_png() {
 }
 
 // ---------------------------------------------------------------------------
+// Anthropic surface (fake LLM)
+// ---------------------------------------------------------------------------
+
+/// Parse an Anthropic SSE body into (event name, data JSON) frames.
+fn anthropic_sse_frames(sse: &str) -> Vec<(String, Value)> {
+    let mut frames = Vec::new();
+    let mut event_name: Option<String> = None;
+    for line in sse.lines() {
+        if let Some(name) = line.strip_prefix("event: ") {
+            event_name = Some(name.to_string());
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            let name = event_name.take().expect("data frame without event name");
+            frames.push((name, serde_json::from_str(data).unwrap()));
+        }
+    }
+    frames
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn anthropic_messages_non_streaming_and_streaming() {
+    skip_without_access_key!();
+    skip_if_unpushed!(TAG_CHAT);
+    let stub = StubControlPlane::start().await;
+    let server = ServerGuard::spawn(&stub).await;
+    let client = reqwest::Client::new();
+    let expected_text = "the quick brown fox";
+    let request = json!({
+        "model": TAG_CHAT,
+        "max_tokens": 256,
+        "system": "You are a helpful assistant.",
+        "messages": [
+            { "role": "user", "content": expected_text },
+        ],
+    });
+
+    // Non-streaming: the OpenAI-shaped fake predictor is adapted into an
+    // Anthropic message with thinking + text content blocks.
+    let response = client
+        .post(format!("{}/v1/messages", server.url()))
+        .json(&request)
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap();
+    let response_status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(response_status, 200, "message creation failed: {body}");
+    let message: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(message["type"], json!("message"));
+    assert_eq!(message["role"], json!("assistant"));
+    assert!(message["id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert_eq!(message["stop_reason"], json!("end_turn"));
+    // The fake emits a reasoning delta before its content deltas; the adapter
+    // must surface it as a leading thinking block before the text block.
+    let content = message["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], json!("thinking"));
+    assert_eq!(content[0]["thinking"], json!("thinking really hard"));
+    assert_eq!(content[1]["type"], json!("text"));
+    assert_eq!(content[1]["text"], json!(expected_text));
+    // The fake reports cached_tokens == number of user messages (1 here);
+    // the adapter maps it to Anthropic's cache_read_input_tokens and
+    // excludes it from input_tokens.
+    assert_eq!(message["usage"]["cache_read_input_tokens"], json!(1));
+    assert!(message["usage"]["input_tokens"].is_u64());
+    assert!(message["usage"]["output_tokens"].as_u64().unwrap() > 0);
+
+    // Streaming: named SSE events with no [DONE] terminator.
+    let mut streaming_request = request.clone();
+    streaming_request["stream"] = json!(true);
+    let sse = client
+        .post(format!("{}/v1/messages", server.url()))
+        .json(&streaming_request)
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap()
+        .text().await.unwrap();
+    assert!(!sse.contains("[DONE]"), "Anthropic SSE must not emit [DONE]: {sse}");
+    let frames = anthropic_sse_frames(&sse);
+    assert!(frames.len() >= 5, "expected several SSE frames, got: {sse}");
+    assert_eq!(frames.first().unwrap().0, "message_start");
+    assert_eq!(frames.last().unwrap().0, "message_stop");
+    let mut streamed_text = String::new();
+    let mut streamed_thinking = String::new();
+    let mut stop_reason = None;
+    for (name, data) in &frames {
+        // Each frame's payload `type` matches its SSE event name.
+        assert_eq!(data["type"], json!(name));
+        match name.as_str() {
+            "content_block_delta" => match data["delta"]["type"].as_str() {
+                Some("text_delta") => {
+                    streamed_text.push_str(data["delta"]["text"].as_str().unwrap());
+                }
+                Some("thinking_delta") => {
+                    streamed_thinking.push_str(data["delta"]["thinking"].as_str().unwrap());
+                }
+                other => panic!("unexpected content block delta type: {other:?}"),
+            },
+            "message_delta" => {
+                stop_reason = data["delta"]["stop_reason"].as_str().map(str::to_string);
+                assert_eq!(data["usage"]["cache_read_input_tokens"], json!(1));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(streamed_text, expected_text);
+    assert_eq!(streamed_thinking, "thinking really hard");
+    assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+
+    // A failing request maps to the Anthropic error envelope.
+    let response = client
+        .post(format!("{}/v1/messages", server.url()))
+        .json(&json!({
+            "model": "@muna/does-not-exist-xyz",
+            "max_tokens": 64,
+            "messages": [{ "role": "user", "content": "hi" }],
+        }))
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap();
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["type"], json!("error"));
+    assert!(error["error"]["type"].as_str().is_some_and(|t| !t.is_empty()));
+    assert!(error["error"]["message"].as_str().is_some_and(|m| !m.is_empty()));
+}
+
+// ---------------------------------------------------------------------------
 // Dispatcher over HTTP (/v1/predictions/remote)
 // ---------------------------------------------------------------------------
 

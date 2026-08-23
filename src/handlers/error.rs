@@ -134,3 +134,79 @@ pub(crate) fn muna_error_value(e: &muna::MunaError) -> Value {
         }
     })
 }
+
+/// Anthropic-style error envelope: same statuses and messages as
+/// [`AppError`], re-shaped to `{"type": "error", "error": {"type", "message"}}`.
+pub(crate) struct AnthropicError(AppError);
+
+impl IntoResponse for AnthropicError {
+
+    fn into_response(self) -> Response {
+        let AppError { status, body, retry_after } = self.0;
+        let message = body["error"]["message"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string();
+        let body = json!({
+            "type": "error",
+            "error": {
+                "type": anthropic_error_type(status),
+                "message": message,
+            }
+        });
+        let mut response = (status, Json(body)).into_response();
+        if let Some(retry_after) = retry_after {
+            if let Ok(value) = retry_after.to_string().parse() {
+                response.headers_mut().insert("Retry-After", value);
+            }
+        }
+        response
+    }
+}
+
+/// Re-shape any [`AppError`] into the Anthropic envelope, so handlers can
+/// build errors with the existing constructors and convert with `.into()`.
+impl From<AppError> for AnthropicError {
+
+    fn from(e: AppError) -> Self {
+        Self(e)
+    }
+}
+
+/// Let `?` lift muna prediction errors into 500 `api_error` responses.
+impl From<muna::MunaError> for AnthropicError {
+
+    fn from(e: muna::MunaError) -> Self {
+        Self(AppError::from(e))
+    }
+}
+
+/// Let `?` lift registry errors (loading, failed, not served) into their
+/// respective 429 / 500 / 404 Anthropic-shaped responses.
+impl From<RegistryError> for AnthropicError {
+
+    fn from(e: RegistryError) -> Self {
+        Self(AppError::from(e))
+    }
+}
+
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST         => "invalid_request_error",
+        StatusCode::NOT_FOUND           => "not_found_error",
+        StatusCode::TOO_MANY_REQUESTS   => "rate_limit_error",
+        StatusCode::SERVICE_UNAVAILABLE => "overloaded_error",
+        _                               => "api_error",
+    }
+}
+
+/// Anthropic-style error payload for embedding in an SSE stream.
+pub(crate) fn anthropic_error_value(e: &muna::MunaError) -> Value {
+    json!({
+        "type": "error",
+        "error": {
+            "message": e.to_string(),
+            "type": "api_error",
+        }
+    })
+}

@@ -8,8 +8,10 @@
 //! - [`ops`]: liveness, node status, drain, fallback consumed by supervisors and the control plane.
 //! - [`predictions`]: Muna-native prediction endpoint.
 //! - [`openai`]: OpenAI-compatible API.
-//! - [`error`]: OpenAI-style error envelope shared by the API handlers.
+//! - [`anthropic`]: Anthropic-compatible API.
+//! - [`error`]: OpenAI- and Anthropic-style error envelopes shared by the API handlers.
 
+mod anthropic;
 mod error;
 mod openai;
 mod ops;
@@ -37,6 +39,8 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/v1/chat/completions", post(openai::chat_completions))
         .route("/v1/embeddings", post(openai::embeddings))
         .route("/v1/images/generations", post(openai::image_generations))
+        // Anthropic compatibility
+        .route("/v1/messages", post(anthropic::messages))
         // Fallbacks
         .fallback(ops::not_found)
 }

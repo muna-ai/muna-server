@@ -1,5 +1,6 @@
 ## 0.0.7
-*INCOMPLETE*
++ Added support for Anthropic-compatible messages at `/v1/messages`.
++ Upgraded `muna` to 0.0.17.
 
 ## 0.0.6
 + Removed the `preload` subcommand. Pin models with `--models` to load them eagerly at boot instead.
