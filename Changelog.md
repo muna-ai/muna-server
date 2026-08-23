@@ -1,3 +1,6 @@
+## 0.0.8
+*INCOMPLETE*
+
 ## 0.0.7
 + Added support for Anthropic-compatible messages at `/v1/messages`.
 + Upgraded `muna` to 0.0.17.
