@@ -31,7 +31,9 @@ pub(crate) enum GpuFamily {
     L40S,
     A100,
     H100,
+    H200,
     B200,
+    B300,
     MI350X,
     MI355X,
 }
@@ -56,7 +58,9 @@ impl GpuFamily {
             ("L4",     GpuFamily::L4),
             ("A100",   GpuFamily::A100),
             ("H100",   GpuFamily::H100),
+            ("H200",   GpuFamily::H200),
             ("B200",   GpuFamily::B200),
+            ("B300",   GpuFamily::B300),
             ("MI350X", GpuFamily::MI350X),
             ("MI355X", GpuFamily::MI355X),
         ]
