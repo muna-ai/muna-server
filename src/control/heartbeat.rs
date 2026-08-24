@@ -7,13 +7,15 @@
 //!
 //! Every `heartbeat_interval`, POST the full `NodeStatus` (per-model state,
 //! GPU metrics) to `{control}/v1/nodes/{node_id}/heartbeat`. The response
-//! drives reconciliation with imperative deltas: `load_models` /
-//! `unload_models` are idempotent no-ops for already-satisfied tags, and the
-//! control plane self-heals by diffing against the fresh status every beat.
+//! is a declarative list of goal descriptors (tag, residency `process` |
+//! `disk` | `none`, optional download key); the node diffs it against its
+//! own actual state and walks the warmth ladder locally. An absent tag
+//! means "no opinion", so an empty response (also the parse-failure
+//! default) is a guaranteed no-op.
 
 use std::sync::Arc;
 
-use crate::control::protocol::{HeartbeatResponse, NodeStatus};
+use crate::control::protocol::{HeartbeatResponse, NodeStatus, Residency};
 use crate::state::AppState;
 
 pub(crate) async fn run(state: Arc<AppState>) {
@@ -59,23 +61,57 @@ pub(crate) async fn run(state: Arc<AppState>) {
     }
 }
 
+/// Diff the goal residency map against local state. Every arm is
+/// idempotent, so re-applying the same goal each beat is free.
 async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
-    for tag in &reconcile.load_models {
-        state.registry.warm(tag);
+    // Store download credentials BEFORE acting on residency: the registry
+    // loader and cache downloader read the key store when they build the
+    // per-model Muna clients the directives below trigger.
+    for descriptor in &reconcile.models {
+        if let Some(key) = &descriptor.key {
+            state.keys.insert(descriptor.tag.clone(), key.clone());
+        }
     }
-    for tag in &reconcile.unload_models {
-        state.dispatcher.remove(tag);
-        state.registry.unload(tag).await;
-    }
-    if let Some(node) = &state.node {
-        node.event_callbacks.send_if_modified(|current| {
-            if *current == reconcile.event_callback_urls {
-                false
-            } else {
-                *current = reconcile.event_callback_urls.clone();
-                true
+    for descriptor in &reconcile.models {
+        let tag = &descriptor.tag;
+        // A residency goal for a tag outside the pinned set (`--models`) is
+        // a control-plane misconfiguration: neither loaded nor cached.
+        if !state.registry.serves(tag) {
+            if !matches!(descriptor.residency, Residency::None) {
+                tracing::warn!(
+                    tag = %tag,
+                    "residency goal ignored: tag is not in this server's --models set"
+                );
             }
-        });
+            continue;
+        }
+        match descriptor.residency {
+            Residency::Process => {
+                // `process` implies `disk`: track the cached tier too, so a
+                // later demotion reports `cached` instead of vanishing.
+                // The engine load downloads the same resources; the
+                // client's per-path single-flight de-duplicates the work.
+                state.cache.ensure_cached(tag);
+                state.registry.warm_reconcile(tag);
+            }
+            Residency::Disk => {
+                // Demote: engine out (idempotent no-op when not loaded),
+                // resources on disk.
+                state.dispatcher.remove(tag);
+                state.registry.unload(tag).await;
+                state.cache.ensure_cached(tag);
+            }
+            Residency::None => {
+                // Engine out. Disk eviction is PERMITTED but not required;
+                // genuinely cached resources stay (and keep reporting
+                // `cached`) until node-local GC under disk pressure exists.
+                // A failed cache record, by contrast, is forgotten: nothing
+                // is on disk, so there is nothing to keep reporting.
+                state.dispatcher.remove(tag);
+                state.registry.unload(tag).await;
+                state.cache.forget_failed(tag);
+            }
+        }
     }
     if reconcile.drain != state.is_draining() {
         tracing::info!(drain = reconcile.drain, "drain state changed by control plane");

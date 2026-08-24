@@ -4,14 +4,23 @@
 */
 
 use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use muna::Muna;
+use dashmap::DashMap;
+use muna::MunaClient;
 
+use crate::serving::cache::CacheTracker;
 use crate::serving::dispatch::Dispatcher;
 use crate::serving::registry::ModelRegistry;
+
+/// Per-tag deployment keys delivered by control-plane residency directives
+/// (`HeartbeatResponse::keys`). Read by the registry loader and the cache
+/// downloader when constructing per-model Muna clients; tags without an
+/// entry fall back to the process-wide `$MUNA_ACCESS_KEY`.
+pub(crate) type KeyStore = Arc<DashMap<String, String>>;
 
 /// Control-plane wiring, present only when the server runs as a fleet node.
 pub(crate) struct NodeContext {
@@ -26,18 +35,21 @@ pub(crate) struct NodeContext {
     /// flush is unroutable for a full window), and an idle window sends
     /// no HTTP at all.
     pub kv_flush_interval: Duration,
-    /// Edge indexer callback URLs for the KV relay, refreshed by every
-    /// heartbeat response.
-    pub event_callbacks: tokio::sync::watch::Sender<Vec<String>>,
 }
 
 pub(crate) struct AppState {
-    /// Muna client.
-    pub muna: Arc<Muna>,
     /// Per-model load-state machine.
     pub registry: ModelRegistry,
+    /// Cached-tier tracker (resources on disk, no engine).
+    pub cache: CacheTracker,
     /// Per-model prediction dispatcher.
     pub dispatcher: Dispatcher,
+    /// Per-tag deployment keys from residency directives; see [`KeyStore`].
+    pub keys: KeyStore,
+    /// Resource-cache directory (env-derived), for disk metrics. There is
+    /// no process-wide Muna client: each loaded model owns its own (see
+    /// `ReadyModel::muna`).
+    pub cache_path: PathBuf,
     /// Control-plane wiring; `None` in standalone mode.
     pub node: Option<NodeContext>,
     /// Process start, for uptime reporting.
@@ -54,14 +66,19 @@ impl AppState {
     const CHECKIN_RETRY_SECONDS: u64 = 60 * 60;
 
     pub(crate) fn new(
-        muna: Arc<Muna>,
         pinned: Option<HashSet<String>>,
         node: Option<NodeContext>
     ) -> Self {
+        let keys: KeyStore = Arc::new(DashMap::new());
+        // Throwaway client purely for the env-derived cache location; it
+        // holds no credential and makes no requests.
+        let cache_path = MunaClient::new(None, None).cache_path().to_path_buf();
         Self {
-            registry: ModelRegistry::new(muna.clone(), pinned),
-            dispatcher: Dispatcher::new(muna.clone()),
-            muna,
+            registry: ModelRegistry::new(keys.clone(), pinned),
+            cache: CacheTracker::new(keys.clone()),
+            dispatcher: Dispatcher::new(),
+            keys,
+            cache_path,
             node,
             start_time: Instant::now(),
             draining: AtomicBool::new(false),
@@ -89,7 +106,12 @@ impl AppState {
         if now < next_checkin {
             return;
         }
-        let result = self
+        // Check in through the model's own (keyed) Muna instance; a model
+        // that is no longer loaded has nothing to check in for.
+        let Some(ready) = self.registry.ready(model) else {
+            return;
+        };
+        let result = ready
             .muna
             .predictions
             .create(model, None, None, None, None)

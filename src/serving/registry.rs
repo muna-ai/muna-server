@@ -20,10 +20,12 @@ use dashmap::DashMap;
 use muna::types::{Acceleration, Signature, Value};
 use muna::Muna;
 
+use crate::client::ServerClient;
 use crate::metrics;
 use crate::serving::batch::BatchPlan;
 use crate::serving::predict;
 use crate::serving::stats::ModelStats;
+use crate::state::KeyStore;
 
 /// How long a request waits on a `Loading` model before giving up with 429.
 const HOLD_THRESHOLD: Duration = Duration::from_secs(10);
@@ -31,8 +33,21 @@ const HOLD_THRESHOLD: Duration = Duration::from_secs(10);
 /// Retry-After fallback before any load has completed.
 const DEFAULT_LOAD_SECS: u64 = 30;
 
+/// Reconciliation-path retry backoff for failed loads. Under a declarative
+/// goal the control plane re-asserts `process` every beat; without this a node
+/// that just failed would hot-loop engine loads at heartbeat cadence.
+const FAILED_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
 /// A model whose engine is warm and whose signature is known.
 pub(crate) struct ReadyModel {
+    /// The per-model Muna client that performed the warm load. It OWNS the
+    /// loaded native predictor handle (muna-rs caches handles per client
+    /// instance), so it must live exactly as long as the model: every
+    /// prediction goes through it, and unload deletes through it -- a
+    /// delete through any other instance would silently leak the handle.
+    /// Also carries the model's deployment key when the control plane
+    /// supplied one.
+    pub muna: Arc<Muna>,
     /// When the load completed (reported as the model's `created` age by
     /// the OpenAI-compatible `/v1/models` handler).
     pub loaded_at: Instant,
@@ -95,18 +110,17 @@ pub(crate) struct ModelRegistry {
     inner: Arc<RegistryInner>,
 }
 
-/// Loader delegate: performs the warmup + signature fetch for one tag.
+/// Loader delegate: performs the warmup + signature fetch for one tag and
+/// returns the per-model Muna client that owns the loaded handle.
 /// Injectable so single-flight behavior is testable without a live engine.
 type Loader = Arc<
-    dyn Fn(String) -> futures_util::future::BoxFuture<'static, Result<Signature, String>>
+    dyn Fn(String) -> futures_util::future::BoxFuture<'static, Result<(Signature, Arc<Muna>), String>>
         + Send
         + Sync
 >;
 
 /// Shared state behind the cloneable `ModelRegistry` handle.
 struct RegistryInner {
-    /// Muna client, used to delete predictors on unload.
-    muna: Arc<Muna>,
     /// Per-tag slots; a tag's absence means it was never loaded (or was
     /// unloaded).
     models: DashMap<String, Slot>,
@@ -121,27 +135,26 @@ struct RegistryInner {
 
 impl ModelRegistry {
 
-    /// Create a model registry.
+    /// Create a model registry. `keys` holds the per-tag deployment keys
+    /// delivered by control-plane residency directives; tags without one
+    /// load through the process-wide `$MUNA_ACCESS_KEY`.
     pub(crate) fn new(
-        muna: Arc<Muna>,
+        keys: KeyStore,
         pinned: Option<HashSet<String>>
     ) -> Self {
-        let loader_muna = muna.clone();
         let loader: Loader = Arc::new(move |tag| {
-            let muna = loader_muna.clone();
-            Box::pin(async move { load_model(&muna, &tag).await })
+            let key = keys.get(&tag).map(|entry| entry.value().clone());
+            Box::pin(async move { load_model(&tag, key).await })
         });
-        Self::with_loader(muna, loader, pinned)
+        Self::with_loader(loader, pinned)
     }
 
     fn with_loader(
-        muna: Arc<Muna>,
         loader: Loader,
         pinned: Option<HashSet<String>>
     ) -> Self {
         Self {
             inner: Arc::new(RegistryInner {
-                muna,
                 models: DashMap::new(),
                 loader,
                 pinned,
@@ -216,7 +229,7 @@ impl ModelRegistry {
 
     /// Whether this server serves the tag (member of the pinned set, or no
     /// pinned set configured).
-    fn serves(&self, tag: &str) -> bool {
+    pub(crate) fn serves(&self, tag: &str) -> bool {
         self.inner
             .pinned
             .as_ref()
@@ -253,9 +266,30 @@ impl ModelRegistry {
         }
     }
 
+    /// Warm a model on the reconciliation path: like [`warm`](Self::warm),
+    /// but a recent failure is left to cool down instead of retrying every
+    /// heartbeat (failed stickiness -- the failure stays visible in status
+    /// reports while the backoff runs, so the plane can place elsewhere).
+    pub(crate) fn warm_reconcile(&self, tag: &str) {
+        if let Some(slot) = self.inner.models.get(tag) {
+            if let ModelState::Failed { at, .. } = &slot.state {
+                if at.elapsed() < FAILED_RETRY_BACKOFF {
+                    return;
+                }
+            }
+        }
+        self.warm(tag);
+    }
+
     /// Unload a model. Idempotent: an absent tag (or a repeated unload of a
     /// still-loading tag) is a no-op. Unloading a `Loading` tag defers the
     /// delete to the load task (see `Slot::unload_requested`).
+    ///
+    /// Two-step teardown: (1) delete the predictor through the model's OWN
+    /// Muna instance (the handle cache is per-instance, so no other client
+    /// can release it), then (2) drop the slot so the per-model `Arc<Muna>`
+    /// itself drops once in-flight predictions holding the `Arc<ReadyModel>`
+    /// finish.
     pub(crate) async fn unload(&self, tag: &str) {
         if let Some(mut slot) = self.inner.models.get_mut(tag) {
             if matches!(slot.state, ModelState::Loading { .. }) {
@@ -264,10 +298,12 @@ impl ModelRegistry {
                 return;
             }
         }
-        if self.inner.models.remove(tag).is_none() {
+        let Some((_, slot)) = self.inner.models.remove(tag) else {
             return;
+        };
+        if let ModelState::Ready(model) = slot.state {
+            delete_predictor(&model.muna, tag).await;
         }
-        delete_predictor(&self.inner.muna, tag).await;
     }
 
     /// Snapshot every slot's state for status reporting.
@@ -295,6 +331,15 @@ impl ModelRegistry {
             .collect()
     }
 
+    /// The model's `Ready` handle, if currently loaded. Never triggers a
+    /// load (unlike `ensure_ready`).
+    pub(crate) fn ready(&self, tag: &str) -> Option<Arc<ReadyModel>> {
+        self.inner.models.get(tag).and_then(|slot| match &slot.state {
+            ModelState::Ready(model) => Some(model.clone()),
+            _ => None,
+        })
+    }
+
     fn retry_after(&self, since: Instant) -> u64 {
         let expected = self.inner.last_load_secs.load(Ordering::Relaxed);
         expected.saturating_sub(since.elapsed().as_secs()).max(5)
@@ -316,8 +361,11 @@ impl ModelRegistry {
                 }
             }
             stats.record_load_time(start.elapsed());
+            // Kept out of `state` so a deferred unload can delete through
+            // the instance that actually loaded the handle.
+            let mut loaded_muna: Option<Arc<Muna>> = None;
             let state = match outcome {
-                Ok(signature) => {
+                Ok((signature, muna)) => {
                     inner.last_load_secs.store(
                         start.elapsed().as_secs().max(1),
                         Ordering::Relaxed
@@ -327,7 +375,9 @@ impl ModelRegistry {
                         load_time_ms = %format!("{:.0}", start.elapsed().as_secs_f64() * 1000.0),
                         "model ready"
                     );
+                    loaded_muna = Some(muna.clone());
                     ModelState::Ready(Arc::new(ReadyModel {
+                        muna,
                         loaded_at: Instant::now(),
                         plan: BatchPlan::from_signature(&signature),
                         signature,
@@ -353,7 +403,9 @@ impl ModelRegistry {
                 // the map, find it vacant, and re-warm organically if they
                 // still want the model.
                 inner.models.remove(&tag);
-                delete_predictor(&inner.muna, &tag).await;
+                if let Some(muna) = loaded_muna {
+                    delete_predictor(&muna, &tag).await;
+                }
             }
         });
     }
@@ -372,9 +424,13 @@ async fn delete_predictor(muna: &Arc<Muna>, tag: &str) {
 }
 
 async fn load_model(
-    muna: &Arc<Muna>,
-    tag: &str
-) -> Result<Signature, String> {
+    tag: &str,
+    key: Option<String>
+) -> Result<(Signature, Arc<Muna>), String> {
+    // One Muna instance per model, keyed with the tag's deployment key when
+    // the control plane supplied one. The instance persists on `ReadyModel`
+    // because it owns the native predictor handle loaded below.
+    let muna = Arc::new(Muna::with_client(Arc::new(ServerClient::with_key(key))));
     // Preload convention: create a prediction that deliberately excludes
     // the predictor's required inputs. Loading the predictor runs all
     // constructors and initializers (the actual engine load); the
@@ -400,7 +456,7 @@ async fn load_model(
         sig_muna.predictors.retrieve(&sig_tag).await
     }).await.map_err(|e| e.to_string())?;
     let predictor = predictor.ok_or_else(|| format!("predictor {tag} not found"))?;
-    Ok(predictor.signature)
+    Ok((predictor.signature, muna))
 }
 
 #[cfg(test)]
@@ -431,11 +487,14 @@ mod tests {
                 if fail {
                     Err("boom".to_string())
                 } else {
-                    Ok(Signature { inputs: vec![], outputs: vec![] })
+                    Ok((
+                        Signature { inputs: vec![], outputs: vec![] },
+                        Arc::new(Muna::new(None, None))
+                    ))
                 }
             })
         });
-        ModelRegistry::with_loader(Arc::new(Muna::new(None, None)), loader, pinned)
+        ModelRegistry::with_loader(loader, pinned)
     }
 
     #[tokio::test]

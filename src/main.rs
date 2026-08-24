@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use muna::Muna;
 
 mod client;
 mod control;
@@ -71,22 +70,20 @@ async fn serve(cli: &Cli) -> Result<(), String> {
             control_plane_url: url.clone(),
             heartbeat_interval: Duration::from_secs(cli.heartbeat_interval.max(1)),
             kv_flush_interval: Duration::from_secs(cli.kv_flush_interval.max(1)),
-            event_callbacks: tokio::sync::watch::channel(Vec::new()).0,
         }),
         (Some(_), None) => {
             return Err("--control-plane-url requires --node-id".into());
         }
         _ => None,
     };
-    // ServerClient resolves $MUNA_ACCESS_KEY / $MUNA_API_URL itself and adds
-    // download single-flight + progress presentation on top of MunaClient.
-    let muna = Arc::new(Muna::with_client(Arc::new(client::ServerClient::new())));
+    // There is no process-wide Muna client: the registry builds one keyed
+    // ServerClient-backed instance per loaded model (see ReadyModel::muna).
     let pinned: Option<std::collections::HashSet<String>> = if cli.models.is_empty() {
         None
     } else {
         Some(cli.models.iter().cloned().collect())
     };
-    let state = Arc::new(AppState::new(muna, pinned, node));
+    let state = Arc::new(AppState::new(pinned, node));
     // Eager load: fire-and-forget warms so the port binds immediately;
     // mid-load requests get 429 + Retry-After.
     for tag in &cli.models {

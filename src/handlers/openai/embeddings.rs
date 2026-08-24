@@ -53,7 +53,7 @@ pub(crate) async fn embeddings(
     state.check_in_if_due(&req.model).await;
     state.mark_model_loaded(req.model.clone()).await;
     let guard = state.dispatcher.acquire(&req.model, &model).await;
-    let muna = state.muna.clone();
+    let muna = model.muna.clone();
     let tag = req.model;
     let dimensions = req.dimensions;
     let response = predict::run(move || async move {

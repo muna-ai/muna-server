@@ -77,7 +77,7 @@ async fn gpu_real_load_chat_and_cached_tokens() {
 
     // Real loading window: the engine takes minutes; a chat that arrives
     // mid-load must 429 with Retry-After.
-    stub.state().directives.load_models = vec![tag.clone()];
+    stub.set_residency(&tag, "process");
     wait_for(Duration::from_secs(30), || {
         let client = client.clone();
         let url = format!("{}/status", server.url());
@@ -129,7 +129,7 @@ async fn gpu_concurrent_chats_overlap() {
     let stub = StubControlPlane::start().await;
     let server = ServerGuard::spawn(&stub).await;
     let client = reqwest::Client::new();
-    stub.state().directives.load_models = vec![tag.clone()];
+    stub.set_residency(&tag, "process");
     wait_until_ready(&client, &server.url(), &tag).await;
 
     // Baseline single-request latency.
@@ -184,8 +184,9 @@ async fn gpu_kv_relay_snapshot_delta_need_snapshot_unload() {
     let stub = StubControlPlane::start().await;
     let server = ServerGuard::spawn(&stub).await;
     let client = reqwest::Client::new();
-    stub.state().directives.load_models = vec![tag.clone()];
-    stub.state().directives.event_callback_urls = vec![stub.kv_callback_url()];
+    // v2: no callback registration -- the relay derives the well-known
+    // `/v1/kv/events` ingest route from the control-plane URL by itself.
+    stub.set_residency(&tag, "process");
     wait_until_ready(&client, &server.url(), &tag).await;
 
     // Drive KV traffic so the engine admits blocks.
@@ -242,15 +243,20 @@ async fn gpu_kv_relay_snapshot_delta_need_snapshot_unload() {
     .await
     .expect("need_snapshot did not trigger a fresh snapshot");
 
-    // Unload stops the batches.
-    stub.state().directives.load_models = vec![];
-    stub.state().directives.unload_models = vec![tag.clone()];
+    // A `none` goal unloads the engine and stops the batches. The tag may
+    // keep reporting `cached` (resources stay on disk by design); what must
+    // disappear is the warm engine.
+    stub.set_residency(&tag, "none");
     wait_for(Duration::from_secs(30), || {
         let client = client.clone();
         let url = format!("{}/status", server.url());
+        let tag = tag.clone();
         async move {
             let status: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
-            status["models"].as_array().unwrap().is_empty()
+            !status["models"].as_array().unwrap().iter().any(|m| {
+                m["tag"] == json!(tag) &&
+                    (m["state"] == json!("ready") || m["state"] == json!("loading"))
+            })
         }
     })
     .await

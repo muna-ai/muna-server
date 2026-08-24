@@ -20,26 +20,37 @@ use muna::MunaClient;
 /// containers/CI).
 ///
 /// The registry already single-flights loads per tag, but two *different*
-/// tags loading concurrently can share a resource file (e.g. `libtvm_ffi.so`
-/// ships with every py2cpp predictor); the single-flight guard prevents
-/// concurrent writes to one destination path.
+/// tags loading concurrently can share a resource file (e.g. `libtvm_ffi.so`);
+/// the single-flight guard prevents
+/// concurrent writes to one destination path. The lock map is
+/// process-global (see [`download_locks`]) because the server constructs
+/// one keyed client per model, and per-instance maps would not protect
+/// across them.
 pub(crate) struct ServerClient {
     inner: MunaClient,
-    /// In-flight download locks, keyed by destination path.
-    downloads: DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl ServerClient {
-    /// Create a server client. Resolves the access key and API URL from the
-    /// environment, mirroring `Muna::new`.
-    pub fn new() -> Self {
-        let access_key = std::env::var("MUNA_ACCESS_KEY").ok();
+
+    /// Create a server client bound to a specific access key -- e.g. the
+    /// per-model deployment key delivered with a residency directive.
+    /// `None` falls back to `$MUNA_ACCESS_KEY` (standalone `muna deploy`
+    /// behavior).
+    pub fn with_key(key: Option<String>) -> Self {
+        let access_key = key.or_else(|| std::env::var("MUNA_ACCESS_KEY").ok());
         let url = std::env::var("MUNA_API_URL").ok();
         Self {
             inner: MunaClient::new(access_key.as_deref(), url.as_deref()),
-            downloads: DashMap::new(),
         }
     }
+}
+
+/// Process-global in-flight download locks, keyed by destination path.
+/// Shared across every `ServerClient` instance so concurrent loads through
+/// different per-model clients still single-flight shared resource files.
+fn download_locks() -> &'static DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>> {
+    static LOCKS: OnceLock<DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> = OnceLock::new();
+    LOCKS.get_or_init(DashMap::new)
 }
 
 #[async_trait]
@@ -71,8 +82,7 @@ impl Client for ServerClient {
         path: &Path,
         progress: Option<DownloadProgressFn>,
     ) -> Result<()> {
-        let lock = self
-            .downloads
+        let lock = download_locks()
             .entry(path.to_path_buf())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
@@ -98,7 +108,7 @@ impl Client for ServerClient {
             }
         };
         // Best-effort cleanup: drop the map entry once no download holds it.
-        self.downloads
+        download_locks()
             .remove_if(&path.to_path_buf(), |_, lock| Arc::strong_count(lock) <= 2);
         result
     }
@@ -247,7 +257,6 @@ mod tests {
     fn test_client() -> ServerClient {
         ServerClient {
             inner: MunaClient::new(None, None),
-            downloads: DashMap::new(),
         }
     }
 

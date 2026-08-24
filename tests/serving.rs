@@ -168,7 +168,7 @@ async fn failed_load_reported_then_cleared_by_unload() {
     let status_url = format!("{}/status", server.url());
     let bogus = "@muna/does-not-exist-xyz";
 
-    stub.state().directives.load_models = vec![bogus.to_string()];
+    stub.set_residency(bogus, "process");
     wait_for(Duration::from_secs(30), || {
         let client = client.clone();
         let url = status_url.clone();
@@ -184,9 +184,9 @@ async fn failed_load_reported_then_cleared_by_unload() {
     .await
     .expect("bogus tag never reported as failed");
 
-    // Unload clears the failed slot.
-    stub.state().directives.load_models = vec![];
-    stub.state().directives.unload_models = vec![bogus.to_string()];
+    // A `none` goal clears the failed slot (registry entry and failed
+    // cache record alike).
+    stub.set_residency(bogus, "none");
     wait_for(Duration::from_secs(10), || {
         let client = client.clone();
         let url = status_url.clone();
@@ -208,8 +208,8 @@ async fn loading_window_returns_429_with_retry_after() {
     let client = reqwest::Client::new();
     let status_url = format!("{}/status", server.url());
 
-    // Warm via directive (non-blocking), then catch the loading window.
-    stub.state().directives.load_models = vec![TAG_SLOW_COLDSTART.to_string()];
+    // Warm via a `gpu` goal (non-blocking), then catch the loading window.
+    stub.set_residency(TAG_SLOW_COLDSTART, "process");
     wait_for(Duration::from_secs(10), || {
         let client = client.clone();
         let url = status_url.clone();
@@ -359,8 +359,8 @@ async fn chat_completion_streaming_and_unload() {
     assert_eq!(streamed_text, expected_text);
     assert_eq!(streamed_reasoning, "thinking really hard");
 
-    // Unload directive removes the model from /v1/models and /status.
-    stub.state().directives.unload_models = vec![TAG_CHAT.to_string()];
+    // A `none` goal removes the model from /v1/models and /status.
+    stub.set_residency(TAG_CHAT, "none");
     wait_for(Duration::from_secs(10), || {
         let client = client.clone();
         let url = format!("{}/v1/models", server.url());
@@ -794,9 +794,9 @@ async fn pinned_models_eager_load_and_reject_unlisted() {
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["error"]["code"], json!("model_not_found"));
 
-    // A control-plane warm directive for an unlisted tag is ignored: the
-    // tag never appears in status.
-    stub.state().directives.load_models = vec![TAG_CHAT.to_string()];
+    // A control-plane `gpu` goal for an unlisted tag is ignored: the tag
+    // never appears in status (neither loaded nor cached).
+    stub.set_residency(TAG_CHAT, "process");
     tokio::time::sleep(Duration::from_secs(3)).await;
     let status: Value = client
         .get(&status_url).send().await.unwrap()

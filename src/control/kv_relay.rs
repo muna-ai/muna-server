@@ -3,7 +3,7 @@
 *   Copyright © 2026 NatML Inc. All Rights Reserved.
 */
 
-//! KV event relay: engine XPUB -> this relay -> edge indexers.
+//! KV event relay: engine XPUB -> this relay -> the control plane.
 //!
 //! Runs only in control-plane mode; one relay task per `Ready` model. The task
 //! discovers the engine's ZMQ endpoint by predicting the model's `kv`
@@ -11,13 +11,17 @@
 //! subscribes to the XPUB, tracks `(epoch, seq)` continuity, batches events
 //! over the configured flush window (`--kv-flush-interval`, default 1s --
 //! deliberately shorter than the heartbeat, since this window bounds
-//! edge-index staleness), and POSTs to every controller-provided edge
-//! callback URL. Fail-soft throughout: callback failures are logged and
-//! dropped; the engine-side stream is never back-pressured.
+//! edge-index staleness), and POSTs to the well-known
+//! `{control_plane}/v1/kv/events` route -- derived from the control-plane
+//! URL the node already has, exactly like the heartbeat route. One
+//! consumer, one continuity stream, one `need_snapshot` handler. Fail-soft
+//! throughout: POST failures are logged and dropped, a plane without a KV
+//! indexer (persistent 404/410) backs the relay off, and the engine-side
+//! stream is never back-pressured.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use muna::types::{Acceleration, Value};
 use serde_json::Value as JsonValue;
@@ -38,10 +42,18 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(60);
 /// Backoff after a failed connect / subscribe.
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 
+/// Backoff after the plane rejects the ingest route (404/410: no KV
+/// indexer behind the URL). Events in the window are dropped; continuity
+/// repairs via snapshot when the route appears.
+const NOT_FOUND_BACKOFF: Duration = Duration::from_secs(60);
+
 /// Supervisor: keeps one relay task alive per Ready model.
 pub(crate) async fn run(state: Arc<AppState>) {
     let node = state.node.as_ref().expect("kv relay requires node context");
-    let callbacks = node.event_callbacks.subscribe();
+    let ingest_url = format!(
+        "{}/v1/kv/events",
+        node.control_plane_url.trim_end_matches('/')
+    );
     let mut tasks: HashMap<String, (CancellationToken, tokio::task::JoinHandle<()>)> = HashMap::new();
     // Models whose kv-sidecar discovery failed (not KV-routed); avoid
     // re-predicting the sidecar on every scan.
@@ -73,7 +85,7 @@ pub(crate) async fn run(state: Arc<AppState>) {
                 state.clone(),
                 tag.clone(),
                 endpoint,
-                callbacks.clone(),
+                ingest_url.clone(),
                 cancel.clone()
             ));
             tasks.insert(tag.clone(), (cancel, handle));
@@ -85,7 +97,9 @@ pub(crate) async fn run(state: Arc<AppState>) {
 /// engine's ZMQ endpoint. A prediction failure means the model has no kv
 /// sidecar, i.e. it is not KV-routed.
 async fn discover_endpoint(state: &Arc<AppState>, tag: &str) -> Option<String> {
-    let muna = state.muna.clone();
+    // The sidecar shares the base model's engine, so predict through the
+    // model's own (keyed) Muna instance from the registry.
+    let muna = state.registry.ready(tag)?.muna.clone();
     let sidecar = format!("{tag}:kv");
     let result = predict::run(move || async move {
         let inputs = HashMap::from([("_".to_string(), Value::Null)]);
@@ -161,21 +175,24 @@ impl Continuity {
 }
 
 struct EdgeState {
-    /// Edge asked for (or has never received) a snapshot; deltas are
+    /// The plane asked for (or has never received) a snapshot; deltas are
     /// withheld until one flows.
     needs_snapshot: bool,
+    /// The ingest route 404/410'd; POSTs are suspended until this passes.
+    backoff_until: Option<Instant>,
 }
 
 async fn relay_model(
     state: Arc<AppState>,
     tag: String,
     endpoint: String,
-    callbacks: tokio::sync::watch::Receiver<Vec<String>>,
+    ingest_url: String,
     cancel: CancellationToken
 ) {
     let node_id = state.node.as_ref()
         .map(|n| n.node_id.clone())
         .unwrap_or_default();
+    let token = std::env::var("MUNA_SERVER_TOKEN").ok();
     let flush_interval = state.node.as_ref()
         .map(|n| n.kv_flush_interval)
         .unwrap_or(Duration::from_secs(1));
@@ -188,7 +205,9 @@ async fn relay_model(
             return;
         }
     };
-    let mut edges: HashMap<String, EdgeState> = HashMap::new();
+    // A fresh session starts snapshot-pending: the plane must not apply
+    // deltas before a full baseline.
+    let mut edge = EdgeState { needs_snapshot: true, backoff_until: None };
     'session: loop {
         if cancel.is_cancelled() {
             return;
@@ -218,12 +237,13 @@ async fn relay_model(
                 _ = flush.tick() => {
                     let want_reconnect = flush_pending(
                         &http,
+                        &ingest_url,
+                        token.as_deref(),
                         &node_id,
                         &tag,
                         continuity.epoch.as_deref(),
                         &mut pending,
-                        &mut edges,
-                        &callbacks
+                        &mut edge
                     ).await;
                     if want_reconnect {
                         // A rejoin forces a snapshot from the XPUB.
@@ -302,36 +322,40 @@ fn parse_message(message: zeromq::ZmqMessage) -> Option<(u64, JsonValue)> {
     Some((seq, payload))
 }
 
-/// POST the pending batch to every edge callback. Returns whether a SUB
-/// reconnect is needed (an edge wants a snapshot the buffer doesn't hold).
-///
-/// A snapshot batch goes to every edge, not just the one that requested it:
-/// the snapshot consumes a publisher seq, so withholding it from current
-/// edges would open a gap in their stream. Snapshots are reset-then-set and
-/// therefore idempotent for edges that were already current.
+/// POST the pending batch to the plane's ingest route. Returns whether a
+/// SUB reconnect is needed (the plane wants a snapshot the buffer doesn't
+/// hold -- a rejoin forces one from the XPUB).
 async fn flush_pending(
     http: &reqwest::Client,
+    ingest_url: &str,
+    token: Option<&str>,
     node_id: &str,
     tag: &str,
     epoch: Option<&str>,
     pending: &mut Pending,
-    edges: &mut HashMap<String, EdgeState>,
-    callbacks: &tokio::sync::watch::Receiver<Vec<String>>
+    edge: &mut EdgeState
 ) -> bool {
-    let urls = callbacks.borrow().clone();
-    edges.retain(|url, _| urls.iter().any(|u| u == url));
-    for url in &urls {
-        // A new edge starts snapshot-pending: it must not apply deltas
-        // before a full baseline.
-        edges.entry(url.clone()).or_insert(EdgeState { needs_snapshot: true });
+    if let Some(until) = edge.backoff_until {
+        if Instant::now() < until {
+            // Plane has no KV indexer behind the route: drop the window's
+            // events (state repairs by snapshot once the route appears)
+            // and stay quiet.
+            *pending = Pending::default();
+            edge.needs_snapshot = true;
+            return false;
+        }
+        edge.backoff_until = None;
     }
     let Some(epoch) = epoch else {
         return false;
     };
     let Some(seq_range) = pending.seq_range else {
-        // Nothing buffered; still reconnect if any edge awaits a snapshot.
-        return edges.values().any(|e| e.needs_snapshot);
+        // Nothing buffered; still reconnect if the plane awaits a snapshot.
+        return edge.needs_snapshot;
     };
+    if edge.needs_snapshot && !pending.snapshot {
+        return true;
+    }
     let batch = RelayBatch {
         worker_id: node_id,
         model: tag,
@@ -341,28 +365,30 @@ async fn flush_pending(
         events: &pending.events,
     };
     let mut want_reconnect = false;
-    for url in &urls {
-        let edge = edges.get_mut(url).expect("edge state ensured above");
-        if edge.needs_snapshot && !pending.snapshot {
-            want_reconnect = true;
-            continue;
+    let mut request = http.post(ingest_url).json(&batch);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    match request.send().await {
+        Ok(response) if response.status().is_success() => {
+            let reply: EdgeResponse = response.json().await.unwrap_or_default();
+            edge.needs_snapshot = reply.need_snapshot;
+            want_reconnect = reply.need_snapshot;
         }
-        match http.post(url).json(&batch).send().await {
-            Ok(response) if response.status().is_success() => {
-                let reply: EdgeResponse = response.json().await.unwrap_or_default();
-                if reply.need_snapshot {
-                    edge.needs_snapshot = true;
-                    want_reconnect = true;
-                } else {
-                    edge.needs_snapshot = false;
-                }
-            }
-            Ok(response) => {
-                tracing::warn!(url = %url, status = %response.status(), "kv callback rejected");
-            }
-            Err(e) => {
-                tracing::warn!(url = %url, error = %e, "kv callback failed");
-            }
+        Ok(response) if matches!(response.status().as_u16(), 404 | 410) => {
+            tracing::info!(
+                url = %ingest_url,
+                status = %response.status(),
+                "control plane has no KV ingest route; relay backing off"
+            );
+            edge.backoff_until = Some(Instant::now() + NOT_FOUND_BACKOFF);
+            edge.needs_snapshot = true;
+        }
+        Ok(response) => {
+            tracing::warn!(url = %ingest_url, status = %response.status(), "kv ingest rejected");
+        }
+        Err(e) => {
+            tracing::warn!(url = %ingest_url, error = %e, "kv ingest failed");
         }
     }
     *pending = Pending::default();

@@ -84,7 +84,7 @@ async fn stream_prediction(
     // Streams bypass batching (per-request token streams cannot merge);
     // sequential models still hold their guard for the whole stream.
     let guard = state.dispatcher.acquire(&tag, &model).await;
-    let muna = state.muna.clone();
+    let muna = model.muna.clone();
     let stream_tag = tag.clone();
     let rx = predict::stream(move || async move {
         muna.predictions.stream(&stream_tag, inputs, Some(acceleration)).await

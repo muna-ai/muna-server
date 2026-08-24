@@ -55,7 +55,7 @@ pub(crate) async fn image_generations(
         size,
         acceleration: Some(Acceleration::LocalGpu),
     };
-    let muna = state.muna.clone();
+    let muna = model.muna.clone();
     let response = predict::run(move || async move {
         muna.beta.openai.images.generate(params).await
     }).await?;

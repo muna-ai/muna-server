@@ -64,7 +64,7 @@ pub(crate) async fn messages(
         top_p: req.top_p,
         acceleration: Some(Acceleration::LocalGpu),
     };
-    let muna = state.muna.clone();
+    let muna = model.muna.clone();
     if req.stream {
         let rx = predict::stream(move || async move {
             muna.beta.anthropic.messages.stream(params).await

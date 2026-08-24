@@ -6,8 +6,9 @@
 //! Shared harness for the LLM-serving integration tests.
 //!
 //! - `StubControlPlane`: in-process axum router that impersonates the
-//!   control plane. Tests mutate its directives directly; the spawned
-//!   muna-server reconciles against them on every heartbeat.
+//!   control plane (v2 protocol: declarative residency goals). Tests mutate
+//!   the goal map directly; the spawned muna-server reconciles against it
+//!   on every heartbeat.
 //! - `ServerGuard`: spawns the real `muna-server` binary against the stub
 //!   and kills it on drop, so panicking tests never leak processes.
 //! - `wait_for`: polling helper used instead of bare sleeps.
@@ -32,13 +33,13 @@ use serde_json::{json, Value};
 // Stub control plane
 // ---------------------------------------------------------------------------
 
-/// Directives returned to the node on every heartbeat. Tests mutate these
-/// through `StubControlPlane::state()`.
+/// Declarative goals returned to the node on every heartbeat (v2 protocol).
+/// Tests mutate these through `StubControlPlane::state()`.
 #[derive(Default)]
 pub struct Directives {
-    pub load_models: Vec<String>,
-    pub unload_models: Vec<String>,
-    pub event_callback_urls: Vec<String>,
+    /// Goal residency per tag: `"process"` | `"disk"` | `"none"`. An
+    /// absent tag means "no opinion".
+    pub models: std::collections::HashMap<String, String>,
     pub drain: bool,
 }
 
@@ -46,11 +47,11 @@ pub struct Directives {
 pub struct StubState {
     /// Every `NodeStatus` payload the node has POSTed, in arrival order.
     pub heartbeats: Vec<Value>,
-    /// Directives echoed back on the next heartbeat.
+    /// Goals echoed back on the next heartbeat.
     pub directives: Directives,
-    /// Every `RelayBatch` POSTed to the `/kv` edge callback.
+    /// Every `RelayBatch` POSTed to the `/v1/kv/events` ingest route.
     pub kv_batches: Vec<Value>,
-    /// One-shot: reply `need_snapshot: true` to the next `/kv` POST.
+    /// One-shot: reply `need_snapshot: true` to the next KV ingest POST.
     pub need_snapshot_armed: bool,
 }
 
@@ -66,7 +67,7 @@ impl StubControlPlane {
         let state = Arc::new(Mutex::new(StubState::default()));
         let router = Router::new()
             .route("/v1/nodes/{node_id}/heartbeat", post(heartbeat))
-            .route("/kv", post(kv))
+            .route("/v1/kv/events", post(kv))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -82,14 +83,22 @@ impl StubControlPlane {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// The `/kv` edge-callback URL, for the `event_callback_urls` directive.
-    pub fn kv_callback_url(&self) -> String {
-        format!("http://127.0.0.1:{}/kv", self.port)
-    }
-
-    /// Lock the mutable stub state (directives, recorded traffic).
+    /// Lock the mutable stub state (goals, recorded traffic).
     pub fn state(&self) -> std::sync::MutexGuard<'_, StubState> {
         self.state.lock().unwrap()
+    }
+
+    /// Set one tag's goal residency (`"process"` | `"disk"` | `"none"`).
+    pub fn set_residency(&self, tag: &str, residency: &str) {
+        self.state()
+            .directives
+            .models
+            .insert(tag.to_string(), residency.to_string());
+    }
+
+    /// Drop the goal for a tag entirely ("no opinion").
+    pub fn clear_residency(&self, tag: &str) {
+        self.state().directives.models.remove(tag);
     }
 
     pub fn heartbeat_count(&self) -> usize {
@@ -109,10 +118,14 @@ async fn heartbeat(
     let mut state = state.lock().unwrap();
     state.heartbeats.push(payload);
     let directives = &state.directives;
+    // Wire shape: a flat list of goal descriptors, one per tag.
+    let models: Vec<Value> = directives
+        .models
+        .iter()
+        .map(|(tag, residency)| json!({ "tag": tag, "residency": residency }))
+        .collect();
     Json(json!({
-        "load_models": directives.load_models,
-        "unload_models": directives.unload_models,
-        "event_callback_urls": directives.event_callback_urls,
+        "models": models,
         "drain": directives.drain,
     }))
 }

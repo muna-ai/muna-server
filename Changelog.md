@@ -1,5 +1,5 @@
 ## 0.0.8
-*INCOMPLETE*
++ Minor updates.
 
 ## 0.0.7
 + Added support for Anthropic-compatible messages at `/v1/messages`.

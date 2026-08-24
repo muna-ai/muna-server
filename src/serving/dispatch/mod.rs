@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 use muna::types::{Acceleration, Prediction, Value};
-use muna::{Muna, MunaError};
+use muna::MunaError;
 
 use crate::serving::batch::{compute_batch_key, item_count, BatchPlan};
 use crate::serving::predict;
@@ -48,13 +48,13 @@ enum Entry {
 
 /// Routes predictions through each model's batch plan.
 ///
-/// One dispatcher serves the whole process; it is cheap to clone (both
-/// fields are shared handles). Per-model state lives in `entries`, keyed by
-/// tag and created lazily on the first prediction against that model.
+/// One dispatcher serves the whole process; it is cheap to clone (a shared
+/// handle). Per-model state lives in `entries`, keyed by tag and created
+/// lazily on the first prediction against that model. Invocations go
+/// through each model's own Muna instance (`ReadyModel::muna`), which
+/// owns the loaded native handle and carries the model's deployment key.
 #[derive(Clone)]
 pub(crate) struct Dispatcher {
-    /// Client through which invocations are made.
-    muna: Arc<Muna>,
     /// Lazily-populated dispatch state per model tag.
     entries: Arc<DashMap<String, Entry>>,
 }
@@ -62,8 +62,8 @@ pub(crate) struct Dispatcher {
 impl Dispatcher {
 
     /// Create a dispatcher
-    pub(crate) fn new(muna: Arc<Muna>) -> Self {
-        Self { muna, entries: Arc::new(DashMap::new()) }
+    pub(crate) fn new() -> Self {
+        Self { entries: Arc::new(DashMap::new()) }
     }
 
     /// Dispatch a raw prediction through the model's batch plan.
@@ -150,7 +150,7 @@ impl Dispatcher {
             BatchPlan::Continuous => Entry::Continuous,
             BatchPlan::Buffered { params, capacity } => {
                 let (tx, rx) = async_channel::bounded(CHANNEL_BUFFER);
-                let muna = self.muna.clone();
+                let muna = model.muna.clone();
                 let tag_owned = tag.to_string();
                 let stats = model.stats.clone();
                 let predict_fn: PredictFn = Arc::new(move |inputs, acceleration| {
@@ -193,7 +193,7 @@ impl Dispatcher {
         inputs: HashMap<String, Value>,
         acceleration: Acceleration
     ) -> Result<Prediction, MunaError> {
-        let muna = self.muna.clone();
+        let muna = model.muna.clone();
         let tag_owned = tag.to_string();
         let stats = model.stats.clone();
         predict::run(move || async move {

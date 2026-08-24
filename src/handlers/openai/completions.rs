@@ -51,7 +51,7 @@ pub(crate) async fn chat_completions(
         max_completion_tokens: req.max_completion_tokens,
         ..Default::default()
     };
-    let muna = state.muna.clone();
+    let muna = model.muna.clone();
     if req.stream {
         let rx = predict::stream(move || async move {
             muna.beta.openai.chat.completions.stream(params).await
