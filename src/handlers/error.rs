@@ -3,12 +3,64 @@
 *   Copyright © 2026 NatML Inc. All Rights Reserved.
 */
 
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRequest, Request};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::{json, Value};
 
 use crate::serving::registry::RegistryError;
+
+/// `axum::Json` with an OpenAI-shaped rejection: a malformed body yields a
+/// 400 `{"error": {...}}` envelope instead of axum's plain-text 422 (OpenAI
+/// itself uses 400 for malformed bodies, and clients only render the
+/// envelope).
+pub(crate) struct Json<T>(pub T);
+
+impl<S, T> FromRequest<S> for Json<T>
+where
+    axum::Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(AppError::bad_request(rejection.body_text())),
+        }
+    }
+}
+
+/// Response-side parity with `axum::Json`, so handlers need only the one
+/// import for both extraction and JSON responses.
+impl<T: serde::Serialize> IntoResponse for Json<T> {
+
+    fn into_response(self) -> Response {
+        axum::Json(self.0).into_response()
+    }
+}
+
+/// [`Json`] with the rejection re-shaped to Anthropic's error envelope,
+/// for `/v1/messages`.
+pub(crate) struct AnthropicJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for AnthropicJson<T>
+where
+    axum::Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = AnthropicError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(
+                AnthropicError::from(AppError::bad_request(rejection.body_text()))
+            ),
+        }
+    }
+}
 
 /// Uniform OpenAI-style error envelope for every handler.
 pub(crate) struct AppError {
@@ -93,8 +145,9 @@ impl AppError {
 }
 
 impl IntoResponse for AppError {
+
     fn into_response(self) -> Response {
-        let mut response = (self.status, Json(self.body)).into_response();
+        let mut response = (self.status, axum::Json(self.body)).into_response();
         if let Some(retry_after) = self.retry_after {
             if let Ok(value) = retry_after.to_string().parse() {
                 response.headers_mut().insert("Retry-After", value);
@@ -105,12 +158,14 @@ impl IntoResponse for AppError {
 }
 
 impl From<muna::MunaError> for AppError {
+
     fn from(e: muna::MunaError) -> Self {
         Self::internal(e.to_string())
     }
 }
 
 impl From<RegistryError> for AppError {
+
     fn from(e: RegistryError) -> Self {
         match e {
             RegistryError::Loading { retry_after } => Self::retry_later(
@@ -154,7 +209,7 @@ impl IntoResponse for AnthropicError {
                 "message": message,
             }
         });
-        let mut response = (status, Json(body)).into_response();
+        let mut response = (status, axum::Json(body)).into_response();
         if let Some(retry_after) = retry_after {
             if let Ok(value) = retry_after.to_string().parse() {
                 response.headers_mut().insert("Retry-After", value);

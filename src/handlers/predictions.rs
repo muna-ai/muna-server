@@ -11,7 +11,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use muna::c;
@@ -23,7 +22,7 @@ use muna::MunaError;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
-use super::error::AppError;
+use super::error::{AppError, Json};
 use crate::serving::predict;
 use crate::state::AppState;
 

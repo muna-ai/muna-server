@@ -15,7 +15,7 @@ use muna::beta::anthropic::{MessageContent, MessageCreateParams, MessageParam};
 use muna::types::Acceleration;
 use serde::Deserialize;
 
-use crate::handlers::error::{anthropic_error_value, AnthropicError, AppError};
+use crate::handlers::error::{anthropic_error_value, AnthropicError, AnthropicJson, AppError};
 use crate::serving::predict;
 use crate::state::AppState;
 
@@ -44,7 +44,7 @@ pub(crate) struct MessagesRequest {
 /// blocking prediction executor.
 pub(crate) async fn messages(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<MessagesRequest>,
+    AnthropicJson(req): AnthropicJson<MessagesRequest>,
 ) -> Result<Response, AnthropicError> {
     if state.is_draining() {
         return Err(AppError::unavailable("node is draining".into(), 30).into());

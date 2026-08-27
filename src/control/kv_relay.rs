@@ -36,11 +36,26 @@ use crate::state::AppState;
 const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Reconnect the SUB if the engine goes silent this long (a rejoin forces a
-/// snapshot, repairing any missed events).
-const RECV_TIMEOUT: Duration = Duration::from_secs(60);
+/// snapshot, repairing any missed events). Engines emit an idle keepalive
+/// every 15s (an empty delta), so at 2x the cadence this only fires for
+/// genuinely dead engines -- and bounds how long a dead engine's stale KV
+/// entries survive at the plane.
+const RECV_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Backoff after a failed connect / subscribe.
+/// Initial backoff after a failed connect / subscribe; doubles per
+/// consecutive failure up to `RETRY_DELAY_MAX`.
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// Backoff ceiling. Engine binaries that never bind the publisher will
+/// exist in the wild for a long time; the relay must idle cheaply against
+/// their unbound endpoints, not churn a fresh socket every few seconds.
+const RETRY_DELAY_MAX: Duration = Duration::from_secs(300);
+
+/// Bound on one connect / subscribe attempt. The zeromq crate's
+/// `connect_forever` retries a missing IPC socket file internally for the
+/// socket's entire `connect_timeout` (30s by default), pinning the socket
+/// and its fds the whole time; this shortens that window.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Backoff after the plane rejects the ingest route (404/410: no KV
 /// indexer behind the URL). Events in the window are dropped; continuity
@@ -208,25 +223,27 @@ async fn relay_model(
     // A fresh session starts snapshot-pending: the plane must not apply
     // deltas before a full baseline.
     let mut edge = EdgeState { needs_snapshot: true, backoff_until: None };
+    let mut consecutive_failures: u32 = 0;
     'session: loop {
         if cancel.is_cancelled() {
             return;
         }
-        let mut sub = zeromq::SubSocket::new();
-        if let Err(e) = sub.connect(&endpoint).await {
-            tracing::warn!(tag = %tag, error = %e, "kv relay connect failed");
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(RETRY_DELAY) => continue 'session,
+        // connect_subscribe drops a failed socket before returning, so the
+        // backoff sleep below never holds a dead socket's fds open.
+        let mut sub = match connect_subscribe(&endpoint, &tag, CONNECT_TIMEOUT).await {
+            Some(sub) => {
+                consecutive_failures = 0;
+                sub
             }
-        }
-        if let Err(e) = sub.subscribe("").await {
-            tracing::warn!(tag = %tag, error = %e, "kv relay subscribe failed");
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(RETRY_DELAY) => continue 'session,
+            None => {
+                let delay = retry_delay(consecutive_failures);
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => continue 'session,
+                }
             }
-        }
+        };
         let mut continuity = Continuity::default();
         let mut pending = Pending::default();
         let mut flush = tokio::time::interval(flush_interval);
@@ -306,6 +323,53 @@ async fn relay_model(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Exponential backoff for consecutive connect / subscribe failures: 5s
+/// doubling to a 5-minute cap.
+fn retry_delay(consecutive_failures: u32) -> Duration {
+    RETRY_DELAY
+        .saturating_mul(2u32.saturating_pow(consecutive_failures.min(16)))
+        .min(RETRY_DELAY_MAX)
+}
+
+/// Create, connect, and subscribe a fresh SUB socket. On any failure the
+/// socket is dropped HERE -- before the caller's backoff sleep -- so a
+/// failed attempt never retains its fds (the eventfd leak that exhausted a
+/// node's fd limit against an unbound endpoint). The crate-level
+/// `connect_timeout` bounds the internal retry loop; the outer
+/// `tokio::time::timeout` is the belt-and-braces bound on the whole
+/// attempt.
+async fn connect_subscribe(
+    endpoint: &str,
+    tag: &str,
+    timeout: Duration
+) -> Option<zeromq::SubSocket> {
+    let mut options = zeromq::SocketOptions::default();
+    options.connect_timeout(timeout);
+    let mut sub = zeromq::SubSocket::with_options(options);
+    match tokio::time::timeout(timeout + Duration::from_secs(1), sub.connect(endpoint)).await {
+        Ok(Ok(())) => (),
+        Ok(Err(e)) => {
+            tracing::warn!(tag = %tag, error = %e, "kv relay connect failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(tag = %tag, endpoint = %endpoint, "kv relay connect timed out");
+            return None;
+        }
+    }
+    match tokio::time::timeout(timeout, sub.subscribe("")).await {
+        Ok(Ok(())) => Some(sub),
+        Ok(Err(e)) => {
+            tracing::warn!(tag = %tag, error = %e, "kv relay subscribe failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(tag = %tag, "kv relay subscribe timed out");
+            None
         }
     }
 }
@@ -464,6 +528,44 @@ mod tests {
         // Engine restarted: new epoch arrives as a snapshot (rejoin path).
         assert_eq!(c.admit("e2", 17, true), Admit::Snapshot);
         assert_eq!(c.admit("e2", 18, false), Admit::Delta);
+    }
+
+    #[test]
+    fn retry_delay_doubles_to_cap() {
+        assert_eq!(retry_delay(0), Duration::from_secs(5));
+        assert_eq!(retry_delay(1), Duration::from_secs(10));
+        assert_eq!(retry_delay(2), Duration::from_secs(20));
+        assert_eq!(retry_delay(6), Duration::from_secs(300));
+        assert_eq!(retry_delay(u32::MAX), Duration::from_secs(300));
+    }
+
+    /// Regression for the eventfd leak: repeated failed connects against an
+    /// unbound IPC path must not retain fds once the socket is dropped.
+    /// A short timeout keeps the crate's internal retry loop (which spins
+    /// until `connect_timeout` on a missing socket file) from slowing the
+    /// test.
+    #[tokio::test]
+    async fn failed_connects_do_not_leak_fds() {
+        let endpoint = format!(
+            "ipc:///tmp/muna-kv-relay-unbound-{}.sock",
+            std::process::id()
+        );
+        let timeout = Duration::from_millis(100);
+        // Warm-up so one-time runtime allocations don't count as a leak.
+        assert!(connect_subscribe(&endpoint, "test", timeout).await.is_none());
+        #[cfg(target_os = "linux")]
+        let before = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        for _ in 0..32 {
+            assert!(connect_subscribe(&endpoint, "test", timeout).await.is_none());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let after = std::fs::read_dir("/proc/self/fd").unwrap().count();
+            assert!(
+                after <= before + 4,
+                "fd count grew across failed connects: {before} -> {after}"
+            );
+        }
     }
 
     /// Mock publisher (same crate) driving framing over a real socket:

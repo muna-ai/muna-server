@@ -7,12 +7,11 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use muna::beta::openai::EncodingFormat;
 use muna::types::Acceleration;
 use serde::Deserialize;
 
-use crate::handlers::error::AppError;
+use crate::handlers::error::{AppError, Json};
 use crate::serving::predict;
 use crate::state::AppState;
 

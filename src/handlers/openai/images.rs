@@ -7,12 +7,11 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use muna::beta::openai::{ImageCreateParams, ImageSize};
 use muna::types::Acceleration;
 use serde::Deserialize;
 
-use crate::handlers::error::AppError;
+use crate::handlers::error::{AppError, Json};
 use crate::serving::predict;
 use crate::state::AppState;
 
@@ -65,16 +64,15 @@ pub(crate) async fn image_generations(
 
 fn parse_size(value: Option<&str>) -> Result<Option<ImageSize>, AppError> {
     match value {
-        None | Some("auto") => Ok(None),
-        Some("256x256") => Ok(Some(ImageSize::Size256x256)),
-        Some("512x512") => Ok(Some(ImageSize::Size512x512)),
-        Some("1024x1024") => Ok(Some(ImageSize::Size1024x1024)),
-        Some("1536x1024") => Ok(Some(ImageSize::Size1536x1024)),
-        Some("1024x1536") => Ok(Some(ImageSize::Size1024x1536)),
-        Some("1792x1024") => Ok(Some(ImageSize::Size1792x1024)),
-        Some("1024x1792") => Ok(Some(ImageSize::Size1024x1792)),
-        Some(value) => Err(AppError::bad_request(format!(
-            "unsupported size `{value}`"
-        ))),
+        None                => Ok(None),
+        Some("auto")        => Ok(None),
+        Some("256x256")     => Ok(Some(ImageSize::Size256x256)),
+        Some("512x512")     => Ok(Some(ImageSize::Size512x512)),
+        Some("1024x1024")   => Ok(Some(ImageSize::Size1024x1024)),
+        Some("1536x1024")   => Ok(Some(ImageSize::Size1536x1024)),
+        Some("1024x1536")   => Ok(Some(ImageSize::Size1024x1536)),
+        Some("1792x1024")   => Ok(Some(ImageSize::Size1792x1024)),
+        Some("1024x1792")   => Ok(Some(ImageSize::Size1024x1792)),
+        Some(value) => Err(AppError::bad_request(format!("unsupported size `{value}`"))),
     }
 }

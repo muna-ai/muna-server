@@ -1,5 +1,8 @@
 ## 0.0.9
-*INCOMPLETE*
++ Added CORS support so browser-based clients (e.g. OpenWebUI direct connections) can call the server.
++ Added `H200` and `B200` GPU families to node status metrics.
++ Updated malformed JSON request bodies to return `400` with an OpenAI-style error envelope (Anthropic-style on `/v1/messages`) instead of axum's plain-text `422`.
++ Fixed a file-descriptor leak in the KV event relay when an LLM engine's KV event publishing endpoint is unbound.
 
 ## 0.0.8
 + Minor updates.

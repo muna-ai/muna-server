@@ -9,13 +9,12 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use futures_util::{stream, StreamExt};
 use muna::beta::openai::{ChatCompletionCreateParams, ChatCompletionMessage};
 use muna::types::Acceleration;
 use serde::Deserialize;
 
-use crate::handlers::error::{muna_error_value, AppError};
+use crate::handlers::error::{muna_error_value, AppError, Json};
 use crate::serving::predict;
 use crate::state::AppState;
 

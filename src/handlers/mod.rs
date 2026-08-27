@@ -19,8 +19,10 @@ mod predictions;
 
 use std::sync::Arc;
 
+use axum::http::{HeaderName, Method, header};
 use axum::routing::{get, post};
 use axum::Router;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::state::AppState;
 
@@ -43,4 +45,18 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/v1/messages", post(anthropic::messages))
         // Fallbacks
         .fallback(ops::not_found)
+        // Browser clients need CORS when a node is used standalone via
+        // `muna deploy` (mirrors OpenAI's `access-control-allow-origin: *`).
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers([
+                    header::AUTHORIZATION,
+                    header::CONTENT_TYPE,
+                    HeaderName::from_static("x-api-key"),
+                    HeaderName::from_static("anthropic-version")
+                ])
+                .expose_headers([header::RETRY_AFTER])
+        )
 }
