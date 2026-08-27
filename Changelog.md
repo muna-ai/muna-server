@@ -1,3 +1,6 @@
+## 0.0.10
+*INCOMPLETE*
+
 ## 0.0.9
 + Added CORS support so browser-based clients (e.g. OpenWebUI direct connections) can call the server.
 + Added `H200` and `B200` GPU families to node status metrics.
