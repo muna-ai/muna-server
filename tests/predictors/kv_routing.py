@@ -8,10 +8,11 @@ Exercises the KV routing sidecar rail. Declaring
 `KVRoutingMetadata(tokenize=...)` makes the compiler emit two sidecar
 variants:
 
-- `{tag}:router`: Runs `tokenize` (whose params must be a name-subset 
-  of the predictor's) then paginates the token IDs into the SAME chained 
-  SHA-256 page hashes the engine keys its KV cache with, returned as 
-  64-hex strings. Token IDs never leave the sidecar.
+- `{tag}:router`: Runs `tokenize` (whose params must be a name-subset
+  of the predictor's) then returns a route-hint dict: `hashes` (the SAME
+  chained SHA-256 page hashes the engine keys its KV cache with, as
+  64-hex strings), `tokens` (exact prompt token count), and `page_tokens`
+  (engine page size). Token IDs never leave the sidecar.
 
 - `{tag}:kv`: Returns the ZMQ endpoint the engine publishes KV cache
   events on.
