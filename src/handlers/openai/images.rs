@@ -4,6 +4,7 @@
 */
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
@@ -13,6 +14,7 @@ use serde::Deserialize;
 
 use crate::handlers::error::{AppError, Json};
 use crate::serving::predict;
+use crate::serving::stats::{PredictionSample, SampleDetail};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -43,7 +45,11 @@ pub(crate) async fn image_generations(
     let model = state.registry.ensure_ready(&req.model).await?;
     state.check_in_if_due(&req.model).await;
     state.mark_model_loaded(req.model.clone()).await;
+    // Time spent acquiring the sequential guard is this surface's
+    // admission wait (zero for continuous models).
+    let admitted = Instant::now();
     let guard = state.dispatcher.acquire(&req.model, &model).await;
+    let queue_wait = admitted.elapsed();
     let params = ImageCreateParams {
         prompt: req.prompt,
         model: req.model,
@@ -55,10 +61,18 @@ pub(crate) async fn image_generations(
         acceleration: Some(Acceleration::LocalGpu),
     };
     let muna = model.muna.clone();
+    let dispatched = Instant::now();
     let response = predict::run(move || async move {
         muna.beta.openai.images.generate(params).await
     }).await?;
     drop(guard);
+    let images = response.data.as_ref().map_or(0, |data| data.len()) as u32;
+    model.stats.telemetry.record(PredictionSample {
+        at: Instant::now(),
+        queue_wait,
+        latency: dispatched.elapsed(),
+        detail: SampleDetail::Image { images },
+    });
     Ok(Json(response).into_response())
 }
 
@@ -73,6 +87,6 @@ fn parse_size(value: Option<&str>) -> Result<Option<ImageSize>, AppError> {
         Some("1024x1536")   => Ok(Some(ImageSize::Size1024x1536)),
         Some("1792x1024")   => Ok(Some(ImageSize::Size1792x1024)),
         Some("1024x1792")   => Ok(Some(ImageSize::Size1024x1792)),
-        Some(value) => Err(AppError::bad_request(format!("unsupported size `{value}`"))),
+        Some(value)   => Err(AppError::bad_request(format!("unsupported size `{value}`"))),
     }
 }

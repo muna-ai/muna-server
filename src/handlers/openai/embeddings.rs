@@ -4,6 +4,7 @@
 */
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
@@ -13,6 +14,7 @@ use serde::Deserialize;
 
 use crate::handlers::error::{AppError, Json};
 use crate::serving::predict;
+use crate::serving::stats::{PredictionSample, SampleDetail};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -51,10 +53,15 @@ pub(crate) async fn embeddings(
     let model = state.registry.ensure_ready(&req.model).await?;
     state.check_in_if_due(&req.model).await;
     state.mark_model_loaded(req.model.clone()).await;
+    // Time spent acquiring the sequential guard is this surface's
+    // admission wait (zero for continuous models).
+    let admitted = Instant::now();
     let guard = state.dispatcher.acquire(&req.model, &model).await;
+    let queue_wait = admitted.elapsed();
     let muna = model.muna.clone();
     let tag = req.model;
     let dimensions = req.dimensions;
+    let dispatched = Instant::now();
     let response = predict::run(move || async move {
         muna.beta.openai.embeddings.create(
             input,
@@ -65,6 +72,12 @@ pub(crate) async fn embeddings(
         ).await
     }).await?;
     drop(guard);
+    model.stats.telemetry.record(PredictionSample {
+        at: Instant::now(),
+        queue_wait,
+        latency: dispatched.elapsed(),
+        detail: SampleDetail::Unary,
+    });
     Ok(Json(response).into_response())
 }
 

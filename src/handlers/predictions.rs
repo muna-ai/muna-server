@@ -24,6 +24,7 @@ use serde_json::Value as JsonValue;
 
 use super::error::{AppError, Json};
 use crate::serving::predict;
+use crate::serving::stats::{StreamKind, StreamMeter};
 use crate::state::AppState;
 
 /// Prediction request.
@@ -81,20 +82,32 @@ async fn stream_prediction(
     acceleration: Acceleration,
 ) -> Result<Response, AppError> {
     // Streams bypass batching (per-request token streams cannot merge);
-    // sequential models still hold their guard for the whole stream.
+    // sequential models still hold their guard for the whole stream. Time
+    // spent acquiring the guard is this surface's admission wait.
+    let admitted = std::time::Instant::now();
     let guard = state.dispatcher.acquire(&tag, &model).await;
+    // Raw frames are opaque, so only time to the first frame is kept; the
+    // meter records its sample when the stream state drops.
+    let meter = StreamMeter::new(
+        model.stats.clone(),
+        StreamKind::Raw,
+        admitted.elapsed()
+    );
     let muna = model.muna.clone();
     let stream_tag = tag.clone();
     let rx = predict::stream(move || async move {
         muna.predictions.stream(&stream_tag, inputs, Some(acceleration)).await
     });
     let event_stream = futures_util::stream::unfold(
-        (rx, guard, tag),
-        |(mut rx, guard, tag)| async move {
+        (rx, guard, tag, meter),
+        |(mut rx, guard, tag, mut meter)| async move {
             let result = rx.recv().await?;
             let remote = match result {
-                Ok(prediction) => to_remote_prediction(prediction)
-                    .unwrap_or_else(|e| error_prediction(&tag, &e.to_string())),
+                Ok(prediction) => {
+                    meter.on_output(true);
+                    to_remote_prediction(prediction)
+                        .unwrap_or_else(|e| error_prediction(&tag, &e.to_string()))
+                }
                 Err(e) => {
                     tracing::warn!("muna prediction stream error: {e}");
                     error_prediction(&tag, &e.to_string())
@@ -102,7 +115,7 @@ async fn stream_prediction(
             };
             let data = serde_json::to_string(&remote).unwrap_or_default();
             let event = Event::default().event("prediction").data(data);
-            Some((Ok::<Event, Infallible>(event), (rx, guard, tag)))
+            Some((Ok::<Event, Infallible>(event), (rx, guard, tag, meter)))
         }
     );
     Ok(Sse::new(event_stream).into_response())

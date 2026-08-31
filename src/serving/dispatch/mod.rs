@@ -21,7 +21,7 @@ mod worker;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use muna::types::{Acceleration, Prediction, Value};
@@ -30,6 +30,7 @@ use muna::MunaError;
 use crate::serving::batch::{compute_batch_key, item_count, BatchPlan};
 use crate::serving::predict;
 use crate::serving::registry::ReadyModel;
+use crate::serving::stats::{PredictionSample, SampleDetail};
 use worker::{BufferedWorker, PredictFn, PredictItem, CHANNEL_BUFFER};
 
 /// Per-model dispatch state, derived from the model's `BatchPlan` on first
@@ -83,15 +84,30 @@ impl Dispatcher {
             Queued(async_channel::Sender<PredictItem>),
         }
         let route = match &*self.entries.get(tag).expect("entry just ensured") {
-            Entry::Continuous => Route::Direct,
-            Entry::Sequential { lock } => Route::Locked(lock.clone()),
+            Entry::Continuous                            => Route::Direct,
+            Entry::Sequential { lock }  => Route::Locked(lock.clone()),
             Entry::Buffered { tx } => Route::Queued(tx.clone()),
         };
         match route {
-            Route::Direct => self.predict(tag, model, inputs, acceleration).await,
+            Route::Direct => {
+                self.predict(
+                    tag,
+                    model,
+                    inputs,
+                    acceleration,
+                    Duration::ZERO
+                ).await
+            }
             Route::Locked(lock) => {
+                let enqueued = Instant::now();
                 let _guard = lock.lock().await;
-                self.predict(tag, model, inputs, acceleration).await
+                self.predict(
+                    tag,
+                    model,
+                    inputs,
+                    acceleration,
+                    enqueued.elapsed()
+                ).await
             }
             Route::Queued(tx) => {
                 let params = match &model.plan {
@@ -191,7 +207,8 @@ impl Dispatcher {
         tag: &str,
         model: &Arc<ReadyModel>,
         inputs: HashMap<String, Value>,
-        acceleration: Acceleration
+        acceleration: Acceleration,
+        queue_wait: Duration
     ) -> Result<Prediction, MunaError> {
         let muna = model.muna.clone();
         let tag_owned = tag.to_string();
@@ -205,7 +222,14 @@ impl Dispatcher {
                 None,
                 None
             ).await;
-            stats.record_latency(start.elapsed());
+            let latency = start.elapsed();
+            stats.record_latency(latency);
+            stats.telemetry.record(PredictionSample {
+                at: Instant::now(),
+                queue_wait,
+                latency,
+                detail: SampleDetail::Unary,
+            });
             result
         }).await
     }

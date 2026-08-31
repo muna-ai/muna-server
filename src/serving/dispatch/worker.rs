@@ -18,7 +18,7 @@ use muna::MunaError;
 use tokio::time::timeout_at;
 
 use super::merge::{merge_inputs, split_results};
-use crate::serving::stats::ModelStats;
+use crate::serving::stats::{ModelStats, PredictionSample, SampleDetail};
 
 /// How long the accumulator waits for more requests before flushing.
 const FLUSH_DEADLINE: Duration = Duration::from_millis(100);
@@ -199,12 +199,28 @@ impl BufferedWorker {
     }
 
     async fn flush(&self, batch: Vec<PredictItem>) {
+        // Queue wait is per request (enqueue -> dispatch); latency is the
+        // shared invocation's elapsed time, which is each request's service
+        // time -- requests merged into a batch complete together.
+        let dispatched = tokio::time::Instant::now();
+        let queue_waits: Vec<Duration> = batch.iter()
+            .map(|item| dispatched.duration_since(item.enqueued))
+            .collect();
         if batch.len() == 1 {
             let item = batch.into_iter().next().expect("batch of one");
             let result = (self.predict_fn)(item.inputs, item.acceleration).await;
             let _ = item.response_tx.send(result);
         } else {
             self.process_batch(batch).await;
+        }
+        let latency = dispatched.elapsed();
+        for queue_wait in queue_waits {
+            self.stats.telemetry.record(PredictionSample {
+                at: std::time::Instant::now(),
+                queue_wait,
+                latency,
+                detail: SampleDetail::Unary,
+            });
         }
     }
 

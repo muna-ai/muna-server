@@ -142,6 +142,25 @@ pub(crate) struct ModelStatus {
     /// -- the co-location contention signal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_ns_waited: Option<u64>,
+    /// p95 admission wait (ms) over the last 5 minutes. Absent below the
+    /// telemetry window's sample floor, like every field below.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms_p95: Option<f64>,
+    /// p95 total service time (ms) over the last 5 minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms_p95: Option<f64>,
+    /// p50 time to first output (ms) -- streaming surfaces only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_output_ms_p50: Option<f64>,
+    /// p95 time to first output (ms) -- streaming surfaces only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_output_ms_p95: Option<f64>,
+    /// p50 token-normalized output interval (ms) -- LLM surfaces only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_interval_ms_p50: Option<f64>,
+    /// p95 token-normalized output interval (ms) -- LLM surfaces only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_interval_ms_p95: Option<f64>,
 }
 
 /// Desired residency for one model.
@@ -281,6 +300,7 @@ fn collect_model_status(
             ModelState::Loading { .. } => empty_status(tag, ModelLifecycle::Loading, None),
             ModelState::Ready(model) => {
                 let lease = lease.get(&tag);
+                let telemetry = model.stats.telemetry.summarize().unwrap_or_default();
                 ModelStatus {
                     tag,
                     state: ModelLifecycle::Ready,
@@ -295,6 +315,12 @@ fn collect_model_status(
                     lease_weight: lease.map(|stats| stats.weight),
                     lease_ns_held: lease.map(|stats| stats.ns_held),
                     lease_ns_waited: lease.map(|stats| stats.ns_waited),
+                    queue_wait_ms_p95: telemetry.queue_wait_ms_p95,
+                    latency_ms_p95: telemetry.latency_ms_p95,
+                    first_output_ms_p50: telemetry.first_output_ms_p50,
+                    first_output_ms_p95: telemetry.first_output_ms_p95,
+                    output_interval_ms_p50: telemetry.output_interval_ms_p50,
+                    output_interval_ms_p95: telemetry.output_interval_ms_p95,
                 }
             },
             ModelState::Failed { error, .. } => {
@@ -337,5 +363,11 @@ fn empty_status(
         lease_weight: None,
         lease_ns_held: None,
         lease_ns_waited: None,
+        queue_wait_ms_p95: None,
+        latency_ms_p95: None,
+        first_output_ms_p50: None,
+        first_output_ms_p95: None,
+        output_interval_ms_p50: None,
+        output_interval_ms_p95: None,
     }
 }

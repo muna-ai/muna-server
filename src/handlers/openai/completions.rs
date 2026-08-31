@@ -5,17 +5,19 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::{stream, StreamExt};
-use muna::beta::openai::{ChatCompletionCreateParams, ChatCompletionMessage};
+use muna::beta::openai::{ChatCompletionChunk, ChatCompletionCreateParams, ChatCompletionMessage};
 use muna::types::Acceleration;
 use serde::Deserialize;
 
 use crate::handlers::error::{muna_error_value, AppError, Json};
 use crate::serving::predict;
+use crate::serving::stats::{PredictionSample, SampleDetail, StreamKind, StreamMeter};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -42,7 +44,11 @@ pub(crate) async fn chat_completions(
     let model = state.registry.ensure_ready(&req.model).await?;
     state.check_in_if_due(&req.model).await;
     state.mark_model_loaded(req.model.clone()).await;
+    // Time spent acquiring the sequential guard is this surface's
+    // admission wait (zero for continuous models).
+    let admitted = Instant::now();
     let guard = state.dispatcher.acquire(&req.model, &model).await;
+    let queue_wait = admitted.elapsed();
     let params = ChatCompletionCreateParams {
         model: req.model,
         messages: req.messages,
@@ -52,35 +58,69 @@ pub(crate) async fn chat_completions(
     };
     let muna = model.muna.clone();
     if req.stream {
+        let meter = StreamMeter::new(model.stats.clone(), StreamKind::Llm, queue_wait);
         let rx = predict::stream(move || async move {
             muna.beta.openai.chat.completions.stream(params).await
         });
-        // The guard travels with the stream state; dropping the response
-        // body (client disconnect) releases it.
-        let event_stream = stream::unfold((rx, guard), |(mut rx, guard)| async move {
-            let item = rx.recv().await?;
-            let event = match item {
-                Ok(chunk) => {
-                    let json = serde_json::to_string(&chunk).unwrap_or_default();
-                    Event::default().data(json)
-                }
-                Err(e) => {
-                    tracing::warn!("muna stream error: {e}");
-                    let json = serde_json::to_string(&muna_error_value(&e)).unwrap_or_default();
-                    Event::default().data(json)
-                }
-            };
-            Some((Ok::<Event, Infallible>(event), (rx, guard)))
-        })
+        // The guard and meter travel with the stream state; dropping the
+        // response body (stream end or client disconnect) releases the
+        // guard and records the meter's telemetry sample.
+        let event_stream = stream::unfold(
+            (rx, guard, meter),
+            |(mut rx, guard, mut meter)| async move {
+                let item = rx.recv().await?;
+                let event = match item {
+                    Ok(chunk) => {
+                        stamp_chunk(&mut meter, &chunk);
+                        let json = serde_json::to_string(&chunk).unwrap_or_default();
+                        Event::default().data(json)
+                    }
+                    Err(e) => {
+                        tracing::warn!("muna stream error: {e}");
+                        let json = serde_json::to_string(&muna_error_value(&e)).unwrap_or_default();
+                        Event::default().data(json)
+                    }
+                };
+                Some((Ok::<Event, Infallible>(event), (rx, guard, meter)))
+            }
+        )
         .chain(stream::once(async {
             Ok::<Event, Infallible>(Event::default().data("[DONE]"))
         }));
         Ok(Sse::new(event_stream).into_response())
     } else {
+        let dispatched = Instant::now();
         let completion = predict::run(move || async move {
             muna.beta.openai.chat.completions.create(params).await
         }).await?;
         drop(guard);
+        // Non-streamed chat records `Unary`: whole-response latency has no
+        // first-yield boundary and must not fatten the TTFT percentiles.
+        model.stats.telemetry.record(PredictionSample {
+            at: Instant::now(),
+            queue_wait,
+            latency: dispatched.elapsed(),
+            detail: SampleDetail::Unary,
+        });
         Ok(Json(completion).into_response())
     }
+}
+
+/// Stamp one chunk on the stream meter: a chunk is content-bearing when
+/// any choice's delta carries text (content or reasoning) or when it is
+/// the terminal usage frame -- role-only wire-consistency frames are not.
+fn stamp_chunk(
+    meter: &mut StreamMeter,
+    chunk: &ChatCompletionChunk
+) {
+    let has_text = chunk.choices.iter().any(|choice| {
+        choice.delta.as_ref().is_some_and(|delta| {
+            delta.content.as_deref().is_some_and(|c| !c.is_empty()) ||
+            delta.reasoning_content.as_deref().is_some_and(|c| !c.is_empty())
+        })
+    });
+    if let Some(usage) = &chunk.usage {
+        meter.on_usage(usage.completion_tokens);
+    }
+    meter.on_output(has_text || chunk.usage.is_some());
 }
