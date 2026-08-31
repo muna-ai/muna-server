@@ -95,14 +95,16 @@ async fn serve(cli: &Cli) -> Result<(), String> {
         tokio::spawn(control::kv_relay::run(state.clone()));
         tracing::info!("control-plane mode: heartbeat + KV relay enabled");
     }
+    // Co-resident NanoSGL engines arbitrate GPU time through the device lease
+    tokio::spawn(serving::lease::run(state.clone()));
     let app = handlers::router().with_state(state);
-
+    // Bind listener
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("failed to bind {addr}: {e}"))?;
     tracing::info!("muna-server listening on {addr}");
-
+    // Serve
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

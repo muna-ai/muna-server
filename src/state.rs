@@ -14,6 +14,7 @@ use muna::MunaClient;
 
 use crate::serving::cache::CacheTracker;
 use crate::serving::dispatch::Dispatcher;
+use crate::serving::lease::LeaseSupervisor;
 use crate::serving::registry::ModelRegistry;
 
 /// Per-tag deployment keys delivered by control-plane residency directives
@@ -44,6 +45,9 @@ pub(crate) struct AppState {
     pub cache: CacheTracker,
     /// Per-model prediction dispatcher.
     pub dispatcher: Dispatcher,
+    /// Device-lease policy/observability surface over the shared-memory
+    /// segments co-resident nanosgl engines arbitrate GPU time through.
+    pub lease: LeaseSupervisor,
     /// Per-tag deployment keys from residency directives; see [`KeyStore`].
     pub keys: KeyStore,
     /// Resource-cache directory (env-derived), for disk metrics. There is
@@ -77,6 +81,7 @@ impl AppState {
             registry: ModelRegistry::new(keys.clone(), pinned),
             cache: CacheTracker::new(keys.clone()),
             dispatcher: Dispatcher::new(),
+            lease: LeaseSupervisor::new(),
             keys,
             cache_path,
             node,

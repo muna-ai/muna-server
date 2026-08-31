@@ -17,6 +17,7 @@
 //! (`caching -> cached -> loading -> ready`) on its own; the plane watches
 //! actuals progress each beat and never micromanages intermediate hops.
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,7 @@ use serde_json::Value as JsonValue;
 use crate::metrics::{collect_gpu_metrics, GpuMetrics};
 use crate::serving::batch::BatchPlan;
 use crate::serving::cache::{CacheState, CacheTracker};
+use crate::serving::lease::RegistrantStats;
 use crate::serving::registry::{ModelRegistry, ModelState};
 use crate::state::AppState;
 
@@ -127,6 +129,19 @@ pub(crate) struct ModelStatus {
     /// Estimated VRAM used by this model in MB (measured at load time).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vram_mb: Option<u64>,
+    /// Device-lease scheduling weight (share of contended GPU time relative
+    /// to co-resident models; never a reservation). Present only when the
+    /// model's engine is registered with the process-wide device lease.
+    /// Optional so the control-plane golden-JSON mirror is not broken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_weight: Option<u32>,
+    /// Total ns the model's engine has spent holding device-lease turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_ns_held: Option<u64>,
+    /// Total ns the model's engine has spent waiting for device-lease turns
+    /// -- the co-location contention signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_ns_waited: Option<u64>,
 }
 
 /// Desired residency for one model.
@@ -224,9 +239,30 @@ impl NodeStatus {
             disk_free_mb: disk.map(|(free, _)| free),
             disk_total_mb: disk.map(|(_, total)| total),
             gpus: collect_gpu_metrics(),
-            models: collect_model_status(&state.registry, &state.cache),
+            models: collect_model_status(
+                &state.registry,
+                &state.cache,
+                &collect_lease_stats(state)
+            ),
         }
     }
+}
+
+/// Fold per-registrant lease counters into a per-label view. A TP engine
+/// registers once per rank device; counters sum across devices and the
+/// weight (uniform across a label's registrants) comes from any of them.
+fn collect_lease_stats(state: &AppState) -> HashMap<String, RegistrantStats> {
+    let mut by_label: HashMap<String, RegistrantStats> = HashMap::new();
+    for stats in state.lease.stats() {
+        by_label
+            .entry(stats.label.clone())
+            .and_modify(|entry| {
+                entry.ns_held += stats.ns_held;
+                entry.ns_waited += stats.ns_waited;
+            })
+            .or_insert(stats);
+    }
+    by_label
 }
 
 /// Merge the engine registry (loading/ready/failed) with the cache tracker
@@ -235,24 +271,31 @@ impl NodeStatus {
 /// plane's placement wants to see.
 fn collect_model_status(
     registry: &ModelRegistry,
-    cache: &CacheTracker
+    cache: &CacheTracker,
+    lease: &HashMap<String, RegistrantStats>
 ) -> Vec<ModelStatus> {
     let mut statuses: Vec<ModelStatus> = registry
         .snapshot()
         .into_iter()
         .map(|(tag, state)| match state {
             ModelState::Loading { .. } => empty_status(tag, ModelLifecycle::Loading, None),
-            ModelState::Ready(model) => ModelStatus {
-                tag,
-                state: ModelLifecycle::Ready,
-                error: None,
-                batch_mode: Some((&model.plan).into()),
-                progress_pct: None,
-                queue_depth: model.stats.queue_depth.load(Ordering::Relaxed),
-                total_predictions: model.stats.total_predictions.load(Ordering::Relaxed),
-                avg_latency_ms: model.stats.avg_latency_ms(),
-                load_time_ms: model.stats.load_time_ms(),
-                vram_mb: model.stats.vram_mb(),
+            ModelState::Ready(model) => {
+                let lease = lease.get(&tag);
+                ModelStatus {
+                    tag,
+                    state: ModelLifecycle::Ready,
+                    error: None,
+                    batch_mode: Some((&model.plan).into()),
+                    progress_pct: None,
+                    queue_depth: model.stats.queue_depth.load(Ordering::Relaxed),
+                    total_predictions: model.stats.total_predictions.load(Ordering::Relaxed),
+                    avg_latency_ms: model.stats.avg_latency_ms(),
+                    load_time_ms: model.stats.load_time_ms(),
+                    vram_mb: model.stats.vram_mb(),
+                    lease_weight: lease.map(|stats| stats.weight),
+                    lease_ns_held: lease.map(|stats| stats.ns_held),
+                    lease_ns_waited: lease.map(|stats| stats.ns_waited),
+                }
             },
             ModelState::Failed { error, .. } => {
                 empty_status(tag, ModelLifecycle::Failed, Some(error))
@@ -291,5 +334,8 @@ fn empty_status(
         avg_latency_ms: 0.0,
         load_time_ms: 0.0,
         vram_mb: None,
+        lease_weight: None,
+        lease_ns_held: None,
+        lease_ns_waited: None,
     }
 }
