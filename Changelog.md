@@ -1,3 +1,6 @@
+## 0.0.11
+*INCOMPLETE*
+
 ## 0.0.10
 + Added support for tool calling in OpenAI-compatible chat completions.
 + Added support for tool calling in Anthropic-compatible messages.
