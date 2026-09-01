@@ -9,6 +9,7 @@ documents the contract it satisfies and the Rust tests that consume it.
 | Script | Tag | Probes |
 |---|---|---|
 | `openai_chat.py` | `@muna/test-openai-chat` | Chat completions (create + SSE stream), `cached_tokens` usage plumbing, `reasoning_content` passthrough |
+| `tools_chat.py` | `@muna/test-openai-tools` | Tool-call fragment streaming, chunk-merge accumulation, `finish_reason: tool_calls`, Anthropic `tool_use` adaptation |
 | `openai_embeddings.py` | `@muna/test-openai-embeddings` | Embeddings shape, determinism, usage |
 | `openai_image.py` | `@muna/test-openai-image` | Image generations (b64, one per prompt) |
 | `batch_sequential.py` | `@muna/test-batch-sequential` | Sequential dispatch guard |
@@ -26,11 +27,12 @@ pip install -r ../../requirements.txt
 muna auth login <access key>   # needs push rights to the @muna organization
 ```
 
-Compile + push all eight (each `@compile` decorator carries its tag):
+Compile + push all nine (each `@compile` decorator carries its tag):
 
 ```sh
-for script in openai_chat openai_embeddings openai_image batch_sequential \
-              batch_static batch_dynamic batch_continuous slow_coldstart; do
+for script in openai_chat tools_chat openai_embeddings openai_image \
+              batch_sequential batch_static batch_dynamic \
+              batch_continuous slow_coldstart; do
     muna compile --overwrite "$script.py"
 done
 ```

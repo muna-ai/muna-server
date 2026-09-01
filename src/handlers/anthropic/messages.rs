@@ -14,7 +14,7 @@ use axum::Json;
 use futures_util::stream;
 use muna::beta::anthropic::{
     MessageContent, MessageCreateParams, MessageParam,
-    RawMessageStreamEvent
+    RawMessageStreamEvent, Tool
 };
 use muna::types::Acceleration;
 use serde::Deserialize;
@@ -32,22 +32,37 @@ use crate::state::AppState;
 
 #[derive(Deserialize)]
 pub(crate) struct MessagesRequest {
+    /// Chat predictor tag.
     model: String,
+    /// The maximum number of tokens to generate before stopping.
+    /// Required by the Anthropic API, unlike the OpenAI surface.
     max_tokens: i32,
+    /// Input messages comprising the conversation so far.
     #[serde(default)]
     messages: Vec<MessageParam>,
+    /// System prompt, folded into the message list by the adapter.
     #[serde(default)]
     system: Option<MessageContent>,
+    /// Whether to stream the response as named server-sent events.
     #[serde(default)]
     stream: bool,
+    /// Custom text sequences that will cause the model to stop generating.
+    /// Ignored unless the predictor declares support for it.
     #[serde(default)]
     stop_sequences: Option<Vec<String>>,
+    /// Amount of randomness injected into the response.
     #[serde(default)]
     temperature: Option<f32>,
+    /// Only sample from the top K options for each subsequent token.
+    /// Ignored unless the predictor declares support for it.
     #[serde(default)]
     top_k: Option<i32>,
+    /// Nucleus sampling coefficient.
     #[serde(default)]
     top_p: Option<f32>,
+    /// Tools the model may call.
+    #[serde(default)]
+    tools: Option<Vec<Tool>>,
 }
 
 /// Messages via the muna-rs Anthropic client, wrapped with the model
@@ -77,6 +92,7 @@ pub(crate) async fn messages(
         temperature: req.temperature,
         top_k: req.top_k,
         top_p: req.top_p,
+        tools: req.tools,
         acceleration: Some(Acceleration::LocalGpu),
     };
     let muna = model.muna.clone();

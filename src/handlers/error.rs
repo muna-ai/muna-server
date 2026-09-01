@@ -160,7 +160,12 @@ impl IntoResponse for AppError {
 impl From<muna::MunaError> for AppError {
 
     fn from(e: muna::MunaError) -> Self {
-        Self::internal(e.to_string())
+        match e {
+            // Caller-fault errors (e.g. unsupported or malformed content
+            // parts) surface as 400s, not internal errors.
+            muna::MunaError::InvalidInput(message)  => Self::bad_request(message),
+            _                                       => Self::internal(e.to_string()),
+        }
     }
 }
 

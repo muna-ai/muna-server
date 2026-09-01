@@ -11,7 +11,10 @@ use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::{stream, StreamExt};
-use muna::beta::openai::{ChatCompletionChunk, ChatCompletionCreateParams, ChatCompletionMessage};
+use muna::beta::openai::{
+    ChatCompletionChunk, ChatCompletionCreateParams, ChatCompletionFunctionTool,
+    ChatCompletionMessage, ChatCompletionToolChoice
+};
 use muna::types::Acceleration;
 use serde::Deserialize;
 
@@ -22,13 +25,25 @@ use crate::state::AppState;
 
 #[derive(Deserialize)]
 pub(crate) struct ChatCompletionsRequest {
+    /// Chat predictor tag.
     model: String,
+    /// Messages comprising the conversation so far.
     #[serde(default)]
     messages: Vec<ChatCompletionMessage>,
+    /// Whether to stream the response as server-sent events.
     #[serde(default)]
     stream: bool,
+    /// Maximum completion tokens. Accepts OpenAI's deprecated
+    /// `max_tokens` spelling as an alias.
     #[serde(default, alias = "max_tokens")]
     max_completion_tokens: Option<i32>,
+    /// Tools the model may call.
+    #[serde(default)]
+    tools: Option<Vec<ChatCompletionFunctionTool>>,
+    /// Tool choice mode. Unknown modes (`required`, named functions)
+    /// fail deserialization and render as 400s.
+    #[serde(default)]
+    tool_choice: Option<ChatCompletionToolChoice>,
 }
 
 /// Chat completions via the muna-rs OpenAI client, wrapped with the model
@@ -54,6 +69,8 @@ pub(crate) async fn chat_completions(
         messages: req.messages,
         acceleration: Some(Acceleration::LocalGpu),
         max_completion_tokens: req.max_completion_tokens,
+        tools: req.tools,
+        tool_choice: req.tool_choice,
         ..Default::default()
     };
     let muna = model.muna.clone();
@@ -107,16 +124,18 @@ pub(crate) async fn chat_completions(
 }
 
 /// Stamp one chunk on the stream meter: a chunk is content-bearing when
-/// any choice's delta carries text (content or reasoning) or when it is
-/// the terminal usage frame -- role-only wire-consistency frames are not.
+/// any choice's delta carries text (content or reasoning) or tool call
+/// fragments, or when it is the terminal usage frame -- role-only
+/// wire-consistency frames are not.
 fn stamp_chunk(
     meter: &mut StreamMeter,
     chunk: &ChatCompletionChunk
 ) {
     let has_text = chunk.choices.iter().any(|choice| {
         choice.delta.as_ref().is_some_and(|delta| {
-            delta.content.as_deref().is_some_and(|c| !c.is_empty()) ||
-            delta.reasoning_content.as_deref().is_some_and(|c| !c.is_empty())
+            delta.content.as_deref().is_some_and(|c| !c.is_empty())             ||
+            delta.reasoning_content.as_deref().is_some_and(|c| !c.is_empty())   ||
+            delta.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
         })
     });
     if let Some(usage) = &chunk.usage {

@@ -29,6 +29,7 @@ use common::{
 
 // Fake predictor tags (pushed from tests/predictors/, see its README).
 const TAG_CHAT: &str = "@muna/test-openai-chat";
+const TAG_TOOLS: &str = "@muna/test-openai-tools";
 const TAG_EMBEDDINGS: &str = "@muna/test-openai-embeddings";
 const TAG_IMAGE: &str = "@muna/test-openai-image";
 const TAG_BATCH_SEQUENTIAL: &str = "@muna/test-batch-sequential";
@@ -371,6 +372,265 @@ async fn chat_completion_streaming_and_unload() {
     })
     .await
     .expect("unload directive did not remove the model");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_completion_content_parts() {
+    skip_without_access_key!();
+    skip_if_unpushed!(TAG_CHAT);
+    let stub = StubControlPlane::start().await;
+    let server = ServerGuard::spawn(&stub).await;
+    let client = reqwest::Client::new();
+    let expected_text = "What is the capital of France?";
+
+    // OpenCode-shaped request: `content` is an array of text parts (OpenAI
+    // compliant). The parts must flatten to a plain string before reaching
+    // the text-only fake predictor, which echoes the last user message.
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.url()))
+        .json(&json!({
+            "model": TAG_CHAT,
+            "messages": [
+                { "role": "system", "content": "You are a helpful assistant." },
+                {
+                    "role": "user",
+                    "content": [ { "type": "text", "text": expected_text } ]
+                },
+            ],
+        }))
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap();
+    let response_status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(response_status, 200, "content-parts chat completion failed: {body}");
+    let completion: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        completion["choices"][0]["message"]["content"],
+        json!(expected_text),
+        "text parts must flatten to the plain string the fake echoes"
+    );
+
+    // Multiple text parts flatten with a newline join.
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.url()))
+        .json(&json!({
+            "model": TAG_CHAT,
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "text", "text": "line one" },
+                    { "type": "text", "text": "line two" },
+                ] },
+            ],
+        }))
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap();
+    let completion: Value = response.json().await.unwrap();
+    assert_eq!(
+        completion["choices"][0]["message"]["content"],
+        json!("line one\nline two")
+    );
+
+    // An image part against a text-only model is a clear 400 (the model
+    // declares no images parameter), not a serde failure or a 500.
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.url()))
+        .json(&json!({
+            "model": TAG_CHAT,
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "text", "text": "describe this" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                ] },
+            ],
+        }))
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap();
+    assert_eq!(response.status(), 400);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["type"], json!("invalid_request_error"));
+    assert!(
+        error["error"]["message"].as_str().unwrap().contains("image_url"),
+        "error must name the unsupported part type: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_completion_tool_calls() {
+    skip_without_access_key!();
+    skip_if_unpushed!(TAG_TOOLS);
+    let stub = StubControlPlane::start().await;
+    let server = ServerGuard::spawn(&stub).await;
+    let client = reqwest::Client::new();
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location.",
+            "parameters": {
+                "type": "object",
+                "properties": { "location": { "type": "string" } },
+                "required": ["location"]
+            }
+        }
+    }]);
+    let request = json!({
+        "model": TAG_TOOLS,
+        "messages": [
+            { "role": "user", "content": "What is the weather in Paris?" },
+        ],
+        "tools": tools,
+    });
+    // Non-streaming: fragments merge into one completed tool call.
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.url()))
+        .json(&request)
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap();
+    let response_status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(response_status, 200, "tool-call chat completion failed: {body}");
+    let completion: Value = serde_json::from_str(&body).unwrap();
+    let tool_call = &completion["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(tool_call["id"], json!("call_test_0"));
+    assert_eq!(tool_call["type"], json!("function"));
+    assert_eq!(tool_call["function"]["name"], json!("get_weather"));
+    assert_eq!(
+        tool_call["function"]["arguments"],
+        json!("{\"location\": \"Paris\"}"),
+        "argument fragments must concatenate in order"
+    );
+    assert_eq!(completion["choices"][0]["finish_reason"], json!("tool_calls"));
+    // Streaming: fragments arrive with a stable index; the first carries
+    // id + name and the rest append argument text.
+    let mut streaming_request = request.clone();
+    streaming_request["stream"] = json!(true);
+    let sse = client
+        .post(format!("{}/v1/chat/completions", server.url()))
+        .json(&streaming_request)
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap()
+        .text().await.unwrap();
+    let frames: Vec<&str> = sse
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .collect();
+    assert_eq!(*frames.last().unwrap(), "[DONE]");
+    let mut streamed_id = None;
+    let mut streamed_name = None;
+    let mut streamed_arguments = String::new();
+    let mut finish_reason = None;
+    for frame in &frames[..frames.len() - 1] {
+        let chunk: Value = serde_json::from_str(frame).unwrap();
+        let choice = &chunk["choices"][0];
+        if let Some(reason) = choice["finish_reason"].as_str() {
+            finish_reason = Some(reason.to_string());
+        }
+        let Some(fragments) = choice["delta"]["tool_calls"].as_array() else {
+            continue;
+        };
+        for fragment in fragments {
+            assert_eq!(fragment["index"], json!(0));
+            if let Some(id) = fragment["id"].as_str() {
+                streamed_id = Some(id.to_string());
+            }
+            if let Some(name) = fragment["function"]["name"].as_str() {
+                streamed_name = Some(name.to_string());
+            }
+            if let Some(arguments) = fragment["function"]["arguments"].as_str() {
+                streamed_arguments.push_str(arguments);
+            }
+        }
+    }
+    assert_eq!(streamed_id.as_deref(), Some("call_test_0"));
+    assert_eq!(streamed_name.as_deref(), Some("get_weather"));
+    assert_eq!(streamed_arguments, "{\"location\": \"Paris\"}");
+    assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
+    // Without tools, the fake takes its echo path.
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.url()))
+        .json(&json!({
+            "model": TAG_TOOLS,
+            "messages": [{ "role": "user", "content": "hello there" }],
+        }))
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap();
+    let completion: Value = response.json().await.unwrap();
+    assert_eq!(completion["choices"][0]["message"]["content"], json!("hello there"));
+    assert!(completion["choices"][0]["message"]["tool_calls"].is_null());
+    assert_eq!(completion["choices"][0]["finish_reason"], json!("stop"));
+    // Anthropic surface: tools in, tool_use block + tool_use stop reason out.
+    // The buffered argument fragments must parse into the block's input.
+    let response = client
+        .post(format!("{}/v1/messages", server.url()))
+        .json(&json!({
+            "model": TAG_TOOLS,
+            "max_tokens": 256,
+            "messages": [
+                { "role": "user", "content": "What is the weather in Paris?" },
+            ],
+            "tools": [{
+                "name": "get_weather",
+                "description": "Get the current weather for a location.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "location": { "type": "string" } },
+                    "required": ["location"]
+                }
+            }],
+        }))
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap();
+    let response_status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(response_status, 200, "tool-call message failed: {body}");
+    let message: Value = serde_json::from_str(&body).unwrap();
+    let block = &message["content"][0];
+    assert_eq!(block["type"], json!("tool_use"));
+    assert_eq!(block["id"], json!("call_test_0"));
+    assert_eq!(block["name"], json!("get_weather"));
+    assert_eq!(block["input"], json!({ "location": "Paris" }));
+    assert_eq!(message["stop_reason"], json!("tool_use"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tools_against_undeclared_model_is_400() {
+    skip_without_access_key!();
+    skip_if_unpushed!(TAG_CHAT);
+    let stub = StubControlPlane::start().await;
+    let server = ServerGuard::spawn(&stub).await;
+    let client = reqwest::Client::new();
+    // The text-only fake declares no tools parameter: a tool-bearing
+    // request is a clear 400, not a silent drop or a 500.
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.url()))
+        .json(&json!({
+            "model": TAG_CHAT,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "get_weather" }
+            }],
+        }))
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap();
+    assert_eq!(response.status(), 400);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["type"], json!("invalid_request_error"));
+    assert!(
+        error["error"]["message"].as_str().unwrap().contains("tool"),
+        "error must name the missing capability: {error}"
+    );
+    // Unsupported tool_choice modes fail deserialization as 400s.
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.url()))
+        .json(&json!({
+            "model": TAG_CHAT,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tool_choice": "required",
+        }))
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap();
+    assert_eq!(response.status(), 400);
 }
 
 #[tokio::test(flavor = "multi_thread")]

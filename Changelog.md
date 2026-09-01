@@ -1,5 +1,8 @@
 ## 0.0.10
-*INCOMPLETE*
++ Added support for tool calling in OpenAI-compatible chat completions.
++ Added support for tool calling in Anthropic-compatible messages.
++ Added support for OpenAI content parts in chat completion messages.
++ Upgraded `muna` to 0.0.18.
 
 ## 0.0.9
 + Added CORS support so browser-based clients (e.g. OpenWebUI direct connections) can call the server.
