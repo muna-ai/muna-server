@@ -1,5 +1,5 @@
 ## 0.0.11
-*INCOMPLETE*
++ Upgraded `muna` to 0.0.19.
 
 ## 0.0.10
 + Added support for tool calling in OpenAI-compatible chat completions.

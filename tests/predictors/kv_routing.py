@@ -36,7 +36,7 @@ tokenizer = AutoTokenizer.from_pretrained("nvidia/GLM-5.2-NVFP4")
 
 def _tokenize(messages) -> list[int]:
     return tokenizer.apply_chat_template(
-        [{ "role": m.role, "content": m.content } for m in messages],
+        messages,
         add_generation_prompt=True,
         tokenize=True,
         return_dict=False,
