@@ -110,11 +110,24 @@ pub(crate) struct ModelRegistry {
     inner: Arc<RegistryInner>,
 }
 
-/// Loader delegate: performs the warmup + signature fetch for one tag and
-/// returns the per-model Muna client that owns the loaded handle.
+/// What a successful warmup yields: the signature, the per-model Muna
+/// client that owns the loaded handle, and how long each phase took.
+pub(crate) struct Loaded {
+    /// Predictor signature.
+    pub signature: Signature,
+    /// Muna client.
+    pub muna: Arc<Muna>,
+    /// Resource download that preceded the load (near zero when
+    /// disk-resident).
+    pub download: Duration,
+    /// Predictor creation with every resource on disk: the cold start.
+    pub load: Duration,
+}
+
+/// Loader delegate: performs the warmup + signature fetch for one tag.
 /// Injectable so single-flight behavior is testable without a live engine.
 type Loader = Arc<
-    dyn Fn(String) -> futures_util::future::BoxFuture<'static, Result<(Signature, Arc<Muna>), String>>
+    dyn Fn(String) -> futures_util::future::BoxFuture<'static, Result<Loaded, String>>
         + Send
         + Sync
 >;
@@ -360,19 +373,23 @@ impl ModelRegistry {
                     stats.record_vram(after - before);
                 }
             }
-            stats.record_load_time(start.elapsed());
             // Kept out of `state` so a deferred unload can delete through
             // the instance that actually loaded the handle.
             let mut loaded_muna: Option<Arc<Muna>> = None;
             let state = match outcome {
-                Ok((signature, muna)) => {
+                Ok(Loaded { signature, muna, download, load }) => {
+                    stats.record_download_time(download);
+                    stats.record_load_time(load);
+                    // Retry-After covers the whole wait a caller sees,
+                    // download included.
                     inner.last_load_secs.store(
                         start.elapsed().as_secs().max(1),
                         Ordering::Relaxed
                     );
                     tracing::info!(
                         tag = %tag,
-                        load_time_ms = %format!("{:.0}", start.elapsed().as_secs_f64() * 1000.0),
+                        download_time_ms = %format!("{:.0}", download.as_secs_f64() * 1000.0),
+                        load_time_ms = %format!("{:.0}", load.as_secs_f64() * 1000.0),
                         "model ready"
                     );
                     loaded_muna = Some(muna.clone());
@@ -426,18 +443,42 @@ async fn delete_predictor(muna: &Arc<Muna>, tag: &str) {
 async fn load_model(
     tag: &str,
     key: Option<String>
-) -> Result<(Signature, Arc<Muna>), String> {
+) -> Result<Loaded, String> {
     // One Muna instance per model, keyed with the tag's deployment key when
     // the control plane supplied one. The instance persists on `ReadyModel`
     // because it owns the native predictor handle loaded below.
     let muna = Arc::new(Muna::with_client(Arc::new(ServerClient::with_key(key))));
-    // Preload convention: create a prediction that deliberately excludes
-    // the predictor's required inputs. Loading the predictor runs all
-    // constructors and initializers (the actual engine load); the
-    // prediction itself then exits early on the missing argument, so
-    // `prediction.error` is expected and deliberately ignored. Genuine
-    // load failures (download, native predictor creation) surface as an
-    // `Err` from `create` itself.
+    // Phase 1, download. The download-only convention (an empty but present
+    // inputs map; see cache.rs) localizes every resource without loading an
+    // engine. Doing it as its own step keeps the load timing below a pure
+    // cold start: a node that has never seen the tag pays the fetch here,
+    // a disk-resident node finds everything cached and passes through in
+    // well under a second. Same acceleration as the load so the resource
+    // set is identical.
+    let download_started = Instant::now();
+    let download_muna = muna.clone();
+    let download_tag = tag.to_string();
+    let downloaded = predict::run(move || async move {
+        download_muna.predictions.create(
+            &download_tag,
+            Some(HashMap::<String, Value>::new()),
+            Some(Acceleration::LocalGpu),
+            None,
+            None
+        ).await
+    }).await.map_err(|e| e.to_string())?;
+    if let Some(error) = downloaded.error {
+        return Err(error);
+    }
+    let download = download_started.elapsed();
+    // Phase 2, load. Preload convention: create a prediction that
+    // deliberately excludes the predictor's required inputs. Loading the
+    // predictor runs all constructors and initializers (the actual engine
+    // load); the prediction itself then exits early on the missing
+    // argument, so `prediction.error` is expected and deliberately
+    // ignored. Genuine load failures (native predictor creation) surface
+    // as an `Err` from `create` itself.
+    let load_started = Instant::now();
     let warm_muna = muna.clone();
     let warm_tag = tag.to_string();
     predict::run(move || async move {
@@ -450,13 +491,14 @@ async fn load_model(
             None
         ).await
     }).await.map_err(|e| e.to_string())?;
+    let load = load_started.elapsed();
     let sig_muna = muna.clone();
     let sig_tag = tag.to_string();
     let predictor = predict::run(move || async move {
         sig_muna.predictors.retrieve(&sig_tag).await
     }).await.map_err(|e| e.to_string())?;
     let predictor = predictor.ok_or_else(|| format!("predictor {tag} not found"))?;
-    Ok((predictor.signature, muna))
+    Ok(Loaded { signature: predictor.signature, muna, download, load })
 }
 
 #[cfg(test)]
@@ -487,10 +529,12 @@ mod tests {
                 if fail {
                     Err("boom".to_string())
                 } else {
-                    Ok((
-                        Signature { inputs: vec![], outputs: vec![] },
-                        Arc::new(Muna::new(None, None))
-                    ))
+                    Ok(Loaded {
+                        signature: Signature { inputs: vec![], outputs: vec![] },
+                        muna: Arc::new(Muna::new(None, None)),
+                        download: Duration::ZERO,
+                        load: delay
+                    })
                 }
             })
         });

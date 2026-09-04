@@ -16,8 +16,13 @@ pub(crate) struct ModelStats {
     pub queue_depth: AtomicU32,
     /// Windowed timing samples for the heartbeat telemetry summary.
     pub telemetry: TelemetryWindow,
-    /// Model load duration in microseconds.
+    /// Model load duration in microseconds: predictor creation only, with
+    /// every resource already on disk.
     load_time_us: AtomicU64,
+    /// Resource download duration in nanoseconds, measured before the load
+    /// so `load_time_us` stays a pure cold-start number. Near zero (one
+    /// manifest round trip) when the model was already disk-resident.
+    download_time_ns: AtomicU64,
     /// Running sum of per-prediction latencies in microseconds.
     latency_sum_us: AtomicU64,
     /// Number of latency samples recorded (denominator for the average).
@@ -34,6 +39,7 @@ impl ModelStats {
             queue_depth: AtomicU32::new(0),
             telemetry: TelemetryWindow::new(),
             load_time_us: AtomicU64::new(0),
+            download_time_ns: AtomicU64::new(0),
             latency_sum_us: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             vram_mb: AtomicU64::new(0),
@@ -43,6 +49,17 @@ impl ModelStats {
     /// Store the duration of the initial model load.
     pub(crate) fn record_load_time(&self, elapsed: std::time::Duration) {
         self.load_time_us.store(elapsed.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Store the duration of the resource download that preceded the load.
+    pub(crate) fn record_download_time(&self, elapsed: std::time::Duration) {
+        self.download_time_ns.store(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Retrieve the download time in nanoseconds (near zero when nothing
+    /// was fetched).
+    pub(crate) fn download_time_ns(&self) -> u64 {
+        self.download_time_ns.load(Ordering::Relaxed)
     }
 
     /// Accumulate a single prediction's latency and bump the counter.

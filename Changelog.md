@@ -1,5 +1,5 @@
 ## 0.0.12
-*INCOMPLETE*
++ Minor telemetry updates.
 
 ## 0.0.11
 + Upgraded `muna` to 0.0.19.

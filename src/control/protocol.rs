@@ -124,8 +124,15 @@ pub(crate) struct ModelStatus {
     pub total_predictions: u64,
     /// Average prediction latency in milliseconds.
     pub avg_latency_ms: f64,
-    /// Time it took to download and load the model in milliseconds.
+    /// Time it took to load the model in milliseconds, with every resource
+    /// already on disk: the true cold start. Excludes download time.
     pub load_time_ms: f64,
+    /// Time spent downloading resources before the load, in nanoseconds.
+    /// Near zero (one manifest round trip) when the model was already
+    /// disk-resident. Present only when `state` is `ready`; optional so
+    /// older control planes and the golden-JSON mirror are not broken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_time_ns: Option<u64>,
     /// Estimated VRAM used by this model in MB (measured at load time).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vram_mb: Option<u64>,
@@ -311,6 +318,7 @@ fn collect_model_status(
                     total_predictions: model.stats.total_predictions.load(Ordering::Relaxed),
                     avg_latency_ms: model.stats.avg_latency_ms(),
                     load_time_ms: model.stats.load_time_ms(),
+                    download_time_ns: Some(model.stats.download_time_ns()),
                     vram_mb: model.stats.vram_mb(),
                     lease_weight: lease.map(|stats| stats.weight),
                     lease_ns_held: lease.map(|stats| stats.ns_held),
@@ -359,6 +367,7 @@ fn empty_status(
         total_predictions: 0,
         avg_latency_ms: 0.0,
         load_time_ms: 0.0,
+        download_time_ns: None,
         vram_mb: None,
         lease_weight: None,
         lease_ns_held: None,
