@@ -5,13 +5,14 @@
 
 //! Control-plane heartbeat loop.
 //!
-//! Every `heartbeat_interval`, POST the full `NodeStatus` (per-model state,
-//! GPU metrics) to `{control}/v1/nodes/{node_id}/heartbeat`. The response
-//! is a declarative list of goal descriptors (tag, residency `process` |
-//! `disk` | `none`, optional download key); the node diffs it against its
-//! own actual state and walks the warmth ladder locally. An absent tag
-//! means "no opinion", so an empty response (also the parse-failure
-//! default) is a guaranteed no-op.
+//! Every `heartbeat_interval` or immediately when reported state changes
+//! (`NotificationCenter::status`), POST the full `NodeStatus` (per-model
+//! state, GPU metrics) to `{control}/v1/nodes/{node_id}/heartbeat`. The
+//! response is a declarative list of goal descriptors (tag, residency
+//! `process` | `disk` | `none`, optional download key); the node diffs it
+//! against its own actual state and walks the warmth ladder locally. An
+//! absent tag means "no opinion", so an empty response (also the
+//! parse-failure default) is a guaranteed no-op.
 
 use std::sync::Arc;
 
@@ -33,32 +34,49 @@ pub(crate) async fn run(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(node.heartbeat_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        interval.tick().await;
-        let payload = NodeStatus::collect(&state);
-        let mut request = client.post(&url).json(&payload);
-        if let Some(token) = &token {
-            request = request.bearer_auth(token);
+        // Periodic cadence OR a state transition. `Notify::notify_one`
+        // stores at most one permit, so any number of transitions that
+        // land while a beat is in flight collapse into exactly one
+        // follow-up beat; no explicit coalescing needed.
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = state.notifications.status.notified() => {}
         }
-        let response = match request.send().await {
-            Ok(response) => response,
-            Err(e) => {
-                tracing::warn!(error = %e, "heartbeat failed");
-                continue;
-            }
-        };
-        if !response.status().is_success() {
-            tracing::warn!(status = %response.status(), "heartbeat rejected");
-            continue;
-        }
-        let reconcile: HeartbeatResponse = match response.json().await {
-            Ok(reconcile) => reconcile,
-            Err(e) => {
-                tracing::warn!(error = %e, "malformed heartbeat response");
-                continue;
-            }
-        };
-        apply(&state, reconcile).await;
+        beat(&state, &client, &url, token.as_deref()).await;
     }
+}
+
+/// One heartbeat: report status, apply the goals that come back.
+async fn beat(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>
+) {
+    let payload = NodeStatus::collect(state);
+    let mut request = client.post(url).json(&payload);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::warn!(error = %e, "heartbeat failed");
+            return;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::warn!(status = %response.status(), "heartbeat rejected");
+        return;
+    }
+    let reconcile: HeartbeatResponse = match response.json().await {
+        Ok(reconcile) => reconcile,
+        Err(e) => {
+            tracing::warn!(error = %e, "malformed heartbeat response");
+            return;
+        }
+    };
+    apply(state, reconcile).await;
 }
 
 /// Diff the goal residency map against local state. Every arm is

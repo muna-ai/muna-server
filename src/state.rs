@@ -12,6 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use muna::MunaClient;
 
+use crate::notifications::NotificationCenter;
+use crate::platform::{self, Platform};
 use crate::serving::cache::CacheTracker;
 use crate::serving::dispatch::Dispatcher;
 use crate::serving::lease::LeaseSupervisor;
@@ -50,6 +52,11 @@ pub(crate) struct AppState {
     pub lease: LeaseSupervisor,
     /// Per-tag deployment keys from residency directives; see [`KeyStore`].
     pub keys: KeyStore,
+    /// In-process wakeups (state transitions -> heartbeat, ...).
+    pub notifications: Arc<NotificationCenter>,
+    /// The platform detected at boot (NVIDIA, Apple, or CPU), owning its
+    /// vendor handles: device and host metrics, and the driver warm.
+    pub platform: Arc<dyn Platform>,
     /// Resource-cache directory (env-derived), for disk metrics. There is
     /// no process-wide Muna client: each loaded model owns its own (see
     /// `ReadyModel::muna`).
@@ -77,12 +84,21 @@ impl AppState {
         // Throwaway client purely for the env-derived cache location; it
         // holds no credential and makes no requests.
         let cache_path = MunaClient::new(None, None).cache_path().to_path_buf();
+        let notifications = Arc::new(NotificationCenter::default());
+        let platform = platform::detect();
         Self {
-            registry: ModelRegistry::new(keys.clone(), pinned),
-            cache: CacheTracker::new(keys.clone()),
+            registry: ModelRegistry::new(
+                keys.clone(),
+                pinned,
+                notifications.clone(),
+                platform.clone()
+            ),
+            cache: CacheTracker::new(keys.clone(), notifications.clone()),
             dispatcher: Dispatcher::new(),
             lease: LeaseSupervisor::new(),
             keys,
+            notifications,
+            platform,
             cache_path,
             node,
             start_time: Instant::now(),
@@ -97,6 +113,7 @@ impl AppState {
 
     pub(crate) fn set_draining(&self, draining: bool) {
         self.draining.store(draining, Ordering::Relaxed);
+        self.notifications.status_changed();
     }
 
     /// Refresh the runtime token for a loaded model if its check-in is due.

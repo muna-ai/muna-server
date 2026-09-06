@@ -1106,9 +1106,9 @@ dependencies = [
 
 [[package]]
 name = "muna"
-version = "0.0.19"
+version = "0.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35bea8f270054cc4168bb02d23e2960c72ad932bfd71de7f08c4d63b918005b6"
+checksum = "13d5195c57066cd76994c549d6a84d80e7c36536bb77df8263ed8fd76496d2be"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1141,6 +1141,7 @@ dependencies = [
  "futures-util",
  "indicatif",
  "libc",
+ "libloading",
  "muna",
  "nvml-wrapper",
  "objc2",

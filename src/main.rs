@@ -5,14 +5,15 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 
 mod client;
 mod control;
 mod handlers;
-mod metrics;
+mod notifications;
+mod platform;
 mod serving;
 mod state;
 
@@ -84,6 +85,34 @@ async fn serve(cli: &Cli) -> Result<(), String> {
         Some(cli.models.iter().cloned().collect())
     };
     let state = Arc::new(AppState::new(pinned, node));
+    // Warm the platform driver off the runtime thread: a cold driver load
+    // under disk pressure can take seconds, and the listener must bind
+    // regardless. Fail-soft: the engine's own init still works without it.
+    {
+        let platform = state.platform.clone();
+        tracing::info!(vendor = ?platform.vendor(), "platform detected");
+        tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let outcome = platform.warm();
+            let elapsed_ms = started.elapsed().as_millis();
+            match outcome {
+                Ok(Some(platform::WarmReport { devices })) => tracing::info!(
+                    devices,
+                    elapsed_ms,
+                    "platform driver warm complete"
+                ),
+                Ok(None) => tracing::info!(
+                    elapsed_ms,
+                    "platform driver had nothing to warm"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    elapsed_ms,
+                    "platform driver warm failed; continuing"
+                ),
+            }
+        });
+    }
     // Eager load: fire-and-forget warms so the port binds immediately;
     // mid-load requests get 429 + Retry-After.
     for tag in &cli.models {

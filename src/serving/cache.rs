@@ -24,6 +24,7 @@ use muna::types::{Acceleration, Value};
 use muna::Muna;
 
 use crate::client::ServerClient;
+use crate::notifications::NotificationCenter;
 use crate::serving::predict;
 use crate::state::KeyStore;
 
@@ -48,13 +49,21 @@ pub(crate) enum CacheState {
 pub(crate) struct CacheTracker {
     /// Per-tag deployment keys for building keyed download clients.
     keys: KeyStore,
+    /// Per-tag disk state. Absent-from-map means never requested (or
+    /// forgotten after a failure); shared with the download tasks, which
+    /// write the terminal `Cached` / `Failed` state on completion.
     states: Arc<DashMap<String, CacheState>>,
+    /// Poked on every tier write so the heartbeat reports it at once.
+    notifications: Arc<NotificationCenter>,
 }
 
 impl CacheTracker {
 
-    pub(crate) fn new(keys: KeyStore) -> Self {
-        Self { keys, states: Arc::new(DashMap::new()) }
+    pub(crate) fn new(
+        keys: KeyStore,
+        notifications: Arc<NotificationCenter>
+    ) -> Self {
+        Self { keys, states: Arc::new(DashMap::new()), notifications }
     }
 
     /// Ensure the tag's resources are on disk. Idempotent and single-flight:
@@ -77,6 +86,7 @@ impl CacheTracker {
                 entry.insert(CacheState::Caching);
             }
         }
+        self.notifications.status_changed();
         self.spawn_download(tag.to_string());
     }
 
@@ -85,8 +95,11 @@ impl CacheTracker {
     /// the resources genuinely are on disk, and the plane's placement wants
     /// to see that even under a `none` goal.
     pub(crate) fn forget_failed(&self, tag: &str) {
-        self.states
+        let removed = self.states
             .remove_if(tag, |_, state| matches!(state, CacheState::Failed { .. }));
+        if removed.is_some() {
+            self.notifications.status_changed();
+        }
     }
 
     /// Snapshot every tracked tag for status reporting.
@@ -105,6 +118,7 @@ impl CacheTracker {
         let key = self.keys.get(&tag).map(|entry| entry.value().clone());
         let muna = Arc::new(Muna::with_client(Arc::new(ServerClient::with_key(key))));
         let states = self.states.clone();
+        let notifications = self.notifications.clone();
         tokio::spawn(async move {
             let start = Instant::now();
             let download_muna = muna.clone();
@@ -144,6 +158,7 @@ impl CacheTracker {
                 }
             };
             states.insert(tag, state);
+            notifications.status_changed();
         });
     }
 }

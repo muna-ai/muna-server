@@ -8,7 +8,7 @@
 //! Every type that crosses the node <-> control-plane boundary lives here;
 //! the standalone control-plane project mirrors this module
 //! (`control-plane/src/nodes/protocol.rs`) and pins it with golden-JSON
-//! tests -- change BOTH ends together.
+//! tests. Make sure to change BOTH ends together.
 //!
 //! Goal-vs-actual vocabulary split: `HeartbeatResponse` declares the GOAL
 //! (three-valued `Residency`, stable), `NodeStatus` reports the ACTUAL
@@ -23,7 +23,7 @@ use std::sync::atomic::Ordering;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::metrics::{collect_gpu_metrics, GpuMetrics};
+use crate::platform::DeviceMetrics;
 use crate::serving::batch::BatchPlan;
 use crate::serving::cache::{CacheState, CacheTracker};
 use crate::serving::lease::RegistrantStats;
@@ -50,7 +50,7 @@ pub(crate) struct NodeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_total_mb: Option<u64>,
     /// Per-device GPU metrics (system RAM fallback on CPU-only nodes).
-    pub gpus: Vec<GpuMetrics>,
+    pub gpus: Vec<DeviceMetrics>,
     /// Warmth tier and counters for every known model, including models
     /// cached on disk with no engine loaded.
     pub models: Vec<ModelStatus>,
@@ -256,7 +256,7 @@ pub(crate) struct EdgeResponse {
 impl NodeStatus {
 
     pub(crate) fn collect(state: &AppState) -> NodeStatus {
-        let disk = crate::metrics::disk_space_mb(&state.cache_path);
+        let disk = state.platform.disk_space_mb(&state.cache_path);
         NodeStatus {
             node_id: state.node.as_ref().map(|n| n.node_id.clone()),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -264,7 +264,7 @@ impl NodeStatus {
             draining: state.is_draining(),
             disk_free_mb: disk.map(|(free, _)| free),
             disk_total_mb: disk.map(|(_, total)| total),
-            gpus: collect_gpu_metrics(),
+            gpus: state.platform.devices(),
             models: collect_model_status(
                 &state.registry,
                 &state.cache,

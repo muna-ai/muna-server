@@ -21,7 +21,8 @@ use muna::types::{Acceleration, Signature, Value};
 use muna::Muna;
 
 use crate::client::ServerClient;
-use crate::metrics;
+use crate::platform::Platform;
+use crate::notifications::NotificationCenter;
 use crate::serving::batch::BatchPlan;
 use crate::serving::predict;
 use crate::serving::stats::ModelStats;
@@ -144,6 +145,10 @@ struct RegistryInner {
     pinned: Option<HashSet<String>>,
     /// Most recent successful load duration in seconds, for Retry-After.
     last_load_secs: AtomicU64,
+    /// Poked on every lifecycle write so the heartbeat reports it at once.
+    notifications: Arc<NotificationCenter>,
+    /// Device memory source for the load-time VRAM delta.
+    platform: Arc<dyn Platform>,
 }
 
 impl ModelRegistry {
@@ -153,25 +158,31 @@ impl ModelRegistry {
     /// load through the process-wide `$MUNA_ACCESS_KEY`.
     pub(crate) fn new(
         keys: KeyStore,
-        pinned: Option<HashSet<String>>
+        pinned: Option<HashSet<String>>,
+        notifications: Arc<NotificationCenter>,
+        platform: Arc<dyn Platform>
     ) -> Self {
         let loader: Loader = Arc::new(move |tag| {
             let key = keys.get(&tag).map(|entry| entry.value().clone());
             Box::pin(async move { load_model(&tag, key).await })
         });
-        Self::with_loader(loader, pinned)
+        Self::with_loader(loader, pinned, notifications, platform)
     }
 
     fn with_loader(
         loader: Loader,
-        pinned: Option<HashSet<String>>
+        pinned: Option<HashSet<String>>,
+        notifications: Arc<NotificationCenter>,
+        platform: Arc<dyn Platform>
     ) -> Self {
         Self {
             inner: Arc::new(RegistryInner {
                 models: DashMap::new(),
                 loader,
                 pinned,
-                last_load_secs: AtomicU64::new(DEFAULT_LOAD_SECS)
+                last_load_secs: AtomicU64::new(DEFAULT_LOAD_SECS),
+                notifications,
+                platform
             })
         }
     }
@@ -217,6 +228,7 @@ impl ModelRegistry {
                         watch,
                         unload_requested: false
                     });
+                    self.inner.notifications.status_changed();
                     self.spawn_load(tag.to_string());
                     rx
                 }
@@ -274,6 +286,7 @@ impl ModelRegistry {
                     watch,
                     unload_requested: false
                 });
+                self.inner.notifications.status_changed();
                 self.spawn_load(tag.to_string());
             }
         }
@@ -314,6 +327,7 @@ impl ModelRegistry {
         let Some((_, slot)) = self.inner.models.remove(tag) else {
             return;
         };
+        self.inner.notifications.status_changed();
         if let ModelState::Ready(model) = slot.state {
             delete_predictor(&model.muna, tag).await;
         }
@@ -364,10 +378,10 @@ impl ModelRegistry {
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let start = Instant::now();
-            let vram_before = metrics::total_memory_used_mb();
+            let vram_before = inner.platform.memory_used_mb();
             let stats = Arc::new(ModelStats::new());
             let outcome = (inner.loader)(tag.clone()).await;
-            let vram_after = metrics::total_memory_used_mb();
+            let vram_after = inner.platform.memory_used_mb();
             if let (Some(before), Some(after)) = (vram_before, vram_after) {
                 if after > before {
                     stats.record_vram(after - before);
@@ -424,6 +438,8 @@ impl ModelRegistry {
                     delete_predictor(&muna, &tag).await;
                 }
             }
+            // Ready, Failed, or gone: all three are reportable transitions.
+            inner.notifications.status_changed();
         });
     }
 }
@@ -521,6 +537,22 @@ mod tests {
         delay: Duration,
         pinned: Option<HashSet<String>>
     ) -> ModelRegistry {
+        registry_notifying(
+            loads,
+            fail,
+            delay,
+            pinned,
+            Arc::new(NotificationCenter::default())
+        )
+    }
+
+    fn registry_notifying(
+        loads: Arc<AtomicUsize>,
+        fail: bool,
+        delay: Duration,
+        pinned: Option<HashSet<String>>,
+        notifications: Arc<NotificationCenter>
+    ) -> ModelRegistry {
         let loader: Loader = Arc::new(move |_tag| {
             let loads = loads.clone();
             Box::pin(async move {
@@ -538,7 +570,12 @@ mod tests {
                 }
             })
         });
-        ModelRegistry::with_loader(loader, pinned)
+        ModelRegistry::with_loader(
+            loader,
+            pinned,
+            notifications,
+            Arc::new(crate::platform::NullPlatform)
+        )
     }
 
     #[tokio::test]
@@ -626,5 +663,35 @@ mod tests {
         assert!(registry.ready_tags().is_empty());
         registry.ensure_ready("@test/model").await.unwrap();
         assert_eq!(registry.ready_tags(), vec!["@test/model".to_string()]);
+    }
+
+    /// Every lifecycle write must wake the heartbeat: one permit after the
+    /// `Loading` insert, another once the load resolves to `Ready`.
+    #[tokio::test]
+    async fn lifecycle_transitions_notify_status() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let notifications = Arc::new(NotificationCenter::default());
+        let registry = registry_notifying(
+            loads,
+            false,
+            Duration::from_millis(50),
+            None,
+            notifications.clone()
+        );
+        let observed = |what: &'static str| {
+            let notifications = notifications.clone();
+            async move {
+                tokio::time::timeout(Duration::from_millis(500), notifications.status.notified())
+                    .await
+                    .unwrap_or_else(|_| panic!("no status notification after {what}"));
+            }
+        };
+        registry.warm("@test/model");
+        observed("Loading").await;
+        // The load is still in flight (50 ms); the next permit is Ready.
+        observed("Ready").await;
+        assert_eq!(registry.ready_tags(), vec!["@test/model".to_string()]);
+        registry.unload("@test/model").await;
+        observed("unload").await;
     }
 }
