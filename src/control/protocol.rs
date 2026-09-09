@@ -285,6 +285,7 @@ fn collect_lease_stats(state: &AppState) -> HashMap<String, RegistrantStats> {
             .and_modify(|entry| {
                 entry.ns_held += stats.ns_held;
                 entry.ns_waited += stats.ns_waited;
+                entry.yields += stats.yields;
             })
             .or_insert(stats);
     }

@@ -23,9 +23,11 @@
 //! segment simply has nothing to supervise yet.
 //!
 //! Layout safety: `LeaseSegment` here is a field-for-field mirror of the
-//! C++ struct (ABI v1); the `layout` test pins every offset the C++
-//! `static_assert`s pin. An `abi_version` mismatch (engines built against a
-//! newer layout) rejects the segment rather than misinterpreting it.
+//! C++ struct (ABI v2, 2026-09: `last_holder`, per-registrant `yields` +
+//! `release_event` for the layer-granular lease yield); the `layout` test
+//! pins every offset the C++ `static_assert`s pin. An `abi_version`
+//! mismatch (engines built against another layout) rejects the segment
+//! rather than misinterpreting it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -39,8 +41,9 @@ use crate::state::AppState;
 
 /// `LeaseSegment::MAGIC` ('NSGL'): the creator's init-complete handshake.
 const MAGIC: u32 = 0x4E53_474C;
-/// Segment layout version this mirror understands.
-const ABI_VERSION: u32 = 1;
+/// Segment layout version this mirror understands (nanosgl
+/// `LeaseSegment::ABI_VERSION`).
+const ABI_VERSION: u32 = 2;
 /// Slots per segment (`LeaseSegment::MAX_REGISTRANTS`).
 const MAX_REGISTRANTS: usize = 8;
 /// Device ordinals probed for segments (per-GPU keying; comfortably above
@@ -87,10 +90,15 @@ struct Registrant {
     /// NUL-terminated label -- the predictor tag (py2cpp splices
     /// `FXN_PREDICTOR_TAG` as the engine config's `lease_label`).
     label: [u8; 128],
-    pad1: u64,
+    /// Mid-forward yields since registration: layer-boundary handoffs a
+    /// preemptible forward (prefill, embedding) made to a queued peer.
+    yields: AtomicU64,
+    /// Engine debug aid (`NSGL_LEASE_VERIFY`): raw device-event handle of
+    /// the holder's last release, 0 when unset. Never read here.
+    release_event: AtomicU64,
 }
 
-/// Byte-for-byte mirror of nanosgl `LeaseSegment` (ABI v1). The pthread
+/// Byte-for-byte mirror of nanosgl `LeaseSegment` (ABI v2). The pthread
 /// mutex/condvar live in fixed 64-byte storage blobs the supervisor never
 /// touches -- policy writes and stats reads are lock-free atomics only.
 #[repr(C)]
@@ -105,7 +113,10 @@ struct LeaseSegment {
     holder: AtomicI32,
     /// Ring virtual time (stride scheduling's global pass).
     virtual_time: AtomicU64,
-    pad0: u64,
+    /// Registrant index of the most recent holder, -1 before the first
+    /// grant; engine-side (`NSGL_LEASE_VERIFY` handoff check).
+    last_holder: AtomicI32,
+    pad0: u32,
     /// PROCESS_SHARED (+ robust) pthread mutex; engine-side only.
     mutex_storage: [u8; 64],
     /// PROCESS_SHARED pthread condvar; engine-side only.
@@ -131,6 +142,10 @@ pub(crate) struct RegistrantStats {
     pub ns_held: u64,
     /// Total ns spent waiting for turns (the contention signal).
     pub ns_waited: u64,
+    /// Mid-forward layer-boundary yields to a queued peer (how often the
+    /// model's prefill-class forwards were preempted).
+    #[allow(dead_code)]
+    pub yields: u64,
 }
 
 /// One attached segment mapping. Never unmapped while cached; dropped (and
@@ -227,7 +242,8 @@ impl LeaseSupervisor {
     }
 
     /// Snapshot per-registrant counters (`ns_held`, `ns_waited`,
-    /// `slots_held`, weight) via atomic loads; never blocks engines.
+    /// `slots_held`, `yields`, weight) via atomic loads; never blocks
+    /// engines.
     pub(crate) fn stats(&self) -> Vec<RegistrantStats> {
         let mut stats = Vec::new();
         let mut segments = self.segments.lock().unwrap();
@@ -246,6 +262,7 @@ impl LeaseSupervisor {
                     slots_held: slot.slots_held.load(Ordering::Relaxed),
                     ns_held: slot.ns_held.load(Ordering::Relaxed),
                     ns_waited: slot.ns_waited.load(Ordering::Relaxed),
+                    yields: slot.yields.load(Ordering::Relaxed),
                 });
             }
         }
@@ -401,17 +418,19 @@ mod tests {
 
     use super::*;
 
-    /// Pins the Rust mirror to nanosgl's `LeaseSegment` ABI v1 -- the same
+    /// Pins the Rust mirror to nanosgl's `LeaseSegment` ABI v2 -- the same
     /// offsets the C++ `static_assert`s pin. A failure here means the C++
     /// layout changed: bump `ABI_VERSION` on BOTH sides and update this
     /// mirror.
     #[test]
-    fn segment_layout_matches_nanosgl_abi_v1() {
+    fn segment_layout_matches_nanosgl_abi_v2() {
+        assert_eq!(ABI_VERSION, 2);
         assert_eq!(offset_of!(LeaseSegment, magic), 0);
         assert_eq!(offset_of!(LeaseSegment, abi_version), 4);
         assert_eq!(offset_of!(LeaseSegment, mode), 8);
         assert_eq!(offset_of!(LeaseSegment, holder), 12);
         assert_eq!(offset_of!(LeaseSegment, virtual_time), 16);
+        assert_eq!(offset_of!(LeaseSegment, last_holder), 24);
         assert_eq!(offset_of!(LeaseSegment, mutex_storage), 32);
         assert_eq!(offset_of!(LeaseSegment, cond_storage), 96);
         assert_eq!(offset_of!(LeaseSegment, registrants), 160);
@@ -424,8 +443,10 @@ mod tests {
         assert_eq!(offset_of!(Registrant, ns_waited), 40);
         assert_eq!(offset_of!(Registrant, last_heartbeat_ns), 48);
         assert_eq!(offset_of!(Registrant, label), 56);
-        assert_eq!(size_of::<Registrant>(), 192);
-        assert_eq!(size_of::<LeaseSegment>(), 160 + 8 * 192);
+        assert_eq!(offset_of!(Registrant, yields), 184);
+        assert_eq!(offset_of!(Registrant, release_event), 192);
+        assert_eq!(size_of::<Registrant>(), 200);
+        assert_eq!(size_of::<LeaseSegment>(), 160 + 8 * 200);
     }
 
     /// Attaching with no engine registered anywhere is a clean no-op.

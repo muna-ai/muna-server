@@ -1,3 +1,7 @@
+## 0.0.13
++ Added `platform` module including driver initialization on load.
++ Upgraded `muna` to 0.0.21.
+
 ## 0.0.12
 + Minor telemetry updates.
 
