@@ -1,3 +1,6 @@
+## 0.0.15
+*INCOMPLETE*
+
 ## 0.0.14
 + Fixed a sporadic segmentation fault when two requests to a static or dynamically batched model overlapped.
 
