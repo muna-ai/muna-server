@@ -447,7 +447,7 @@ impl ModelRegistry {
 async fn delete_predictor(muna: &Arc<Muna>, tag: &str) {
     let delete_muna = muna.clone();
     let delete_tag = tag.to_string();
-    let result = predict::run(move || async move {
+    let result = predict::run(None, move || async move {
         delete_muna.predictions.delete(&delete_tag).await
     }).await;
     match result {
@@ -474,7 +474,7 @@ async fn load_model(
     let download_started = Instant::now();
     let download_muna = muna.clone();
     let download_tag = tag.to_string();
-    let downloaded = predict::run(move || async move {
+    let downloaded = predict::run(None, move || async move {
         download_muna.predictions.create(
             &download_tag,
             Some(HashMap::<String, Value>::new()),
@@ -497,7 +497,7 @@ async fn load_model(
     let load_started = Instant::now();
     let warm_muna = muna.clone();
     let warm_tag = tag.to_string();
-    predict::run(move || async move {
+    predict::run(None, move || async move {
         let inputs = HashMap::from([("_".to_string(), Value::Null)]);
         warm_muna.predictions.create(
             &warm_tag,
@@ -510,7 +510,7 @@ async fn load_model(
     let load = load_started.elapsed();
     let sig_muna = muna.clone();
     let sig_tag = tag.to_string();
-    let predictor = predict::run(move || async move {
+    let predictor = predict::run(None, move || async move {
         sig_muna.predictors.retrieve(&sig_tag).await
     }).await.map_err(|e| e.to_string())?;
     let predictor = predictor.ok_or_else(|| format!("predictor {tag} not found"))?;

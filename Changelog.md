@@ -1,5 +1,5 @@
 ## 0.0.14
-*INCOMPLETE*
++ Fixed a sporadic segmentation fault when two requests to a static or dynamically batched model overlapped.
 
 ## 0.0.13
 + Added `platform` module including driver initialization on load.

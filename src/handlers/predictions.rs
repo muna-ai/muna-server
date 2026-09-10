@@ -82,8 +82,10 @@ async fn stream_prediction(
     acceleration: Acceleration,
 ) -> Result<Response, AppError> {
     // Streams bypass batching (per-request token streams cannot merge);
-    // sequential models still hold their guard for the whole stream. Time
-    // spent acquiring the guard is this surface's admission wait.
+    // sequential models still hold their guard for the whole stream: it
+    // rides with the pump onto the blocking thread and is released once
+    // the native stream is dropped. Time spent acquiring the guard is this
+    // surface's admission wait.
     let admitted = std::time::Instant::now();
     let guard = state.dispatcher.acquire(&tag, &model).await;
     // Raw frames are opaque, so only time to the first frame is kept; the
@@ -95,12 +97,12 @@ async fn stream_prediction(
     );
     let muna = model.muna.clone();
     let stream_tag = tag.clone();
-    let rx = predict::stream(move || async move {
+    let rx = predict::stream(guard, move || async move {
         muna.predictions.stream(&stream_tag, inputs, Some(acceleration)).await
     });
     let event_stream = futures_util::stream::unfold(
-        (rx, guard, tag, meter),
-        |(mut rx, guard, tag, mut meter)| async move {
+        (rx, tag, meter),
+        |(mut rx, tag, mut meter)| async move {
             let result = rx.recv().await?;
             let remote = match result {
                 Ok(prediction) => {
@@ -115,7 +117,7 @@ async fn stream_prediction(
             };
             let data = serde_json::to_string(&remote).unwrap_or_default();
             let event = Event::default().event("prediction").data(data);
-            Some((Ok::<Event, Infallible>(event), (rx, guard, tag, meter)))
+            Some((Ok::<Event, Infallible>(event), (rx, tag, meter)))
         }
     );
     Ok(Sse::new(event_stream).into_response())

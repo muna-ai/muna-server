@@ -62,10 +62,9 @@ pub(crate) async fn image_generations(
     };
     let muna = model.muna.clone();
     let dispatched = Instant::now();
-    let response = predict::run(move || async move {
+    let response = predict::run(guard, move || async move {
         muna.beta.openai.images.generate(params).await
     }).await?;
-    drop(guard);
     let images = response.data.as_ref().map_or(0, |data| data.len()) as u32;
     model.stats.telemetry.record(PredictionSample {
         at: Instant::now(),

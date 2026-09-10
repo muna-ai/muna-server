@@ -116,7 +116,7 @@ async fn discover_endpoint(state: &Arc<AppState>, tag: &str) -> Option<String> {
     // model's own (keyed) Muna instance from the registry.
     let muna = state.registry.ready(tag)?.muna.clone();
     let sidecar = format!("{tag}:kv");
-    let result = predict::run(move || async move {
+    let result = predict::run(None, move || async move {
         let inputs = HashMap::from([("_".to_string(), Value::Null)]);
         muna.predictions.create(
             &sidecar,

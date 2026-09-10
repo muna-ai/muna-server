@@ -10,7 +10,16 @@
 //! - `Sequential`: per-model mutex so one slow model no longer blocks every other model.
 //! - `Buffered`: per-model channel + one accumulator task that merges
 //!   compatible requests (same batch key) up to the plan capacity, invokes
-//!   once, then splits the results back per request.
+//!   once, then splits the results back per request. The accumulator holds
+//!   the same per-model mutex around each invocation, because the OpenAI
+//!   surfaces bypass it (muna-rs fuses translation and prediction) and take
+//!   that mutex through `acquire` instead.
+//!
+//! Invariant: a compiled predictor that is not continuous is never invoked
+//! concurrently, whichever surface the request arrives on. The guard that
+//! enforces it must travel with the invocation onto the blocking thread
+//! (`predict::run` / `predict::stream`), never stay in a handler future
+//! that a client disconnect can drop mid-invocation.
 //!
 //! This module owns routing (`Dispatcher`); the buffered accumulator lives
 //! in [`worker`] and the input-merge / result-split plumbing in [`merge`].
@@ -40,8 +49,14 @@ enum Entry {
     /// per-model mutex.
     Sequential { lock: Arc<tokio::sync::Mutex<()>> },
     /// Requests are queued to the model's accumulator task
-    /// (`BufferedWorker`), which merges them into batches.
-    Buffered { tx: async_channel::Sender<PredictItem> },
+    /// (`BufferedWorker`), which merges them into batches. `lock` is the
+    /// model's invocation mutex: the accumulator holds it around each
+    /// flush, and surfaces that bypass the accumulator take it via
+    /// `acquire`.
+    Buffered {
+        tx: async_channel::Sender<PredictItem>,
+        lock: Arc<tokio::sync::Mutex<()>>,
+    },
     /// The model handles concurrency itself: requests go straight to the
     /// blocking executor with no coordination.
     Continuous,
@@ -84,9 +99,9 @@ impl Dispatcher {
             Queued(async_channel::Sender<PredictItem>),
         }
         let route = match &*self.entries.get(tag).expect("entry just ensured") {
-            Entry::Continuous                            => Route::Direct,
-            Entry::Sequential { lock }  => Route::Locked(lock.clone()),
-            Entry::Buffered { tx } => Route::Queued(tx.clone()),
+            Entry::Continuous               => Route::Direct,
+            Entry::Sequential { lock }      => Route::Locked(lock.clone()),
+            Entry::Buffered { tx, .. }      => Route::Queued(tx.clone()),
         };
         match route {
             Route::Direct => {
@@ -95,17 +110,19 @@ impl Dispatcher {
                     model,
                     inputs,
                     acceleration,
+                    None,
                     Duration::ZERO
                 ).await
             }
             Route::Locked(lock) => {
                 let enqueued = Instant::now();
-                let _guard = lock.lock().await;
+                let guard = lock.lock_owned().await;
                 self.predict(
                     tag,
                     model,
                     inputs,
                     acceleration,
+                    Some(guard),
                     enqueued.elapsed()
                 ).await
             }
@@ -134,18 +151,21 @@ impl Dispatcher {
         }
     }
 
-    /// Acquire the sequential guard for a model, if its plan requires one.
-    /// OpenAI handlers use this around muna-rs client calls (which fuse
-    /// translation and prediction, bypassing `create`).
+    /// Acquire the invocation guard for a model, if its plan requires one
+    /// (every plan but `Continuous`). OpenAI handlers use this around
+    /// muna-rs client calls (which fuse translation and prediction,
+    /// bypassing `create`); pass the result to `predict::run` / `stream`
+    /// so it is released on the blocking thread, not by the handler.
     pub(crate) async fn acquire(
         &self,
         tag: &str,
         model: &Arc<ReadyModel>
-    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    ) -> predict::Guard {
         self.ensure_entry(tag, model);
         let lock = match &*self.entries.get(tag).expect("entry just ensured") {
-            Entry::Sequential { lock } => Some(lock.clone()),
-            _ => None,
+            Entry::Sequential { lock }      => Some(lock.clone()),
+            Entry::Buffered { lock, .. }    => Some(lock.clone()),
+            Entry::Continuous               => None,
         }?;
         Some(lock.lock_owned().await)
     }
@@ -166,15 +186,22 @@ impl Dispatcher {
             BatchPlan::Continuous => Entry::Continuous,
             BatchPlan::Buffered { params, capacity } => {
                 let (tx, rx) = async_channel::bounded(CHANNEL_BUFFER);
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
                 let muna = model.muna.clone();
                 let tag_owned = tag.to_string();
                 let stats = model.stats.clone();
+                let invoke_lock = lock.clone();
                 let predict_fn: PredictFn = Arc::new(move |inputs, acceleration| {
                     let muna = muna.clone();
                     let tag = tag_owned.clone();
                     let stats = stats.clone();
+                    let lock = invoke_lock.clone();
                     Box::pin(async move {
-                        predict::run(move || async move {
+                        // The accumulator is already single-consumer; the
+                        // lock only contends with `acquire` callers on the
+                        // OpenAI surfaces.
+                        let guard = lock.lock_owned().await;
+                        predict::run(Some(guard), move || async move {
                             let start = Instant::now();
                             let result = muna.predictions.create(
                                 &tag,
@@ -196,7 +223,7 @@ impl Dispatcher {
                     rx,
                 };
                 tokio::spawn(worker.run());
-                Entry::Buffered { tx }
+                Entry::Buffered { tx, lock }
             }
         };
         self.entries.entry(tag.to_string()).or_insert(entry);
@@ -208,12 +235,13 @@ impl Dispatcher {
         model: &Arc<ReadyModel>,
         inputs: HashMap<String, Value>,
         acceleration: Acceleration,
+        guard: predict::Guard,
         queue_wait: Duration
     ) -> Result<Prediction, MunaError> {
         let muna = model.muna.clone();
         let tag_owned = tag.to_string();
         let stats = model.stats.clone();
-        predict::run(move || async move {
+        predict::run(guard, move || async move {
             let start = Instant::now();
             let result = muna.predictions.create(
                 &tag_owned,
@@ -232,5 +260,90 @@ impl Dispatcher {
             });
             result
         }).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use muna::types::Signature;
+    use muna::Muna;
+
+    use super::*;
+    use crate::serving::stats::ModelStats;
+
+    fn ready_model(plan: BatchPlan) -> Arc<ReadyModel> {
+        Arc::new(ReadyModel {
+            muna: Arc::new(Muna::new(None, None)),
+            loaded_at: Instant::now(),
+            signature: Signature { inputs: vec![], outputs: vec![] },
+            plan,
+            stats: Arc::new(ModelStats::new()),
+        })
+    }
+
+    fn buffered_plan() -> BatchPlan {
+        BatchPlan::Buffered {
+            params: HashSet::from(["prompt".to_string()]),
+            capacity: 4,
+        }
+    }
+
+    /// Buffered models (FLUX.2 [klein], the embedders) reach the predictor
+    /// through the OpenAI surfaces via `acquire`, bypassing the accumulator;
+    /// they must get the model's invocation guard, not `None`.
+    #[tokio::test]
+    async fn acquire_guards_buffered_models() {
+        let dispatcher = Dispatcher::new();
+        let model = ready_model(buffered_plan());
+        let first = dispatcher.acquire("@test/buffered", &model).await;
+        assert!(first.is_some(), "buffered plan must yield an invocation guard");
+        // A second caller blocks until the first guard is released.
+        let second = tokio::time::timeout(
+            Duration::from_millis(50),
+            dispatcher.acquire("@test/buffered", &model)
+        ).await;
+        assert!(second.is_err(), "second acquire must wait on the first");
+        drop(first);
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            dispatcher.acquire("@test/buffered", &model)
+        ).await.expect("acquire after release");
+        assert!(second.is_some());
+    }
+
+    #[tokio::test]
+    async fn acquire_guards_sequential_models() {
+        let dispatcher = Dispatcher::new();
+        let model = ready_model(BatchPlan::Sequential);
+        assert!(dispatcher.acquire("@test/sequential", &model).await.is_some());
+    }
+
+    /// Continuous predictors own their synchronization; no guard.
+    #[tokio::test]
+    async fn acquire_skips_continuous_models() {
+        let dispatcher = Dispatcher::new();
+        let model = ready_model(BatchPlan::Continuous);
+        assert!(dispatcher.acquire("@test/continuous", &model).await.is_none());
+    }
+
+    /// The accumulator and `acquire` callers share ONE lock per model, so a
+    /// raw `/v1/predictions` batch can never overlap an OpenAI-surface call.
+    #[tokio::test]
+    async fn buffered_accumulator_shares_the_acquire_lock() {
+        let dispatcher = Dispatcher::new();
+        let model = ready_model(buffered_plan());
+        let tag = "@test/buffered";
+        dispatcher.ensure_entry(tag, &model);
+        let lock = match &*dispatcher.entries.get(tag).expect("entry") {
+            Entry::Buffered { lock, .. } => lock.clone(),
+            _ => panic!("expected a buffered entry"),
+        };
+        // `acquire` hands out the very same mutex the accumulator holds.
+        let guard = dispatcher.acquire(tag, &model).await.expect("guard");
+        assert!(lock.try_lock().is_err());
+        drop(guard);
+        assert!(lock.try_lock().is_ok());
     }
 }

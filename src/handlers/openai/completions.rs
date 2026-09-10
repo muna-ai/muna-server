@@ -76,15 +76,16 @@ pub(crate) async fn chat_completions(
     let muna = model.muna.clone();
     if req.stream {
         let meter = StreamMeter::new(model.stats.clone(), StreamKind::Llm, queue_wait);
-        let rx = predict::stream(move || async move {
+        // The guard rides with the pump onto the blocking thread and is
+        // released once the native stream is dropped; the meter travels
+        // with the stream state and records its telemetry sample when the
+        // response body drops (stream end or client disconnect).
+        let rx = predict::stream(guard, move || async move {
             muna.beta.openai.chat.completions.stream(params).await
         });
-        // The guard and meter travel with the stream state; dropping the
-        // response body (stream end or client disconnect) releases the
-        // guard and records the meter's telemetry sample.
         let event_stream = stream::unfold(
-            (rx, guard, meter),
-            |(mut rx, guard, mut meter)| async move {
+            (rx, meter),
+            |(mut rx, mut meter)| async move {
                 let item = rx.recv().await?;
                 let event = match item {
                     Ok(chunk) => {
@@ -98,7 +99,7 @@ pub(crate) async fn chat_completions(
                         Event::default().data(json)
                     }
                 };
-                Some((Ok::<Event, Infallible>(event), (rx, guard, meter)))
+                Some((Ok::<Event, Infallible>(event), (rx, meter)))
             }
         )
         .chain(stream::once(async {
@@ -107,10 +108,9 @@ pub(crate) async fn chat_completions(
         Ok(Sse::new(event_stream).into_response())
     } else {
         let dispatched = Instant::now();
-        let completion = predict::run(move || async move {
+        let completion = predict::run(guard, move || async move {
             muna.beta.openai.chat.completions.create(params).await
         }).await?;
-        drop(guard);
         // Non-streamed chat records `Unary`: whole-response latency has no
         // first-yield boundary and must not fatten the TTFT percentiles.
         model.stats.telemetry.record(PredictionSample {

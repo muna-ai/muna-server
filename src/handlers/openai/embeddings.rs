@@ -62,7 +62,7 @@ pub(crate) async fn embeddings(
     let tag = req.model;
     let dimensions = req.dimensions;
     let dispatched = Instant::now();
-    let response = predict::run(move || async move {
+    let response = predict::run(guard, move || async move {
         muna.beta.openai.embeddings.create(
             input,
             &tag,
@@ -71,7 +71,6 @@ pub(crate) async fn embeddings(
             Some(Acceleration::LocalGpu)
         ).await
     }).await?;
-    drop(guard);
     model.stats.telemetry.record(PredictionSample {
         at: Instant::now(),
         queue_wait,

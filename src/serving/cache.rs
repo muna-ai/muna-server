@@ -128,7 +128,7 @@ impl CacheTracker {
             // its resources without loading any engine. Acceleration must
             // be a LOCAL flavor: without it the API resolves the tag as a
             // remote predictor, which compiled models do not have.
-            let result = predict::run(move || async move {
+            let result = predict::run(None, move || async move {
                 download_muna.predictions.create(
                     &download_tag,
                     Some(HashMap::<String, Value>::new()),

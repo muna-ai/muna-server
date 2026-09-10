@@ -98,18 +98,20 @@ pub(crate) async fn messages(
     let muna = model.muna.clone();
     if req.stream {
         let meter = StreamMeter::new(model.stats.clone(), StreamKind::Llm, queue_wait);
-        let rx = predict::stream(move || async move {
+        // The guard rides with the pump onto the blocking thread and is
+        // released once the native stream is dropped.
+        let rx = predict::stream(guard, move || async move {
             muna.beta.anthropic.messages.stream(params).await
         });
         // Anthropic SSE frames are named events with no `[DONE]` terminator:
         // the stream simply ends after `message_stop`. Mid-stream errors are
         // emitted as `event: error` with the Anthropic error envelope. The
-        // guard and meter travel with the stream state; dropping the
-        // response body (stream end or client disconnect) releases the
-        // guard and records the meter's telemetry sample.
+        // meter travels with the stream state and records its telemetry
+        // sample when the response body drops (stream end or client
+        // disconnect).
         let event_stream = stream::unfold(
-            (rx, guard, meter),
-            |(mut rx, guard, mut meter)| async move {
+            (rx, meter),
+            |(mut rx, mut meter)| async move {
                 let item = rx.recv().await?;
                 let event = match item {
                     Ok(message_event) => {
@@ -124,16 +126,15 @@ pub(crate) async fn messages(
                         Event::default().event("error").data(json)
                     }
                 };
-                Some((Ok::<Event, Infallible>(event), (rx, guard, meter)))
+                Some((Ok::<Event, Infallible>(event), (rx, meter)))
             }
         );
         Ok(Sse::new(event_stream).into_response())
     } else {
         let dispatched = Instant::now();
-        let message = predict::run(move || async move {
+        let message = predict::run(guard, move || async move {
             muna.beta.anthropic.messages.create(params).await
         }).await?;
-        drop(guard);
         // Non-streamed messages record `Unary`: whole-response latency has
         // no first-yield boundary and must not fatten the TTFT percentiles.
         model.stats.telemetry.record(PredictionSample {
