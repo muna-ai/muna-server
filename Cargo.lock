@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "muna-server"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "async-channel",
  "async-trait",
