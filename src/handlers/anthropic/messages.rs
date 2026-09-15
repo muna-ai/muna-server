@@ -100,9 +100,21 @@ pub(crate) async fn messages(
         let meter = StreamMeter::new(model.stats.clone(), StreamKind::Llm, queue_wait);
         // The guard rides with the pump onto the blocking thread and is
         // released once the native stream is dropped.
-        let rx = predict::stream(guard, move || async move {
+        let mut rx = predict::stream(guard, move || async move {
             muna.beta.anthropic.messages.stream(params).await
         });
+        // Commit the response status on the first item. Failures raised
+        // before the predictor's first output (context length, malformed
+        // messages) arrive here as `Err` and become a proper 400 / 500 body
+        // instead of a 200 stream carrying an error frame. Errors after
+        // this point are mid-stream and stay in-band, as Anthropic's do.
+        let first = match rx.recv().await {
+            Some(Ok(message_event)) => message_event,
+            Some(Err(e)) => return Err(AppError::from(e).into()),
+            None => return Err(AppError::internal(
+                "prediction stream ended before producing output".into()
+            ).into()),
+        };
         // Anthropic SSE frames are named events with no `[DONE]` terminator:
         // the stream simply ends after `message_stop`. Mid-stream errors are
         // emitted as `event: error` with the Anthropic error envelope. The
@@ -110,9 +122,12 @@ pub(crate) async fn messages(
         // sample when the response body drops (stream end or client
         // disconnect).
         let event_stream = stream::unfold(
-            (rx, meter),
-            |(mut rx, mut meter)| async move {
-                let item = rx.recv().await?;
+            (rx, meter, Some(first)),
+            |(mut rx, mut meter, mut pending)| async move {
+                let item = match pending.take() {
+                    Some(message_event) => Ok(message_event),
+                    None => rx.recv().await?,
+                };
                 let event = match item {
                     Ok(message_event) => {
                         stamp_event(&mut meter, &message_event);
@@ -126,7 +141,7 @@ pub(crate) async fn messages(
                         Event::default().event("error").data(json)
                     }
                 };
-                Some((Ok::<Event, Infallible>(event), (rx, meter)))
+                Some((Ok::<Event, Infallible>(event), (rx, meter, pending)))
             }
         );
         Ok(Sse::new(event_stream).into_response())

@@ -336,6 +336,11 @@ async fn chat_completion_streaming_and_unload() {
         .collect();
     assert!(frames.len() >= 3, "expected several SSE frames, got: {sse}");
     assert_eq!(*frames.last().unwrap(), "[DONE]");
+    // The handler holds the response until the predictor's first item so
+    // pre-output failures can change the status; a healthy stream still
+    // opens with the role announcement.
+    let first: Value = serde_json::from_str(frames[0]).unwrap();
+    assert_eq!(first["choices"][0]["delta"]["role"], json!("assistant"));
     let mut streamed_text = String::new();
     let mut streamed_reasoning = String::new();
     for frame in &frames[..frames.len() - 1] {
@@ -372,6 +377,74 @@ async fn chat_completion_streaming_and_unload() {
     })
     .await
     .expect("unload directive did not remove the model");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_completion_caller_fault_is_400() {
+    skip_without_access_key!();
+    skip_if_unpushed!(TAG_CHAT);
+    let stub = StubControlPlane::start().await;
+    let server = ServerGuard::spawn(&stub).await;
+    let client = reqwest::Client::new();
+    // The fake raises `ValueError` before its first yield on this message,
+    // standing in for a prompt longer than the model's context length.
+    // `muna-rs` classifies it as `InvalidInput`; the server must render it
+    // as a real 400 on both the JSON and the SSE path (the streaming
+    // handler holds the status until the first item arrives).
+    let request = json!({
+        "model": TAG_CHAT,
+        "messages": [
+            { "role": "user", "content": "__invalid__" },
+        ],
+    });
+
+    // Non-streaming.
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.url()))
+        .json(&request)
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap();
+    assert_eq!(response.status(), 400);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["type"], json!("invalid_request_error"));
+    assert!(
+        error["error"]["message"].as_str().unwrap().contains("context length"),
+        "error must carry the predictor's message: {error}"
+    );
+
+    // Streaming: same status and body, no SSE frames.
+    let mut streaming_request = request.clone();
+    streaming_request["stream"] = json!(true);
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.url()))
+        .json(&streaming_request)
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap();
+    assert_eq!(response.status(), 400);
+    let body = response.text().await.unwrap();
+    assert!(!body.contains("data: "), "400 must not open an SSE stream: {body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"]["type"], json!("invalid_request_error"));
+    assert!(error["error"]["message"].as_str().unwrap().contains("context length"));
+
+    // Anthropic surface, streaming: same commit-on-first-item rule with the
+    // Anthropic error envelope.
+    let response = client
+        .post(format!("{}/v1/messages", server.url()))
+        .json(&json!({
+            "model": TAG_CHAT,
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{ "role": "user", "content": "__invalid__" }],
+        }))
+        .timeout(LOAD_TIMEOUT)
+        .send().await.unwrap();
+    assert_eq!(response.status(), 400);
+    let body = response.text().await.unwrap();
+    assert!(!body.contains("event: "), "400 must not open an SSE stream: {body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["type"], json!("error"));
+    assert_eq!(error["error"]["type"], json!("invalid_request_error"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

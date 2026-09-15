@@ -80,13 +80,28 @@ pub(crate) async fn chat_completions(
         // released once the native stream is dropped; the meter travels
         // with the stream state and records its telemetry sample when the
         // response body drops (stream end or client disconnect).
-        let rx = predict::stream(guard, move || async move {
+        let mut rx = predict::stream(guard, move || async move {
             muna.beta.openai.chat.completions.stream(params).await
         });
+        // Commit the response status on the first item. Failures raised
+        // before the predictor's first output (context length, malformed
+        // messages) arrive here as `Err` and become a proper 400 / 500 body
+        // instead of a 200 stream carrying an error frame. Errors after
+        // this point are mid-stream and stay in-band, as OpenAI's do.
+        let first = match rx.recv().await {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(e)) => return Err(e.into()),
+            None => return Err(AppError::internal(
+                "prediction stream ended before producing output".into()
+            )),
+        };
         let event_stream = stream::unfold(
-            (rx, meter),
-            |(mut rx, mut meter)| async move {
-                let item = rx.recv().await?;
+            (rx, meter, Some(first)),
+            |(mut rx, mut meter, mut pending)| async move {
+                let item = match pending.take() {
+                    Some(chunk) => Ok(chunk),
+                    None => rx.recv().await?,
+                };
                 let event = match item {
                     Ok(chunk) => {
                         stamp_chunk(&mut meter, &chunk);
@@ -99,7 +114,7 @@ pub(crate) async fn chat_completions(
                         Event::default().data(json)
                     }
                 };
-                Some((Ok::<Event, Infallible>(event), (rx, meter)))
+                Some((Ok::<Event, Infallible>(event), (rx, meter, pending)))
             }
         )
         .chain(stream::once(async {

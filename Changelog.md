@@ -1,5 +1,6 @@
 ## 0.0.15
-*INCOMPLETE*
++ Updated streaming chat completions and messages endpoints to propagate input errors with `400` status code.
++ Upgraded `muna` to 0.0.22.
 
 ## 0.0.14
 + Fixed a sporadic segmentation fault when two requests to a static or dynamically batched model overlapped.

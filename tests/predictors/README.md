@@ -8,7 +8,7 @@ documents the contract it satisfies and the Rust tests that consume it.
 
 | Script | Tag | Probes |
 |---|---|---|
-| `openai_chat.py` | `@muna/test-openai-chat` | Chat completions (create + SSE stream), `cached_tokens` usage plumbing, `reasoning_content` passthrough |
+| `openai_chat.py` | `@muna/test-openai-chat` | Chat completions (create + SSE stream), `cached_tokens` usage plumbing, `reasoning_content` passthrough, pre-output `ValueError` (last user message `__invalid__`) renders as 400 on stream + non-stream |
 | `tools_chat.py` | `@muna/test-openai-tools` | Tool-call fragment streaming, chunk-merge accumulation, `finish_reason: tool_calls`, Anthropic `tool_use` adaptation |
 | `openai_embeddings.py` | `@muna/test-openai-embeddings` | Embeddings shape, determinism, usage |
 | `openai_image.py` | `@muna/test-openai-image` | Image generations (b64, one per prompt) |
