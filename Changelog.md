@@ -1,5 +1,5 @@
 ## 0.0.16
-*INCOMPLETE*
++ Upgraded `muna` to 0.0.23.
 
 ## 0.0.15
 + Updated streaming chat completions and messages endpoints to propagate input errors with `400` status code.
