@@ -1,3 +1,6 @@
+## 0.0.18
++ Upgraded `muna` to 0.0.25.
+
 ## 0.0.17
 + Process-tier model downloads now run ahead of disk-tier prefetch, so a model the control plane wants loaded is ready sooner on nodes with slow disks.
 + Resource downloads are published as soon as they are in memory instead of waiting for the disk to absorb them allowing for faster model cold starts.
