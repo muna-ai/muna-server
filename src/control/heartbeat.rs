@@ -16,7 +16,8 @@
 
 use std::sync::Arc;
 
-use crate::control::protocol::{HeartbeatResponse, NodeStatus, Residency};
+use crate::control::protocol::{HeartbeatResponse, ModelDescriptor, NodeStatus, Residency};
+use crate::serving::cache::CachePriority;
 use crate::state::AppState;
 
 pub(crate) async fn run(state: Arc<AppState>) {
@@ -90,7 +91,7 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
             state.keys.insert(descriptor.tag.clone(), key.clone());
         }
     }
-    for descriptor in &reconcile.models {
+    for descriptor in process_first(&reconcile.models) {
         let tag = &descriptor.tag;
         // A residency goal for a tag outside the pinned set (`--models`) is
         // a control-plane misconfiguration: neither loaded nor cached.
@@ -105,19 +106,22 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
         }
         match descriptor.residency {
             Residency::Process => {
-                // `process` implies `disk`: track the cached tier too, so a
-                // later demotion reports `cached` instead of vanishing.
-                // The engine load downloads the same resources; the
-                // client's per-path single-flight de-duplicates the work.
-                state.cache.ensure_cached(tag);
+                // Warm FIRST so the gate guard exists before the cache
+                // request. `process` implies `disk`: track the cached tier
+                // too, so a later demotion reports `cached` instead of
+                // vanishing. The engine load downloads the same resources
+                // and the client's per-path single-flight de-duplicates,
+                // so the cache request is `Immediate` rather than queued.
                 state.registry.warm_reconcile(tag);
+                state.cache.ensure_cached(tag, CachePriority::Immediate);
             }
             Residency::Disk => {
                 // Demote: engine out (idempotent no-op when not loaded),
-                // resources on disk.
+                // resources on disk. Prefetch queues behind process-tier
+                // downloads.
                 state.dispatcher.remove(tag);
                 state.registry.unload(tag).await;
-                state.cache.ensure_cached(tag);
+                state.cache.ensure_cached(tag, CachePriority::Prefetch);
             }
             Residency::None => {
                 // Engine out. Disk eviction is PERMITTED but not required;
@@ -134,5 +138,42 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
     if reconcile.drain != state.is_draining() {
         tracing::info!(drain = reconcile.drain, "drain state changed by control plane");
         state.set_draining(reconcile.drain);
+    }
+}
+
+/// Order directives so `process` goals are applied before the rest.
+///
+/// `warm` takes the download-gate guard synchronously, so every disk-tier
+/// prefetch applied after the `process` pass queues behind the loads the
+/// plane is actually waiting on, whatever order the plane listed them in.
+/// Stable within each group.
+fn process_first(models: &[ModelDescriptor]) -> impl Iterator<Item = &ModelDescriptor> {
+    let (process, rest): (Vec<_>, Vec<_>) = models
+        .iter()
+        .partition(|descriptor| matches!(descriptor.residency, Residency::Process));
+    process.into_iter().chain(rest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor(tag: &str, residency: Residency) -> ModelDescriptor {
+        ModelDescriptor { tag: tag.to_string(), residency, key: None }
+    }
+
+    #[test]
+    fn process_directives_are_applied_first() {
+        // The plane listed a disk-tier prefetch ahead of the process-tier
+        // load; the load must still be applied first so its gate guard
+        // exists before the prefetch is spawned.
+        let models = vec![
+            descriptor("@a/flux", Residency::Disk),
+            descriptor("@a/gemma", Residency::Process),
+            descriptor("@a/old", Residency::None),
+            descriptor("@a/qwen", Residency::Process),
+        ];
+        let tags: Vec<&str> = process_first(&models).map(|d| d.tag.as_str()).collect();
+        assert_eq!(tags, vec!["@a/gemma", "@a/qwen", "@a/flux", "@a/old"]);
     }
 }

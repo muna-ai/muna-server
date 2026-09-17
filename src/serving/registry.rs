@@ -24,6 +24,7 @@ use crate::client::ServerClient;
 use crate::platform::Platform;
 use crate::notifications::NotificationCenter;
 use crate::serving::batch::BatchPlan;
+use crate::serving::download_gate::{DownloadGate, PriorityGuard};
 use crate::serving::predict;
 use crate::serving::stats::ModelStats;
 use crate::state::KeyStore;
@@ -127,8 +128,12 @@ pub(crate) struct Loaded {
 
 /// Loader delegate: performs the warmup + signature fetch for one tag.
 /// Injectable so single-flight behavior is testable without a live engine.
+///
+/// Receives the download-gate guard and owns its release: the real loader
+/// drops it once resources are on disk, before the engine load, so
+/// disk-tier prefetch resumes while weights stage from page cache.
 type Loader = Arc<
-    dyn Fn(String) -> futures_util::future::BoxFuture<'static, Result<Loaded, String>>
+    dyn Fn(String, PriorityGuard) -> futures_util::future::BoxFuture<'static, Result<Loaded, String>>
         + Send
         + Sync
 >;
@@ -149,6 +154,8 @@ struct RegistryInner {
     notifications: Arc<NotificationCenter>,
     /// Device memory source for the load-time VRAM delta.
     platform: Arc<dyn Platform>,
+    /// Priority side of the process-tier-first download ordering.
+    download_gate: Arc<DownloadGate>,
 }
 
 impl ModelRegistry {
@@ -160,20 +167,22 @@ impl ModelRegistry {
         keys: KeyStore,
         pinned: Option<HashSet<String>>,
         notifications: Arc<NotificationCenter>,
-        platform: Arc<dyn Platform>
+        platform: Arc<dyn Platform>,
+        download_gate: Arc<DownloadGate>
     ) -> Self {
-        let loader: Loader = Arc::new(move |tag| {
+        let loader: Loader = Arc::new(move |tag, priority| {
             let key = keys.get(&tag).map(|entry| entry.value().clone());
-            Box::pin(async move { load_model(&tag, key).await })
+            Box::pin(async move { load_model(&tag, key, priority).await })
         });
-        Self::with_loader(loader, pinned, notifications, platform)
+        Self::with_loader(loader, pinned, notifications, platform, download_gate)
     }
 
     fn with_loader(
         loader: Loader,
         pinned: Option<HashSet<String>>,
         notifications: Arc<NotificationCenter>,
-        platform: Arc<dyn Platform>
+        platform: Arc<dyn Platform>,
+        download_gate: Arc<DownloadGate>
     ) -> Self {
         Self {
             inner: Arc::new(RegistryInner {
@@ -182,7 +191,8 @@ impl ModelRegistry {
                 pinned,
                 last_load_secs: AtomicU64::new(DEFAULT_LOAD_SECS),
                 notifications,
-                platform
+                platform,
+                download_gate
             })
         }
     }
@@ -374,13 +384,19 @@ impl ModelRegistry {
 
     /// Spawn the single-flight warmup: sentinel prediction (reaches the
     /// engine's `load_predictor`), then signature fetch and plan derivation.
+    ///
+    /// Callers invoke this synchronously right after inserting the
+    /// `Loading` slot, so the download-gate guard taken here exists before
+    /// any disk-tier prefetch spawned later in the same reconcile pass
+    /// checks the gate (see `download_gate.rs`).
     fn spawn_load(&self, tag: String) {
+        let priority = self.inner.download_gate.enter_priority();
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let start = Instant::now();
             let vram_before = inner.platform.memory_used_mb();
             let stats = Arc::new(ModelStats::new());
-            let outcome = (inner.loader)(tag.clone()).await;
+            let outcome = (inner.loader)(tag.clone(), priority).await;
             let vram_after = inner.platform.memory_used_mb();
             if let (Some(before), Some(after)) = (vram_before, vram_after) {
                 if after > before {
@@ -458,7 +474,8 @@ async fn delete_predictor(muna: &Arc<Muna>, tag: &str) {
 
 async fn load_model(
     tag: &str,
-    key: Option<String>
+    key: Option<String>,
+    priority: PriorityGuard
 ) -> Result<Loaded, String> {
     // One Muna instance per model, keyed with the tag's deployment key when
     // the control plane supplied one. The instance persists on `ReadyModel`
@@ -487,6 +504,10 @@ async fn load_model(
         return Err(error);
     }
     let download = download_started.elapsed();
+    // Everything from here is GPU staging from page cache; disk-tier
+    // prefetch may start writing again. (An `Err` above drops the guard on
+    // the way out, so failures release it too.)
+    drop(priority);
     // Phase 2, load. Preload convention: create a prediction that
     // deliberately excludes the predictor's required inputs. Loading the
     // predictor runs all constructors and initializers (the actual engine
@@ -553,7 +574,7 @@ mod tests {
         pinned: Option<HashSet<String>>,
         notifications: Arc<NotificationCenter>
     ) -> ModelRegistry {
-        let loader: Loader = Arc::new(move |_tag| {
+        let loader: Loader = Arc::new(move |_tag, _priority| {
             let loads = loads.clone();
             Box::pin(async move {
                 loads.fetch_add(1, Ordering::SeqCst);
@@ -574,8 +595,63 @@ mod tests {
             loader,
             pinned,
             notifications,
-            Arc::new(crate::platform::NullPlatform)
+            Arc::new(crate::platform::NullPlatform),
+            Arc::new(DownloadGate::new())
         )
+    }
+
+    /// A registry whose loader holds the gate guard until `release` fires,
+    /// then succeeds or fails per `fail`, so gate accounting is observable.
+    fn registry_gated(
+        gate: Arc<DownloadGate>,
+        release: Arc<tokio::sync::Notify>,
+        fail: bool
+    ) -> ModelRegistry {
+        let loader: Loader = Arc::new(move |_tag, priority| {
+            let release = release.clone();
+            Box::pin(async move {
+                // The real loader holds the guard through the download
+                // phase only; `release` stands in for "resources on disk".
+                release.notified().await;
+                drop(priority);
+                if fail {
+                    Err("boom".to_string())
+                } else {
+                    Ok(Loaded {
+                        signature: Signature { inputs: vec![], outputs: vec![] },
+                        muna: Arc::new(Muna::new(None, None)),
+                        download: Duration::ZERO,
+                        load: Duration::ZERO
+                    })
+                }
+            })
+        });
+        ModelRegistry::with_loader(
+            loader,
+            None,
+            Arc::new(NotificationCenter::default()),
+            Arc::new(crate::platform::NullPlatform),
+            gate
+        )
+    }
+
+    #[tokio::test]
+    async fn warm_holds_gate_through_download_and_releases_on_both_outcomes() {
+        for fail in [false, true] {
+            let gate = Arc::new(DownloadGate::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let registry = registry_gated(gate.clone(), release.clone(), fail);
+            // Synchronous: the guard exists before the load task runs.
+            registry.warm("@test/model");
+            assert_eq!(gate.inflight(), 1);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(gate.inflight(), 1, "held while downloading");
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), gate.wait_idle())
+                .await
+                .expect("gate released after the download phase");
+            assert_eq!(gate.inflight(), 0, "fail={fail}");
+        }
     }
 
     #[tokio::test]

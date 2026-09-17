@@ -11,13 +11,16 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use muna::client::{Client, DownloadProgressFn, RequestInput, Result, SseStream};
+use muna::client::{
+    Client, DownloadDurability, DownloadProgressFn,
+    RequestInput, Result, SseStream
+};
 use muna::MunaClient;
 
 /// Muna client for server use: wraps the default [`MunaClient`] and
-/// overrides `download` with per-path single-flight plus progress
-/// presentation (an indicatif bar on a TTY, throttled tracing lines in
-/// containers/CI).
+/// overrides `download` with per-path single-flight, eventual durability,
+/// and progress presentation (an indicatif bar on a TTY, throttled tracing
+/// lines in containers/CI).
 ///
 /// The registry already single-flights loads per tag, but two *different*
 /// tags loading concurrently can share a resource file (e.g. `libtvm_ffi.so`);
@@ -26,8 +29,20 @@ use muna::MunaClient;
 /// process-global (see [`download_locks`]) because the server constructs
 /// one keyed client per model, and per-instance maps would not protect
 /// across them.
+///
+/// Durability: fleet nodes bootstrap onto a fresh disk every time, so a
+/// cache file torn by a crash is never read back. What matters is how soon
+/// the engine can stage weights from page cache, and the default client's
+/// fsync-before-rename makes that wait for the disk to absorb every byte.
+/// On some network root volumes (~130 MB/s) that is the difference between
+/// ~30 s and ~4 min for a 30 GB model, so downloads here are published
+/// with [`DownloadDurability::Eventual`].
 pub(crate) struct ServerClient {
     inner: MunaClient,
+    /// Dedicated CDN client for `download`. The API client's pool is
+    /// unrelated to CDN traffic, and the durability policy lives with the
+    /// caller of `muna::download`, not with `MunaClient`.
+    http: reqwest::Client,
 }
 
 impl ServerClient {
@@ -41,8 +56,17 @@ impl ServerClient {
         let url = std::env::var("MUNA_API_URL").ok();
         Self {
             inner: MunaClient::new(access_key.as_deref(), url.as_deref()),
+            http: cdn_client(),
         }
     }
+}
+
+/// HTTP client for resource downloads.
+fn cdn_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent("muna-server")
+        .build()
+        .expect("failed to build reqwest client")
 }
 
 /// Process-global in-flight download locks, keyed by destination path.
@@ -93,7 +117,7 @@ impl Client for ServerClient {
                 Ok(())
             } else if let Some(callback) = progress {
                 // A caller-provided callback wins over our presentation.
-                self.inner.download(url, path, Some(callback)).await
+                self.download_eventual(url, path, callback).await
             } else {
                 let presentation = DownloadProgress::new(path);
                 let callback = {
@@ -102,7 +126,7 @@ impl Client for ServerClient {
                         presentation.advance(increment, total)
                     }) as DownloadProgressFn
                 };
-                let result = self.inner.download(url, path, Some(callback)).await;
+                let result = self.download_eventual(url, path, callback).await;
                 presentation.finish(result.is_ok());
                 result
             }
@@ -115,6 +139,26 @@ impl Client for ServerClient {
 
     async fn upload(&self, path: &Path) -> Result<String> {
         self.inner.upload(path).await
+    }
+}
+
+impl ServerClient {
+
+    /// Publish as soon as the bytes are in page cache; see the type-level
+    /// durability note.
+    async fn download_eventual(
+        &self,
+        url: &str,
+        path: &Path,
+        progress: DownloadProgressFn,
+    ) -> Result<()> {
+        muna::download(
+            &self.http,
+            url,
+            path,
+            Some(progress),
+            DownloadDurability::Eventual
+        ).await
     }
 }
 
@@ -257,6 +301,7 @@ mod tests {
     fn test_client() -> ServerClient {
         ServerClient {
             inner: MunaClient::new(None, None),
+            http: cdn_client(),
         }
     }
 
@@ -291,5 +336,32 @@ mod tests {
         b.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), baseline);
         assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; 1024]);
+    }
+
+    #[tokio::test]
+    async fn eventual_download_publishes_complete_file_without_leftovers() {
+        // The server's eventual-durability path must still deliver a complete
+        // payload at the destination and leave no temp file behind.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = start_resource_server(hits).await;
+        let client = test_client();
+        let dir = std::env::temp_dir().join(format!(
+            "muna-server-eventual-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("resource.bin");
+        Client::download(&client, &url, &path, None).await.unwrap();
+        let payload = std::fs::read(&path).unwrap();
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(payload, vec![7u8; 1024]);
+        assert_eq!(names, vec![std::ffi::OsString::from("resource.bin")]);
     }
 }

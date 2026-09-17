@@ -16,6 +16,7 @@ use crate::notifications::NotificationCenter;
 use crate::platform::{self, Platform};
 use crate::serving::cache::CacheTracker;
 use crate::serving::dispatch::Dispatcher;
+use crate::serving::download_gate::DownloadGate;
 use crate::serving::lease::LeaseSupervisor;
 use crate::serving::registry::ModelRegistry;
 
@@ -86,14 +87,23 @@ impl AppState {
         let cache_path = MunaClient::new(None, None).cache_path().to_path_buf();
         let notifications = Arc::new(NotificationCenter::default());
         let platform = platform::detect();
+        // Orders process-tier downloads ahead of disk-tier prefetch; the
+        // registry holds the priority side, the cache tracker the waiting
+        // side. See `serving/download_gate.rs`.
+        let download_gate = Arc::new(DownloadGate::new());
         Self {
             registry: ModelRegistry::new(
                 keys.clone(),
                 pinned,
                 notifications.clone(),
-                platform.clone()
+                platform.clone(),
+                download_gate.clone()
             ),
-            cache: CacheTracker::new(keys.clone(), notifications.clone()),
+            cache: CacheTracker::new(
+                keys.clone(),
+                notifications.clone(),
+                download_gate
+            ),
             dispatcher: Dispatcher::new(),
             lease: LeaseSupervisor::new(),
             keys,

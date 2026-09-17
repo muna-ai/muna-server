@@ -11,6 +11,7 @@
 pub(crate) mod batch;
 pub(crate) mod cache;
 pub(crate) mod dispatch;
+pub(crate) mod download_gate;
 pub(crate) mod lease;
 pub(crate) mod predict;
 pub(crate) mod registry;
