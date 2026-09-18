@@ -1,3 +1,6 @@
+## 0.0.20
+*INCOMPLETE*
+
 ## 0.0.19
 + Added support for `thinking` and `output_config.effort` in `/v1/messages` (Anthropic client).
 + Added support for `temperature`, `top_p`, `seed`, and `reasoning_effort` in `/v1/chat/completions` (OpenAI client).
