@@ -11,71 +11,46 @@ use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::{stream, StreamExt};
-use muna::beta::openai::{
-    ChatCompletionChunk, ChatCompletionCreateParams, ChatCompletionFunctionTool,
-    ChatCompletionMessage, ChatCompletionToolChoice
-};
+use muna::beta::openai::{ChatCompletionChunk, ChatCompletionCreateParams};
 use muna::types::Acceleration;
-use serde::Deserialize;
 
+use crate::handlers::body::ChatBody;
 use crate::handlers::error::{muna_error_value, AppError, Json};
 use crate::serving::predict;
 use crate::serving::stats::{PredictionSample, SampleDetail, StreamKind, StreamMeter};
 use crate::state::AppState;
 
-#[derive(Deserialize)]
-pub(crate) struct ChatCompletionsRequest {
-    /// Chat predictor tag.
-    model: String,
-    /// Messages comprising the conversation so far.
-    #[serde(default)]
-    messages: Vec<ChatCompletionMessage>,
-    /// Whether to stream the response as server-sent events.
-    #[serde(default)]
-    stream: bool,
-    /// Maximum completion tokens. Accepts OpenAI's deprecated
-    /// `max_tokens` spelling as an alias.
-    #[serde(default, alias = "max_tokens")]
-    max_completion_tokens: Option<i32>,
-    /// Tools the model may call.
-    #[serde(default)]
-    tools: Option<Vec<ChatCompletionFunctionTool>>,
-    /// Tool choice mode. Unknown modes (`required`, named functions)
-    /// fail deserialization and render as 400s.
-    #[serde(default)]
-    tool_choice: Option<ChatCompletionToolChoice>,
-}
-
 /// Chat completions via the muna-rs OpenAI client, wrapped with the model
 /// registry (429-on-loading), the sequential dispatch guard, and the
 /// blocking prediction executor.
+///
+/// The body deserializes straight into muna-rs's request params (see
+/// `ChatBody`); unknown `tool_choice` modes (`required`, named functions)
+/// fail deserialization there and render as 400s.
 pub(crate) async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ChatCompletionsRequest>,
+    Json(body): Json<ChatBody<ChatCompletionCreateParams>>,
 ) -> Result<Response, AppError> {
     if state.is_draining() {
         return Err(AppError::unavailable("node is draining".into(), 30));
     }
-    let model = state.registry.ensure_ready(&req.model).await?;
-    state.check_in_if_due(&req.model).await;
-    state.mark_model_loaded(req.model.clone()).await;
+    let ChatBody { stream: streaming, mut params } = body;
+    params.acceleration = Some(Acceleration::LocalGpu);
+    let model = state.registry.ensure_ready(&params.model).await?;
+    state.check_in_if_due(&params.model).await;
+    state.mark_model_loaded(params.model.clone()).await;
     // Time spent acquiring the sequential guard is this surface's
     // admission wait (zero for continuous models).
     let admitted = Instant::now();
-    let guard = state.dispatcher.acquire(&req.model, &model).await;
+    let guard = state.dispatcher.acquire(&params.model, &model).await;
     let queue_wait = admitted.elapsed();
-    let params = ChatCompletionCreateParams {
-        model: req.model,
-        messages: req.messages,
-        acceleration: Some(Acceleration::LocalGpu),
-        max_completion_tokens: req.max_completion_tokens,
-        tools: req.tools,
-        tool_choice: req.tool_choice,
-        ..Default::default()
-    };
     let muna = model.muna.clone();
-    if req.stream {
-        let meter = StreamMeter::new(model.stats.clone(), StreamKind::Llm, queue_wait);
+    if streaming {
+        let meter = StreamMeter::new(
+            model.stats.clone(),
+            StreamKind::Llm,
+            queue_wait
+        );
         // The guard rides with the pump onto the blocking thread and is
         // released once the native stream is dropped; the meter travels
         // with the stream state and records its telemetry sample when the

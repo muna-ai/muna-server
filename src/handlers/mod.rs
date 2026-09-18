@@ -10,8 +10,10 @@
 //! - [`openai`]: OpenAI-compatible API.
 //! - [`anthropic`]: Anthropic-compatible API.
 //! - [`error`]: OpenAI- and Anthropic-style error envelopes shared by the API handlers.
+//! - [`body`]: chat request body wrapper shared by the OpenAI and Anthropic handlers.
 
 mod anthropic;
+mod body;
 mod error;
 mod openai;
 mod ops;

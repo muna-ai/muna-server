@@ -12,13 +12,10 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::stream;
-use muna::beta::anthropic::{
-    MessageContent, MessageCreateParams, MessageParam,
-    RawMessageStreamEvent, Tool
-};
+use muna::beta::anthropic::{MessageCreateParams, RawMessageStreamEvent};
 use muna::types::Acceleration;
-use serde::Deserialize;
 
+use crate::handlers::body::ChatBody;
 use crate::handlers::error::{
     anthropic_error_value, AnthropicError,
     AnthropicJson, AppError
@@ -30,74 +27,37 @@ use crate::serving::stats::{
 };
 use crate::state::AppState;
 
-#[derive(Deserialize)]
-pub(crate) struct MessagesRequest {
-    /// Chat predictor tag.
-    model: String,
-    /// The maximum number of tokens to generate before stopping.
-    /// Required by the Anthropic API, unlike the OpenAI surface.
-    max_tokens: i32,
-    /// Input messages comprising the conversation so far.
-    #[serde(default)]
-    messages: Vec<MessageParam>,
-    /// System prompt, folded into the message list by the adapter.
-    #[serde(default)]
-    system: Option<MessageContent>,
-    /// Whether to stream the response as named server-sent events.
-    #[serde(default)]
-    stream: bool,
-    /// Custom text sequences that will cause the model to stop generating.
-    /// Ignored unless the predictor declares support for it.
-    #[serde(default)]
-    stop_sequences: Option<Vec<String>>,
-    /// Amount of randomness injected into the response.
-    #[serde(default)]
-    temperature: Option<f32>,
-    /// Only sample from the top K options for each subsequent token.
-    /// Ignored unless the predictor declares support for it.
-    #[serde(default)]
-    top_k: Option<i32>,
-    /// Nucleus sampling coefficient.
-    #[serde(default)]
-    top_p: Option<f32>,
-    /// Tools the model may call.
-    #[serde(default)]
-    tools: Option<Vec<Tool>>,
-}
-
 /// Messages via the muna-rs Anthropic client, wrapped with the model
 /// registry (429-on-loading), the sequential dispatch guard, and the
 /// blocking prediction executor.
+///
+/// The body deserializes straight into muna-rs's request params (see
+/// `ChatBody`); `max_tokens` is required there, as on the Anthropic API,
+/// so a body without it renders as a 400.
 pub(crate) async fn messages(
     State(state): State<Arc<AppState>>,
-    AnthropicJson(req): AnthropicJson<MessagesRequest>,
+    AnthropicJson(body): AnthropicJson<ChatBody<MessageCreateParams>>,
 ) -> Result<Response, AnthropicError> {
     if state.is_draining() {
         return Err(AppError::unavailable("node is draining".into(), 30).into());
     }
-    let model = state.registry.ensure_ready(&req.model).await?;
-    state.check_in_if_due(&req.model).await;
-    state.mark_model_loaded(req.model.clone()).await;
+    let ChatBody { stream: streaming, mut params } = body;
+    params.acceleration = Some(Acceleration::LocalGpu);
+    let model = state.registry.ensure_ready(&params.model).await?;
+    state.check_in_if_due(&params.model).await;
+    state.mark_model_loaded(params.model.clone()).await;
     // Time spent acquiring the sequential guard is this surface's
     // admission wait (zero for continuous models).
     let admitted = Instant::now();
-    let guard = state.dispatcher.acquire(&req.model, &model).await;
+    let guard = state.dispatcher.acquire(&params.model, &model).await;
     let queue_wait = admitted.elapsed();
-    let params = MessageCreateParams {
-        model: req.model,
-        max_tokens: req.max_tokens,
-        messages: req.messages,
-        system: req.system,
-        stop_sequences: req.stop_sequences,
-        temperature: req.temperature,
-        top_k: req.top_k,
-        top_p: req.top_p,
-        tools: req.tools,
-        acceleration: Some(Acceleration::LocalGpu),
-    };
     let muna = model.muna.clone();
-    if req.stream {
-        let meter = StreamMeter::new(model.stats.clone(), StreamKind::Llm, queue_wait);
+    if streaming {
+        let meter = StreamMeter::new(
+            model.stats.clone(),
+            StreamKind::Llm,
+            queue_wait
+        );
         // The guard rides with the pump onto the blocking thread and is
         // released once the native stream is dropped.
         let mut rx = predict::stream(guard, move || async move {

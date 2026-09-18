@@ -1,5 +1,7 @@
 ## 0.0.19
-*INCOMPLETE*
++ Added support for `thinking` and `output_config.effort` in `/v1/messages` (Anthropic client).
++ Added support for `temperature`, `top_p`, `seed`, and `reasoning_effort` in `/v1/chat/completions` (OpenAI client).
++ Upgraded `muna` to 0.0.26.
 
 ## 0.0.18
 + Upgraded `muna` to 0.0.25.
