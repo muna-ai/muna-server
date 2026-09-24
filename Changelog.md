@@ -1,3 +1,6 @@
+## 0.0.21
+*INCOMPLETE*
+
 ## 0.0.20
 + Added `max_input_tokens`, `max_tokens`, and `capabilities` to `/v1/models` rows, derived from the predictor signature, satisfying the Anthropic API shape.
 + Added `GET /v1/models/{tag}` for retrieving a single model.
