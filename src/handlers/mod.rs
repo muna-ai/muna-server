@@ -40,6 +40,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/v1/predictions/remote", post(predictions::predictions))
         // OpenAI compatibility
         .route("/v1/models", get(openai::models))
+        .route("/v1/models/{*id}", get(openai::model))
         .route("/v1/chat/completions", post(openai::chat_completions))
         .route("/v1/embeddings", post(openai::embeddings))
         .route("/v1/images/generations", post(openai::image_generations))

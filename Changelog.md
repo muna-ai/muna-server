@@ -1,5 +1,7 @@
 ## 0.0.20
-*INCOMPLETE*
++ Added `max_input_tokens`, `max_tokens`, and `capabilities` to `/v1/models` rows, derived from the predictor signature, satisfying the Anthropic API shape.
++ Added `GET /v1/models/{tag}` for retrieving a single model.
++ Upgraded `muna` to 0.0.27.
 
 ## 0.0.19
 + Added support for `thinking` and `output_config.effort` in `/v1/messages` (Anthropic client).

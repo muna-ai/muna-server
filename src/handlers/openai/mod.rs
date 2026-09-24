@@ -15,4 +15,4 @@ mod models;
 pub(super) use completions::chat_completions;
 pub(super) use embeddings::embeddings;
 pub(super) use images::image_generations;
-pub(super) use models::models;
+pub(super) use models::{model, models};

@@ -53,8 +53,8 @@ pub(crate) struct ReadyModel {
     /// When the load completed (reported as the model's `created` age by
     /// the OpenAI-compatible `/v1/models` handler).
     pub loaded_at: Instant,
-    /// Kept for future handler validation (the plan is derived from it now).
-    #[allow(dead_code)]
+    /// The predictor signature: the batch plan derives from it, and the
+    /// `/v1/models` rows advertise its limits and capabilities.
     pub signature: Signature,
     /// How the dispatcher batches predictions for this model, derived from
     /// the signature's batch config.

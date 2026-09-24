@@ -136,6 +136,7 @@ mod tests {
             min: None,
             max: None,
             sample_rate: None,
+            context_length: None,
             batch,
         }
     }

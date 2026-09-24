@@ -315,11 +315,30 @@ async fn chat_completion_streaming_and_unload() {
         json!(3)
     );
 
-    // Ready model shows up in /v1/models and /status.
+    // Ready model shows up in /v1/models and /status. The row serves both
+    // the OpenAI `Model` and Anthropic `ModelInfo` shapes at once.
     let models: Value = client
         .get(format!("{}/v1/models", server.url()))
         .send().await.unwrap().json().await.unwrap();
-    assert!(models["data"].as_array().unwrap().iter().any(|m| m["id"] == json!(TAG_CHAT)));
+    assert_eq!(models["object"], json!("list"));
+    assert_eq!(models["has_more"], json!(false));
+    let row = models["data"].as_array().unwrap().iter()
+        .find(|m| m["id"] == json!(TAG_CHAT))
+        .expect("ready model listed");
+    assert_eq!(row["object"], json!("model"));
+    assert_eq!(row["type"], json!("model"));
+    assert!(row["created"].as_u64().is_some_and(|created| created > 0));
+    assert!(row["created_at"].as_str().is_some_and(|at| at.ends_with('Z')));
+    assert!(row["capabilities"]["thinking"]["supported"].is_boolean());
+    // Retrieve by tag: the slash in the tag rides the wildcard segment.
+    let one: Value = client
+        .get(format!("{}/v1/models/{TAG_CHAT}", server.url()))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(one["id"], json!(TAG_CHAT));
+    let missing = client
+        .get(format!("{}/v1/models/@nobody/nothing", server.url()))
+        .send().await.unwrap();
+    assert_eq!(missing.status(), 404);
 
     // Streaming: multiple SSE frames, then [DONE]; chunks reassemble the text.
     let mut streaming_request = request.clone();
