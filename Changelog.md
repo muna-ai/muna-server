@@ -1,3 +1,6 @@
+## 0.0.22
+*INCOMPLETE*
+
 ## 0.0.21
 + Fixed `/v1/messages` (Anthropic client) returning `400` when a request replays `thinking` blocks from a prior response.
 + Updated `/v1/messages` to return a descriptive `400` for unsupported `image`, `document`, and unrecognized content blocks.
