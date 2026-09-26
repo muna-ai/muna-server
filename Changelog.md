@@ -1,5 +1,7 @@
 ## 0.0.21
-*INCOMPLETE*
++ Fixed `/v1/messages` (Anthropic client) returning `400` when a request replays `thinking` blocks from a prior response.
++ Updated `/v1/messages` to return a descriptive `400` for unsupported `image`, `document`, and unrecognized content blocks.
++ Upgraded `muna` to 0.0.28.
 
 ## 0.0.20
 + Added `max_input_tokens`, `max_tokens`, and `capabilities` to `/v1/models` rows, derived from the predictor signature, satisfying the Anthropic API shape.
