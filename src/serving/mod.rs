@@ -15,4 +15,5 @@ pub(crate) mod download_gate;
 pub(crate) mod lease;
 pub(crate) mod predict;
 pub(crate) mod registry;
+pub(crate) mod remote_images;
 pub(crate) mod stats;

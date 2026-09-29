@@ -27,7 +27,7 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match axum::Json::<T>::from_request(req, state).await {
             Ok(axum::Json(value)) => Ok(Self(value)),
-            Err(rejection) => Err(AppError::bad_request(rejection.body_text())),
+            Err(rejection) => Err(AppError::rejected(rejection)),
         }
     }
 }
@@ -55,9 +55,7 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match axum::Json::<T>::from_request(req, state).await {
             Ok(axum::Json(value)) => Ok(Self(value)),
-            Err(rejection) => Err(
-                AnthropicError::from(AppError::bad_request(rejection.body_text()))
-            ),
+            Err(rejection) => Err(AnthropicError::from(AppError::rejected(rejection))),
         }
     }
 }
@@ -78,6 +76,28 @@ impl AppError {
                 "error": {
                     "message": message,
                     "type": "invalid_request_error",
+                }
+            }),
+            retry_after: None,
+        }
+    }
+
+    /// A rejected JSON body. Oversized bodies keep their 413 so clients can
+    /// tell "too large" from "malformed"; everything else is a 400.
+    pub(crate) fn rejected(rejection: JsonRejection) -> Self {
+        if rejection.status() != StatusCode::PAYLOAD_TOO_LARGE {
+            return Self::bad_request(rejection.body_text());
+        }
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: json!({
+                "error": {
+                    "message": format!(
+                        "The request body exceeds the {} MB limit.",
+                        super::MAX_REQUEST_BYTES / (1024 * 1024)
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "request_too_large",
                 }
             }),
             retry_after: None,
@@ -254,6 +274,7 @@ fn anthropic_error_type(status: StatusCode) -> &'static str {
     match status {
         StatusCode::BAD_REQUEST         => "invalid_request_error",
         StatusCode::NOT_FOUND           => "not_found_error",
+        StatusCode::PAYLOAD_TOO_LARGE   => "request_too_large",
         StatusCode::TOO_MANY_REQUESTS   => "rate_limit_error",
         StatusCode::SERVICE_UNAVAILABLE => "overloaded_error",
         _                               => "api_error",

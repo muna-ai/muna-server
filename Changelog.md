@@ -1,5 +1,9 @@
 ## 0.0.22
-*INCOMPLETE*
++ Added support for Anthropic `image` blocks in `/v1/messages`, with `base64` or `url` sources.
++ Updated the request body limit from 2 MB to 64 MB to accommodate base64-encoded images.
++ Updated oversized request bodies to return `413` with a `request_too_large` error in the OpenAI or Anthropic envelope, instead of `400`.
++ Updated `/v1/chat/completions` and `/v1/messages` to fetch remote images on the server and pass them to the model inline.
++ Upgraded `muna` to 0.0.29.
 
 ## 0.0.21
 + Fixed `/v1/messages` (Anthropic client) returning `400` when a request replays `thinking` blocks from a prior response.

@@ -1106,9 +1106,9 @@ dependencies = [
 
 [[package]]
 name = "muna"
-version = "0.0.28"
+version = "0.0.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c067fcbf8992aa5c7b16eba679737f7dc3ccd85f5a7bf37c82b94506818ceb0"
+checksum = "abff99a20d3a544e3ae19e5bf7949d9892fa199e6a819a58c4192d71173523e5"
 dependencies = [
  "async-stream",
  "async-trait",

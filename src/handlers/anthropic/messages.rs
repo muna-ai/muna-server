@@ -46,6 +46,8 @@ pub(crate) async fn messages(
     let model = state.registry.ensure_ready(&params.model).await?;
     state.check_in_if_due(&params.model).await;
     state.mark_model_loaded(params.model.clone()).await;
+    // Before admission, so a slow image host never holds the dispatch guard.
+    state.image_fetcher.inline_anthropic(&mut params).await?;
     // Time spent acquiring the sequential guard is this surface's
     // admission wait (zero for continuous models).
     let admitted = Instant::now();

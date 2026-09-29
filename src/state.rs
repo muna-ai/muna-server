@@ -19,6 +19,7 @@ use crate::serving::dispatch::Dispatcher;
 use crate::serving::download_gate::DownloadGate;
 use crate::serving::lease::LeaseSupervisor;
 use crate::serving::registry::ModelRegistry;
+use crate::serving::remote_images::ImageFetcher;
 
 /// Per-tag deployment keys delivered by control-plane residency directives
 /// (`HeartbeatResponse::keys`). Read by the registry loader and the cache
@@ -64,6 +65,8 @@ pub(crate) struct AppState {
     pub cache_path: PathBuf,
     /// Control-plane wiring; `None` in standalone mode.
     pub node: Option<NodeContext>,
+    /// Fetches remote chat images for inlining (public addresses only).
+    pub image_fetcher: ImageFetcher,
     /// Process start, for uptime reporting.
     pub start_time: Instant,
     /// Set by `/drain` or a heartbeat response; new inference requests are
@@ -111,6 +114,7 @@ impl AppState {
             platform,
             cache_path,
             node,
+            image_fetcher: ImageFetcher::new(),
             start_time: Instant::now(),
             draining: AtomicBool::new(false),
             runtime_checkins: tokio::sync::RwLock::new(BTreeMap::new()),
