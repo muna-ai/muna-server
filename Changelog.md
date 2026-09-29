@@ -1,3 +1,6 @@
+## 0.0.23
+*INCOMPLETE*
+
 ## 0.0.22
 + Added support for Anthropic `image` blocks in `/v1/messages`, with `base64` or `url` sources.
 + Updated the request body limit from 2 MB to 64 MB to accommodate base64-encoded images.
