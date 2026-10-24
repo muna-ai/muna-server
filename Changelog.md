@@ -1,3 +1,6 @@
+## 0,0,24
+*INCOMPLETE*
+
 ## 0.0.23
 + Added `compute_architecture` to heartbeat node status, so the control plane can discover which models have implementations for the node's GPUs.
 + Added `devices` to heartbeat goal descriptors: the node loads the model's engine on the given GPUs, and reloads it when the assignment changes.
