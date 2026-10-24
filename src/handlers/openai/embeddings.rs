@@ -68,7 +68,8 @@ pub(crate) async fn embeddings(
             &tag,
             dimensions,
             encoding_format,
-            Some(Acceleration::LocalGpu)
+            Some(Acceleration::LocalGpu),
+            None
         ).await
     }).await?;
     model.stats.telemetry.record(PredictionSample {

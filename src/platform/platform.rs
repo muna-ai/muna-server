@@ -74,6 +74,12 @@ pub(crate) trait Platform: Send + Sync {
     /// delta the registry records. `None` if the platform cannot say.
     fn memory_used_mb(&self) -> Option<u64>;
 
+    /// Device memory in use across the given device indices. Unified-memory
+    /// platforms have one pool, so the default is the all-device figure.
+    fn memory_used_mb_on(&self, _devices: &[u32]) -> Option<u64> {
+        self.memory_used_mb()
+    }
+
     /// Free and total space in MB of the filesystem containing `path`.
     /// Feeds capacity reporting: resources are never deleted, so the
     /// control plane must see remaining disk to know when to stop placing

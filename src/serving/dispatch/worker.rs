@@ -295,6 +295,7 @@ mod tests {
                     created: "0".into(),
                     configuration: None,
                     resources: None,
+                    requirements: None,
                     results,
                     latency: None,
                     error: None,

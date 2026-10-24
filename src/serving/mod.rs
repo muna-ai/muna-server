@@ -13,6 +13,7 @@ pub(crate) mod cache;
 pub(crate) mod dispatch;
 pub(crate) mod download_gate;
 pub(crate) mod lease;
+pub(crate) mod lease_weights;
 pub(crate) mod predict;
 pub(crate) mod registry;
 pub(crate) mod remote_images;

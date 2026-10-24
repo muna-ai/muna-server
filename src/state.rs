@@ -11,7 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use muna::MunaClient;
+use tokio_util::sync::CancellationToken;
 
+use crate::control::protocol::LeasePolicy;
 use crate::notifications::NotificationCenter;
 use crate::platform::{self, Platform};
 use crate::serving::cache::CacheTracker;
@@ -26,6 +28,16 @@ use crate::serving::remote_images::ImageFetcher;
 /// downloader when constructing per-model Muna clients; tags without an
 /// entry fall back to the process-wide `$MUNA_ACCESS_KEY`.
 pub(crate) type KeyStore = Arc<DashMap<String, String>>;
+
+/// Per-tag GPU ordinals (rank order) delivered by control-plane residency
+/// directives. Read by the registry when a load starts; tags without an
+/// entry load on the engine's default devices.
+pub(crate) type DeviceStore = Arc<DashMap<String, Vec<u32>>>;
+
+/// Per-tag lease policy delivered by control-plane residency directives.
+/// Read every second by the lease-weight solver; tags without an entry use
+/// the standalone defaults.
+pub(crate) type PolicyStore = Arc<DashMap<String, LeasePolicy>>;
 
 /// Control-plane wiring, present only when the server runs as a fleet node.
 pub(crate) struct NodeContext {
@@ -54,11 +66,19 @@ pub(crate) struct AppState {
     pub lease: LeaseSupervisor,
     /// Per-tag deployment keys from residency directives; see [`KeyStore`].
     pub keys: KeyStore,
+    /// Per-tag device assignments; see [`DeviceStore`].
+    pub devices: DeviceStore,
+    /// Per-tag lease policy; see [`PolicyStore`].
+    pub policies: PolicyStore,
     /// In-process wakeups (state transitions -> heartbeat, ...).
     pub notifications: Arc<NotificationCenter>,
     /// The platform detected at boot (NVIDIA, Apple, or CPU), owning its
     /// vendor handles: device and host metrics, and the driver warm.
     pub platform: Arc<dyn Platform>,
+    /// GPU compute architecture from Function (`sm_100`, `gfx950`), probed
+    /// once at boot; `None` without a supported GPU. The control plane
+    /// discovers which predictor implementations run on this node by it.
+    pub compute_architecture: Option<String>,
     /// Resource-cache directory (env-derived), for disk metrics. There is
     /// no process-wide Muna client: each loaded model owns its own (see
     /// `ReadyModel::muna`).
@@ -69,6 +89,9 @@ pub(crate) struct AppState {
     pub image_fetcher: ImageFetcher,
     /// Process start, for uptime reporting.
     pub start_time: Instant,
+    /// Cancelled on the first SIGINT or SIGTERM. Background loops exit on
+    /// it; the heartbeat sends one final report first.
+    pub shutdown: CancellationToken,
     /// Set by `/drain` or a heartbeat response; new inference requests are
     /// rejected while draining.
     draining: AtomicBool,
@@ -85,11 +108,19 @@ impl AppState {
         node: Option<NodeContext>
     ) -> Self {
         let keys: KeyStore = Arc::new(DashMap::new());
+        let devices: DeviceStore = Arc::new(DashMap::new());
         // Throwaway client purely for the env-derived cache location; it
         // holds no credential and makes no requests.
         let cache_path = MunaClient::new(None, None).cache_path().to_path_buf();
         let notifications = Arc::new(NotificationCenter::default());
         let platform = platform::detect();
+        let compute_architecture = match muna::c::Configuration::get_compute_architecture() {
+            Ok(architecture) => architecture,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to get compute architecture");
+                None
+            }
+        };
         // Orders process-tier downloads ahead of disk-tier prefetch; the
         // registry holds the priority side, the cache tracker the waiting
         // side. See `serving/download_gate.rs`.
@@ -97,6 +128,7 @@ impl AppState {
         Self {
             registry: ModelRegistry::new(
                 keys.clone(),
+                devices.clone(),
                 pinned,
                 notifications.clone(),
                 platform.clone(),
@@ -110,12 +142,16 @@ impl AppState {
             dispatcher: Dispatcher::new(),
             lease: LeaseSupervisor::new(),
             keys,
+            devices,
+            policies: Arc::new(DashMap::new()),
             notifications,
             platform,
+            compute_architecture,
             cache_path,
             node,
             image_fetcher: ImageFetcher::new(),
             start_time: Instant::now(),
+            shutdown: CancellationToken::new(),
             draining: AtomicBool::new(false),
             runtime_checkins: tokio::sync::RwLock::new(BTreeMap::new()),
         }
@@ -150,7 +186,7 @@ impl AppState {
         let result = ready
             .muna
             .predictions
-            .create(model, None, None, None, None)
+            .create(model, None, None, None, None, None, None)
             .await;
         let delay = if result.is_ok() {
             Self::CHECKIN_INTERVAL_SECONDS

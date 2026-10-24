@@ -49,6 +49,10 @@ pub(crate) struct NodeStatus {
     /// Total space in MB on the data volume.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_total_mb: Option<u64>,
+    /// GPU compute architecture (`sm_100`, `gfx950`), as Function reports
+    /// it to the prediction API; absent without a supported GPU.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute_architecture: Option<String>,
     /// Per-device GPU metrics (system RAM fallback on CPU-only nodes).
     pub gpus: Vec<DeviceMetrics>,
     /// Warmth tier and counters for every known model, including models
@@ -168,6 +172,15 @@ pub(crate) struct ModelStatus {
     /// p95 token-normalized output interval (ms) -- LLM surfaces only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_interval_ms_p95: Option<f64>,
+    /// GPU ordinals the engine was loaded on, in rank order, as passed to
+    /// the predictor configuration. Absent when the engine picked its own
+    /// devices. Present for `loading` and `ready`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_ids: Option<Vec<u32>>,
+    /// Content hash of the loaded build's predictor `dso` resource (its
+    /// URL path stem), when `state` is `ready`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
 }
 
 /// Desired residency for one model.
@@ -202,6 +215,26 @@ pub(crate) struct ModelDescriptor {
     /// `MUNA_ACCESS_KEY` (standalone `muna deploy` behavior).
     #[serde(default)]
     pub key: Option<String>,
+    /// GPU ordinals to load the engine on, in rank order. Absent means
+    /// the engine default. A `process` goal whose devices differ from the
+    /// loaded engine's triggers an unload and a reload.
+    #[serde(default)]
+    pub devices: Option<Vec<u32>>,
+    /// Inputs to the node's local lease-weight solver. Absent falls back
+    /// to the standalone defaults (see `serving/lease_weights.rs`).
+    #[serde(default)]
+    pub policy: Option<LeasePolicy>,
+}
+
+/// Slow-moving, per-model lease policy computed by the control plane from
+/// history. The node turns it into device-lease weights every second from
+/// live lease counters.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LeasePolicy {
+    /// Historical revenue per lease-held GPU-second (USD).
+    pub value_per_gpu_s: f64,
+    /// Floor on the model's share of each contended device, in [0, 1).
+    pub min_share: f64,
 }
 
 /// Control plane's reply to a heartbeat POST -- the declarative goal.
@@ -264,6 +297,7 @@ impl NodeStatus {
             draining: state.is_draining(),
             disk_free_mb: disk.map(|(free, _)| free),
             disk_total_mb: disk.map(|(_, total)| total),
+            compute_architecture: state.compute_architecture.clone(),
             gpus: state.platform.devices(),
             models: collect_model_status(
                 &state.registry,
@@ -275,14 +309,16 @@ impl NodeStatus {
 }
 
 /// Fold per-registrant lease counters into a per-label view. A TP engine
-/// registers once per rank device; counters sum across devices and the
-/// weight (uniform across a label's registrants) comes from any of them.
+/// registers once per rank device; counters sum across devices. Weights
+/// are solved per device, so the reported weight is the smallest: the
+/// rank that bounds the engine's lockstep progress.
 fn collect_lease_stats(state: &AppState) -> HashMap<String, RegistrantStats> {
     let mut by_label: HashMap<String, RegistrantStats> = HashMap::new();
     for stats in state.lease.stats() {
         by_label
             .entry(stats.label.clone())
             .and_modify(|entry| {
+                entry.weight = entry.weight.min(stats.weight);
                 entry.ns_held += stats.ns_held;
                 entry.ns_waited += stats.ns_waited;
                 entry.yields += stats.yields;
@@ -305,7 +341,10 @@ fn collect_model_status(
         .snapshot()
         .into_iter()
         .map(|(tag, state)| match state {
-            ModelState::Loading { .. } => empty_status(tag, ModelLifecycle::Loading, None),
+            ModelState::Loading { devices, .. } => ModelStatus {
+                device_ids: devices,
+                ..empty_status(tag, ModelLifecycle::Loading, None)
+            },
             ModelState::Ready(model) => {
                 let lease = lease.get(&tag);
                 let telemetry = model.stats.telemetry.summarize().unwrap_or_default();
@@ -330,6 +369,8 @@ fn collect_model_status(
                     first_output_ms_p95: telemetry.first_output_ms_p95,
                     output_interval_ms_p50: telemetry.output_interval_ms_p50,
                     output_interval_ms_p95: telemetry.output_interval_ms_p95,
+                    device_ids: model.devices.clone(),
+                    build: model.build.clone(),
                 }
             },
             ModelState::Failed { error, .. } => {
@@ -379,5 +420,67 @@ fn empty_status(
         first_output_ms_p95: None,
         output_interval_ms_p50: None,
         output_interval_ms_p95: None,
+        device_ids: None,
+        build: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// The node's half of `control-plane/tests/protocol.rs`: the same
+    /// descriptor JSON the plane's golden test emits must parse here.
+    #[test]
+    fn descriptor_devices_and_policy_parse() {
+        let response: HeartbeatResponse = serde_json::from_value(json!({
+            "models": [
+                {
+                    "tag": "@muna/qwen-embedding-8b",
+                    "residency": "process",
+                    "key": "muna_sk_qwen",
+                    "devices": [2, 3],
+                    "policy": { "value_per_gpu_s": 0.0042, "min_share": 0.05 }
+                },
+                { "tag": "@muna/nomic-embed-text", "residency": "disk" }
+            ],
+            "drain": false
+        })).unwrap();
+        let process = &response.models[0];
+        assert_eq!(process.devices, Some(vec![2, 3]));
+        assert_eq!(
+            process.policy,
+            Some(LeasePolicy { value_per_gpu_s: 0.0042, min_share: 0.05 })
+        );
+        assert_eq!(response.models[1].devices, None);
+        assert_eq!(response.models[1].policy, None);
+    }
+
+    /// `device_ids` and `build` serialize as the plane's golden sample
+    /// expects, and are elided when absent.
+    #[test]
+    fn status_device_ids_and_build_serialize() {
+        let loading = ModelStatus {
+            device_ids: Some(vec![6]),
+            ..empty_status("@muna/gemma-4-26b".to_string(), ModelLifecycle::Loading, None)
+        };
+        assert_eq!(serde_json::to_value(&loading).unwrap(), json!({
+            "tag": "@muna/gemma-4-26b",
+            "state": "loading",
+            "queue_depth": 0,
+            "total_predictions": 0,
+            "avg_latency_ms": 0.0,
+            "load_time_ms": 0.0,
+            "device_ids": [6]
+        }));
+        let ready = ModelStatus {
+            build: Some("9f2c41aa".to_string()),
+            ..empty_status("@muna/x".to_string(), ModelLifecycle::Ready, None)
+        };
+        let value = serde_json::to_value(&ready).unwrap();
+        assert_eq!(value["build"], json!("9f2c41aa"));
+        assert!(value.get("device_ids").is_none());
     }
 }

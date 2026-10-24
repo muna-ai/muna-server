@@ -3,11 +3,14 @@
 *   Copyright © 2026 NatML Inc. All Rights Reserved.
 */
 
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio_util::task::TaskTracker;
 
 mod client;
 mod control;
@@ -18,6 +21,12 @@ mod serving;
 mod state;
 
 use state::{AppState, NodeContext};
+
+/// How long in-flight requests get to finish after the first signal.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long background loops get to exit after the server stops; bounds
+/// the heartbeat's final report.
+const LOOP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(
@@ -119,30 +128,65 @@ async fn serve(cli: &Cli) -> Result<(), String> {
         tracing::info!(tag = %tag, "eager-loading pinned model");
         state.registry.warm(tag);
     }
+    // Background loops exit when `state.shutdown` is cancelled; the tracker
+    // lets shutdown wait for them (the heartbeat's final report included).
+    let loops = TaskTracker::new();
     if state.node.is_some() {
-        tokio::spawn(control::heartbeat::run(state.clone()));
-        tokio::spawn(control::kv_relay::run(state.clone()));
+        loops.spawn(control::heartbeat::run(state.clone()));
+        loops.spawn(control::kv_relay::run(state.clone()));
         tracing::info!("control-plane mode: heartbeat + KV relay enabled");
     }
     // Co-resident NanoSGL engines arbitrate GPU time through the device lease
-    tokio::spawn(serving::lease::run(state.clone()));
-    let app = handlers::router().with_state(state);
+    loops.spawn(serving::lease_weights::run(state.clone()));
+    loops.close();
+    tokio::spawn(watch_signals(state.clone()));
+    let app = handlers::router().with_state(state.clone());
     // Bind listener
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("failed to bind {addr}: {e}"))?;
     tracing::info!("muna-server listening on {addr}");
-    // Serve
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| format!("server error: {e}"))
+    // Serve until shutdown, then give in-flight requests (long streams
+    // included) a bounded window to finish.
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(state.shutdown.clone().cancelled_owned())
+        .into_future();
+    let drain_deadline = async {
+        state.shutdown.cancelled().await;
+        tokio::time::sleep(DRAIN_TIMEOUT).await;
+    };
+    tokio::select! {
+        result = server => result.map_err(|e| format!("server error: {e}"))?,
+        _ = drain_deadline => tracing::warn!(
+            timeout_s = DRAIN_TIMEOUT.as_secs(),
+            "in-flight requests did not finish in time; closing them"
+        ),
+    }
+    if tokio::time::timeout(LOOP_SHUTDOWN_TIMEOUT, loops.wait()).await.is_err() {
+        tracing::warn!("background loops did not exit in time");
+    }
+    Ok(())
 }
 
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for ctrl+c");
+/// First SIGINT or SIGTERM: drain and cancel `state.shutdown`. Second:
+/// exit immediately, for when a native call or stream holds up shutdown.
+async fn watch_signals(state: Arc<AppState>) {
+    let mut terminate = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    let mut interrupt = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+    tokio::select! {
+        _ = terminate.recv() => {}
+        _ = interrupt.recv() => {}
+    }
     tracing::info!("shutting down");
+    // Reject new inference requests on connections still open, and report
+    // `draining: true` in the final heartbeat.
+    state.set_draining(true);
+    state.shutdown.cancel();
+    tokio::select! {
+        _ = terminate.recv() => {}
+        _ = interrupt.recv() => {}
+    }
+    tracing::warn!("second signal; exiting immediately");
+    std::process::exit(130);
 }

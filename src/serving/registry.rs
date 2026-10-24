@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use muna::types::{Acceleration, Signature, Value};
+use muna::types::{Acceleration, Device, Prediction, Signature, Value};
 use muna::Muna;
 
 use crate::client::ServerClient;
@@ -27,7 +27,7 @@ use crate::serving::batch::BatchPlan;
 use crate::serving::download_gate::{DownloadGate, PriorityGuard};
 use crate::serving::predict;
 use crate::serving::stats::ModelStats;
-use crate::state::KeyStore;
+use crate::state::{DeviceStore, KeyStore};
 
 /// How long a request waits on a `Loading` model before giving up with 429.
 const HOLD_THRESHOLD: Duration = Duration::from_secs(10);
@@ -62,6 +62,11 @@ pub(crate) struct ReadyModel {
     /// Live counters (queue depth, prediction totals, latency, load time,
     /// VRAM), shared with the dispatcher and reported in heartbeats.
     pub stats: Arc<ModelStats>,
+    /// GPU ordinals the engine was loaded on, in rank order; `None` when
+    /// the engine picked its own.
+    pub devices: Option<Vec<u32>>,
+    /// Content hash of the loaded predictor build; see [`build_id`].
+    pub build: Option<String>,
 }
 
 /// Lifecycle state of one model. Absent-from-map is the implicit fourth
@@ -69,8 +74,9 @@ pub(crate) struct ReadyModel {
 /// next request retries the load.
 pub(crate) enum ModelState {
     /// Single-flight warmup in progress since the given instant (used to
-    /// derive `Retry-After` for requests that give up waiting).
-    Loading { since: Instant },
+    /// derive `Retry-After` for requests that give up waiting), on the
+    /// given devices.
+    Loading { since: Instant, devices: Option<Vec<u32>> },
     /// Engine warm, signature and batch plan known; shared with every
     /// request currently predicting against the model.
     Ready(Arc<ReadyModel>),
@@ -124,16 +130,20 @@ pub(crate) struct Loaded {
     pub download: Duration,
     /// Predictor creation with every resource on disk: the cold start.
     pub load: Duration,
+    /// Content hash of the predictor build; see [`build_id`].
+    pub build: Option<String>,
 }
 
-/// Loader delegate: performs the warmup + signature fetch for one tag.
-/// Injectable so single-flight behavior is testable without a live engine.
+/// Loader delegate: performs the warmup + signature fetch for one tag on
+/// the given devices. Injectable so single-flight behavior is testable
+/// without a live engine.
 ///
 /// Receives the download-gate guard and owns its release: the real loader
 /// drops it once resources are on disk, before the engine load, so
 /// disk-tier prefetch resumes while weights stage from page cache.
 type Loader = Arc<
-    dyn Fn(String, PriorityGuard) -> futures_util::future::BoxFuture<'static, Result<Loaded, String>>
+    dyn Fn(String, Option<Vec<u32>>, PriorityGuard)
+        -> futures_util::future::BoxFuture<'static, Result<Loaded, String>>
         + Send
         + Sync
 >;
@@ -145,6 +155,8 @@ struct RegistryInner {
     models: DashMap<String, Slot>,
     /// Warmup delegate invoked by `spawn_load` (injectable for tests).
     loader: Loader,
+    /// Control-plane device assignments, read when a load starts.
+    devices: DeviceStore,
     /// Pinned model set (`--models`): the only tags this server will load.
     /// `None` means open behavior (any tag loadable on demand).
     pinned: Option<HashSet<String>>,
@@ -162,23 +174,27 @@ impl ModelRegistry {
 
     /// Create a model registry. `keys` holds the per-tag deployment keys
     /// delivered by control-plane residency directives; tags without one
-    /// load through the process-wide `$MUNA_ACCESS_KEY`.
+    /// load through the process-wide `$MUNA_ACCESS_KEY`. `devices` holds
+    /// the per-tag device assignments; tags without one load on the
+    /// engine's default devices.
     pub(crate) fn new(
         keys: KeyStore,
+        devices: DeviceStore,
         pinned: Option<HashSet<String>>,
         notifications: Arc<NotificationCenter>,
         platform: Arc<dyn Platform>,
         download_gate: Arc<DownloadGate>
     ) -> Self {
-        let loader: Loader = Arc::new(move |tag, priority| {
+        let loader: Loader = Arc::new(move |tag, devices, priority| {
             let key = keys.get(&tag).map(|entry| entry.value().clone());
-            Box::pin(async move { load_model(&tag, key, priority).await })
+            Box::pin(async move { load_model(&tag, key, devices, priority).await })
         });
-        Self::with_loader(loader, pinned, notifications, platform, download_gate)
+        Self::with_loader(loader, devices, pinned, notifications, platform, download_gate)
     }
 
     fn with_loader(
         loader: Loader,
+        devices: DeviceStore,
         pinned: Option<HashSet<String>>,
         notifications: Arc<NotificationCenter>,
         platform: Arc<dyn Platform>,
@@ -188,6 +204,7 @@ impl ModelRegistry {
             inner: Arc::new(RegistryInner {
                 models: DashMap::new(),
                 loader,
+                devices,
                 pinned,
                 last_load_secs: AtomicU64::new(DEFAULT_LOAD_SECS),
                 notifications,
@@ -221,7 +238,7 @@ impl ModelRegistry {
                         entry.remove();
                         return Err(RegistryError::Failed(error));
                     }
-                    ModelState::Loading { since } => {
+                    ModelState::Loading { since, .. } => {
                         let since = *since;
                         if Instant::now() >= deadline {
                             return Err(RegistryError::Loading {
@@ -233,20 +250,21 @@ impl ModelRegistry {
                 },
                 dashmap::Entry::Vacant(entry) => {
                     let (watch, rx) = tokio::sync::watch::channel(());
+                    let devices = self.assigned_devices(tag);
                     entry.insert(Slot {
-                        state: ModelState::Loading { since: Instant::now() },
+                        state: ModelState::Loading { since: Instant::now(), devices: devices.clone() },
                         watch,
                         unload_requested: false
                     });
                     self.inner.notifications.status_changed();
-                    self.spawn_load(tag.to_string());
+                    self.spawn_load(tag.to_string(), devices);
                     rx
                 }
             };
             let remaining = deadline.saturating_duration_since(Instant::now());
             if tokio::time::timeout(remaining, waiter.changed()).await.is_err() {
                 let since = self.inner.models.get(tag).and_then(|slot| match &slot.state {
-                    ModelState::Loading { since } => Some(*since),
+                    ModelState::Loading { since, .. } => Some(*since),
                     _ => None,
                 });
                 match since {
@@ -291,15 +309,31 @@ impl ModelRegistry {
             }
             dashmap::Entry::Vacant(entry) => {
                 let (watch, _rx) = tokio::sync::watch::channel(());
+                let devices = self.assigned_devices(tag);
                 entry.insert(Slot {
-                    state: ModelState::Loading { since: Instant::now() },
+                    state: ModelState::Loading { since: Instant::now(), devices: devices.clone() },
                     watch,
                     unload_requested: false
                 });
                 self.inner.notifications.status_changed();
-                self.spawn_load(tag.to_string());
+                self.spawn_load(tag.to_string(), devices);
             }
         }
+    }
+
+    /// Devices the model's engine is loading or loaded on: `None` when the
+    /// tag has no engine (absent or failed), `Some(None)` when the engine
+    /// picked its own devices.
+    pub(crate) fn devices(&self, tag: &str) -> Option<Option<Vec<u32>>> {
+        self.inner.models.get(tag).and_then(|slot| match &slot.state {
+            ModelState::Loading { devices, .. } => Some(devices.clone()),
+            ModelState::Ready(model) => Some(model.devices.clone()),
+            ModelState::Failed { .. } => None,
+        })
+    }
+
+    fn assigned_devices(&self, tag: &str) -> Option<Vec<u32>> {
+        self.inner.devices.get(tag).map(|entry| entry.value().clone())
     }
 
     /// Warm a model on the reconciliation path: like [`warm`](Self::warm),
@@ -348,7 +382,10 @@ impl ModelRegistry {
         self.inner.models.iter()
             .map(|entry| {
                 let state = match &entry.state {
-                    ModelState::Loading { since } => ModelState::Loading { since: *since },
+                    ModelState::Loading { since, devices } => ModelState::Loading {
+                        since: *since,
+                        devices: devices.clone()
+                    },
                     ModelState::Ready(model) => ModelState::Ready(model.clone()),
                     ModelState::Failed { error, at } => ModelState::Failed {
                         error: error.clone(),
@@ -389,15 +426,25 @@ impl ModelRegistry {
     /// `Loading` slot, so the download-gate guard taken here exists before
     /// any disk-tier prefetch spawned later in the same reconcile pass
     /// checks the gate (see `download_gate.rs`).
-    fn spawn_load(&self, tag: String) {
+    fn spawn_load(
+        &self,
+        tag: String,
+        devices: Option<Vec<u32>>
+    ) {
         let priority = self.inner.download_gate.enter_priority();
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let start = Instant::now();
-            let vram_before = inner.platform.memory_used_mb();
+            // Measured over the assigned devices only, so a concurrent load
+            // on other GPUs does not pollute this model's delta.
+            let memory_used_mb = || match &devices {
+                Some(devices) => inner.platform.memory_used_mb_on(devices),
+                None => inner.platform.memory_used_mb(),
+            };
+            let vram_before = memory_used_mb();
             let stats = Arc::new(ModelStats::new());
-            let outcome = (inner.loader)(tag.clone(), priority).await;
-            let vram_after = inner.platform.memory_used_mb();
+            let outcome = (inner.loader)(tag.clone(), devices.clone(), priority).await;
+            let vram_after = memory_used_mb();
             if let (Some(before), Some(after)) = (vram_before, vram_after) {
                 if after > before {
                     stats.record_vram(after - before);
@@ -407,7 +454,7 @@ impl ModelRegistry {
             // the instance that actually loaded the handle.
             let mut loaded_muna: Option<Arc<Muna>> = None;
             let state = match outcome {
-                Ok(Loaded { signature, muna, download, load }) => {
+                Ok(Loaded { signature, muna, download, load, build }) => {
                     stats.record_download_time(download);
                     stats.record_load_time(load);
                     // Retry-After covers the whole wait a caller sees,
@@ -428,7 +475,9 @@ impl ModelRegistry {
                         loaded_at: Instant::now(),
                         plan: BatchPlan::from_signature(&signature),
                         signature,
-                        stats
+                        stats,
+                        devices,
+                        build
                     }))
                 }
                 Err(error) => {
@@ -475,6 +524,7 @@ async fn delete_predictor(muna: &Arc<Muna>, tag: &str) {
 async fn load_model(
     tag: &str,
     key: Option<String>,
+    devices: Option<Vec<u32>>,
     priority: PriorityGuard
 ) -> Result<Loaded, String> {
     // One Muna instance per model, keyed with the tag's deployment key when
@@ -497,6 +547,8 @@ async fn load_model(
             Some(HashMap::<String, Value>::new()),
             Some(Acceleration::LocalGpu),
             None,
+            None,
+            None,
             None
         ).await
     }).await.map_err(|e| e.to_string())?;
@@ -504,6 +556,7 @@ async fn load_model(
         return Err(error);
     }
     let download = download_started.elapsed();
+    let build = build_id(&downloaded);
     // Everything from here is GPU staging from page cache; disk-tier
     // prefetch may start writing again. (An `Err` above drops the guard on
     // the way out, so failures release it too.)
@@ -518,12 +571,21 @@ async fn load_model(
     let load_started = Instant::now();
     let warm_muna = muna.clone();
     let warm_tag = tag.to_string();
+    // The control plane assigns these from the heartbeat's NVML indices
+    // and they are used here as CUDA ordinals. The two agree only while
+    // CUDA_VISIBLE_DEVICES is unset and every GPU on the node is the same
+    // model (CUDA's fastest-first order then ties back to PCI bus order).
+    let handles = devices.map(|devices| {
+        devices.iter().map(|&index| Device::cuda(index as i32)).collect::<Vec<_>>()
+    });
     predict::run(None, move || async move {
         let inputs = HashMap::from([("_".to_string(), Value::Null)]);
         warm_muna.predictions.create(
             &warm_tag,
             Some(inputs),
             Some(Acceleration::LocalGpu),
+            handles.as_deref(),
+            None,
             None,
             None
         ).await
@@ -535,7 +597,24 @@ async fn load_model(
         sig_muna.predictors.retrieve(&sig_tag).await
     }).await.map_err(|e| e.to_string())?;
     let predictor = predictor.ok_or_else(|| format!("predictor {tag} not found"))?;
-    Ok(Loaded { signature: predictor.signature, muna, download, load })
+    Ok(Loaded { signature: predictor.signature, muna, download, load, build })
+}
+
+/// Content hash of a prediction's build: the URL path stem of its last
+/// `dso` resource, which is always the compiled predictor (the rest are
+/// shared runtime libraries). Resource URLs are checksum-named, so the
+/// stem changes exactly when the predictor binary does.
+fn build_id(prediction: &Prediction) -> Option<String> {
+    let resource = prediction
+        .resources
+        .as_ref()?
+        .iter()
+        .rev()
+        .find(|resource| resource.kind == "dso")?;
+    let path = resource.url.split(['?', '#']).next()?;
+    let name = path.rsplit(['/', '\\']).next()?;
+    let stem = std::path::Path::new(name).file_stem()?.to_str()?;
+    (!stem.is_empty()).then(|| stem.to_string())
 }
 
 #[cfg(test)]
@@ -574,7 +653,7 @@ mod tests {
         pinned: Option<HashSet<String>>,
         notifications: Arc<NotificationCenter>
     ) -> ModelRegistry {
-        let loader: Loader = Arc::new(move |_tag, _priority| {
+        let loader: Loader = Arc::new(move |_tag, _devices, _priority| {
             let loads = loads.clone();
             Box::pin(async move {
                 loads.fetch_add(1, Ordering::SeqCst);
@@ -586,13 +665,15 @@ mod tests {
                         signature: Signature { inputs: vec![], outputs: vec![] },
                         muna: Arc::new(Muna::new(None, None)),
                         download: Duration::ZERO,
-                        load: delay
+                        load: delay,
+                        build: None
                     })
                 }
             })
         });
         ModelRegistry::with_loader(
             loader,
+            Arc::new(DashMap::new()),
             pinned,
             notifications,
             Arc::new(crate::platform::NullPlatform),
@@ -607,7 +688,7 @@ mod tests {
         release: Arc<tokio::sync::Notify>,
         fail: bool
     ) -> ModelRegistry {
-        let loader: Loader = Arc::new(move |_tag, priority| {
+        let loader: Loader = Arc::new(move |_tag, _devices, priority| {
             let release = release.clone();
             Box::pin(async move {
                 // The real loader holds the guard through the download
@@ -621,13 +702,15 @@ mod tests {
                         signature: Signature { inputs: vec![], outputs: vec![] },
                         muna: Arc::new(Muna::new(None, None)),
                         download: Duration::ZERO,
-                        load: Duration::ZERO
+                        load: Duration::ZERO,
+                        build: None
                     })
                 }
             })
         });
         ModelRegistry::with_loader(
             loader,
+            Arc::new(DashMap::new()),
             None,
             Arc::new(NotificationCenter::default()),
             Arc::new(crate::platform::NullPlatform),
@@ -769,5 +852,77 @@ mod tests {
         assert_eq!(registry.ready_tags(), vec!["@test/model".to_string()]);
         registry.unload("@test/model").await;
         observed("unload").await;
+    }
+
+    /// The loader receives the device assignment present when the load
+    /// starts, and the registry reports it through `Loading` and `Ready`.
+    #[tokio::test]
+    async fn loads_on_assigned_devices() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let loader_seen = seen.clone();
+        let loader: Loader = Arc::new(move |_tag, devices, _priority| {
+            loader_seen.lock().unwrap().push(devices);
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(Loaded {
+                    signature: Signature { inputs: vec![], outputs: vec![] },
+                    muna: Arc::new(Muna::new(None, None)),
+                    download: Duration::ZERO,
+                    load: Duration::ZERO,
+                    build: Some("abc123".to_string())
+                })
+            })
+        });
+        let devices: DeviceStore = Arc::new(DashMap::new());
+        devices.insert("@test/model".to_string(), vec![4, 5]);
+        let registry = ModelRegistry::with_loader(
+            loader,
+            devices,
+            None,
+            Arc::new(NotificationCenter::default()),
+            Arc::new(crate::platform::NullPlatform),
+            Arc::new(DownloadGate::new())
+        );
+        assert_eq!(registry.devices("@test/model"), None);
+        registry.warm("@test/model");
+        assert_eq!(registry.devices("@test/model"), Some(Some(vec![4, 5])));
+        let model = registry.ensure_ready("@test/model").await.unwrap();
+        assert_eq!(model.devices, Some(vec![4, 5]));
+        assert_eq!(model.build.as_deref(), Some("abc123"));
+        assert_eq!(*seen.lock().unwrap(), vec![Some(vec![4, 5])]);
+        // Unassigned tags load on the engine default.
+        registry.warm("@test/other");
+        assert_eq!(registry.devices("@test/other"), Some(None));
+    }
+
+    #[test]
+    fn build_id_is_last_dso_url_stem() {
+        let resource = |kind: &str, url: &str| muna::types::PredictionResource {
+            kind: kind.to_string(),
+            url: url.to_string(),
+            name: None,
+            size: None
+        };
+        let prediction = |resources| Prediction {
+            id: "pred".to_string(),
+            tag: "@test/model".to_string(),
+            created: String::new(),
+            configuration: None,
+            resources: Some(resources),
+            requirements: None,
+            results: None,
+            latency: None,
+            error: None,
+            logs: None
+        };
+        let signed = prediction(vec![
+            resource("dso", "https://cdn.muna.ai/resources/cudart?sig=x"),
+            resource("bin", "https://cdn.muna.ai/resources/weights"),
+            resource("dso", "https://cdn.muna.ai/resources/9f2c41?X-Amz-Signature=y")
+        ]);
+        assert_eq!(build_id(&signed).as_deref(), Some("9f2c41"));
+        let local = prediction(vec![resource("dso", "/cache/hf/snapshots/abc/9f2c41.so")]);
+        assert_eq!(build_id(&local).as_deref(), Some("9f2c41"));
+        assert_eq!(build_id(&prediction(vec![resource("bin", "https://cdn/x")])), None);
     }
 }

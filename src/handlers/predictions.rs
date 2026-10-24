@@ -98,7 +98,7 @@ async fn stream_prediction(
     let muna = model.muna.clone();
     let stream_tag = tag.clone();
     let rx = predict::stream(guard, move || async move {
-        muna.predictions.stream(&stream_tag, inputs, Some(acceleration)).await
+        muna.predictions.stream(&stream_tag, inputs, Some(acceleration), None).await
     });
     let event_stream = futures_util::stream::unfold(
         (rx, tag, meter),

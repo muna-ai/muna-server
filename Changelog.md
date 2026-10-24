@@ -1,5 +1,11 @@
 ## 0.0.23
-*INCOMPLETE*
++ Added `compute_architecture` to heartbeat node status, so the control plane can discover which models have implementations for the node's GPUs.
++ Added `devices` to heartbeat goal descriptors: the node loads the model's engine on the given GPUs, and reloads it when the assignment changes.
++ Added `policy` to heartbeat goal descriptors, the per-model inputs to the local lease-weight solver.
++ Added `device_ids` and `build` to heartbeat model status.
++ Updated device-lease weights to be solved locally every second from live lease demand and each model's policy. Models without a policy are weighted equally.
++ Updated the load-time VRAM measurement to cover only the model's assigned GPUs.
++ Upgraded `muna` to 0.0.34.
 
 ## 0.0.22
 + Added support for Anthropic `image` blocks in `/v1/messages`, with `base64` or `url` sources.

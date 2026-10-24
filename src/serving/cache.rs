@@ -211,6 +211,8 @@ async fn download_resources(
             Some(HashMap::<String, Value>::new()),
             Some(Acceleration::LocalAuto),
             None,
+            None,
+            None,
             None
         ).await
     }).await.map_err(|e| e.to_string())?;

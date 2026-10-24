@@ -40,11 +40,15 @@ pub(crate) async fn run(state: Arc<AppState>) {
         // land while a beat is in flight collapse into exactly one
         // follow-up beat; no explicit coalescing needed.
         tokio::select! {
+            _ = state.shutdown.cancelled() => break,
             _ = interval.tick() => {}
             _ = state.notifications.status.notified() => {}
         }
         beat(&state, &client, &url, token.as_deref()).await;
     }
+    // One last report (`draining: true`) so the plane stops routing here
+    // now rather than after the heartbeat timeout.
+    beat(&state, &client, &url, token.as_deref()).await;
 }
 
 /// One heartbeat: report status, apply the goals that come back.
@@ -77,18 +81,35 @@ async fn beat(
             return;
         }
     };
+    // Once shutdown starts, goals would start loads that cannot finish
+    // and could un-drain the node.
+    if state.shutdown.is_cancelled() {
+        return;
+    }
     apply(state, reconcile).await;
 }
 
 /// Diff the goal residency map against local state. Every arm is
 /// idempotent, so re-applying the same goal each beat is free.
 async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
-    // Store download credentials BEFORE acting on residency: the registry
-    // loader and cache downloader read the key store when they build the
-    // per-model Muna clients the directives below trigger.
+    // Store download credentials and device assignments BEFORE acting on
+    // residency: the registry loader and cache downloader read them when
+    // the directives below trigger a load. Devices and policy mirror the
+    // descriptor exactly (absent clears), since both are per-beat goals.
     for descriptor in &reconcile.models {
+        let tag = &descriptor.tag;
         if let Some(key) = &descriptor.key {
-            state.keys.insert(descriptor.tag.clone(), key.clone());
+            state.keys.insert(tag.clone(), key.clone());
+        }
+        if let Some(devices) = &descriptor.devices {
+            state.devices.insert(tag.clone(), devices.clone());
+        } else {
+            state.devices.remove(tag);
+        }
+        if let Some(policy) = descriptor.policy {
+            state.policies.insert(tag.clone(), policy);
+        } else {
+            state.policies.remove(tag);
         }
     }
     for descriptor in process_first(&reconcile.models) {
@@ -106,6 +127,22 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
         }
         match descriptor.residency {
             Residency::Process => {
+                // One predictor per process, so moving a model to other
+                // devices means unload then reload. A `Loading` engine
+                // defers the unload to its load task; the slot then clears
+                // and the next beat reloads on the new devices.
+                if let Some(current) = state.registry.devices(tag) {
+                    if current != descriptor.devices {
+                        tracing::info!(
+                            tag = %tag,
+                            from = ?current,
+                            to = ?descriptor.devices,
+                            "device assignment changed; reloading"
+                        );
+                        state.dispatcher.remove(tag);
+                        state.registry.unload(tag).await;
+                    }
+                }
                 // Warm FIRST so the gate guard exists before the cache
                 // request. `process` implies `disk`: track the cached tier
                 // too, so a later demotion reports `cached` instead of
@@ -159,7 +196,13 @@ mod tests {
     use super::*;
 
     fn descriptor(tag: &str, residency: Residency) -> ModelDescriptor {
-        ModelDescriptor { tag: tag.to_string(), residency, key: None }
+        ModelDescriptor {
+            tag: tag.to_string(),
+            residency,
+            key: None,
+            devices: None,
+            policy: None
+        }
     }
 
     #[test]

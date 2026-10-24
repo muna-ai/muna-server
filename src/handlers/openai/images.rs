@@ -59,6 +59,7 @@ pub(crate) async fn image_generations(
         output_compression: req.output_compression,
         size,
         acceleration: Some(Acceleration::LocalGpu),
+        devices: None,
     };
     let muna = model.muna.clone();
     let dispatched = Instant::now();

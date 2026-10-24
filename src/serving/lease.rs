@@ -31,13 +31,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
-
-use crate::serving::batch::BatchPlan;
-use crate::serving::registry::ModelState;
-use crate::state::AppState;
 
 /// `LeaseSegment::MAGIC` ('NSGL'): the creator's init-complete handshake.
 const MAGIC: u32 = 0x4E53_474C;
@@ -49,8 +43,6 @@ const MAX_REGISTRANTS: usize = 8;
 /// Device ordinals probed for segments (per-GPU keying; comfortably above
 /// any single-node GPU count we deploy).
 const MAX_DEVICES: i32 = 16;
-/// Cadence of the weight-reconcile loop in [`run`].
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Global arbitration mode, mirror of nanosgl `LeaseMode`. Written by the
 /// supervisor, read by every engine at each acquire.
@@ -129,7 +121,6 @@ struct LeaseSegment {
 #[derive(Clone)]
 pub(crate) struct RegistrantStats {
     /// CUDA device ordinal the segment is keyed on.
-    #[allow(dead_code)]
     pub device: i32,
     /// The registrant's label (predictor tag).
     pub label: String,
@@ -194,35 +185,35 @@ impl LeaseSupervisor {
         Self { segments: Mutex::new(HashMap::new()) }
     }
 
-    /// Set a registrant's scheduling weight by label (atomic store).
+    /// Set a registrant's scheduling weight on one device (atomic store).
     ///
     /// Weights are shares under contention, never reservations; `0` puts
     /// the model in per-model free-run (spatial), skipping the fair queue.
-    /// A label with no live registrant (model not loaded, or its engine
-    /// has no lease) is a silent no-op -- the reconcile loop re-asserts
-    /// weights periodically, so a late-registering engine converges within
-    /// one interval.
-    pub(crate) fn set_weight(&self, label: &str, weight: u32) {
+    /// A label with no live registrant on the device is a silent no-op --
+    /// the weight solver re-asserts every second, so a late-registering
+    /// engine converges within one interval.
+    pub(crate) fn set_weight_on(
+        &self,
+        device: i32,
+        label: &str,
+        weight: u32
+    ) {
         let mut segments = self.segments.lock().unwrap();
-        for device in 0..MAX_DEVICES {
-            let Some(segment) = attached(&mut segments, device) else {
+        let Some(segment) = attached(&mut segments, device) else {
+            return;
+        };
+        for slot in &segment.registrants {
+            if slot.pid.load(Ordering::Acquire) == 0 {
                 continue;
-            };
-            for slot in &segment.registrants {
-                if slot.pid.load(Ordering::Acquire) == 0 {
-                    continue;
-                }
-                if slot_label(slot) == label
-                    && slot.weight.load(Ordering::Relaxed) != weight
-                {
-                    slot.weight.store(weight, Ordering::Relaxed);
-                    tracing::info!(
-                        label = %label,
-                        device = device,
-                        weight = weight,
-                        "device lease weight set"
-                    );
-                }
+            }
+            if slot_label(slot) == label && slot.weight.load(Ordering::Relaxed) != weight {
+                slot.weight.store(weight, Ordering::Relaxed);
+                tracing::debug!(
+                    label = %label,
+                    device = device,
+                    weight = weight,
+                    "device lease weight set"
+                );
             }
         }
     }
@@ -384,34 +375,6 @@ fn slot_label(slot: &Registrant) -> std::borrow::Cow<'_, str> {
     String::from_utf8_lossy(&slot.label[..len])
 }
 
-/// Periodic weight-reconcile loop, spawned unconditionally in `main` (the
-/// heartbeat is control-plane-gated; lease policy must not be -- co-resident
-/// engines arbitrate in standalone mode too).
-///
-/// Policy: LLM-style models (continuous batching) get weight 3; batch-style
-/// models (`Sequential` / `Buffered` dispatch) get weight 1, so an LLM keeps
-/// ~75% of contended GPU time against a co-resident batch workload. Weights
-/// only bind under contention (work-conserving), so a lone model is
-/// unaffected. Idempotent atomic stores make the periodic re-assert free;
-/// it also converges engines that registered after the model turned Ready.
-pub(crate) async fn run(state: Arc<AppState>) {
-    let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        interval.tick().await;
-        for (tag, model_state) in state.registry.snapshot() {
-            let ModelState::Ready(model) = model_state else {
-                continue;
-            };
-            let weight = match model.plan {
-                BatchPlan::Continuous => 3,
-                BatchPlan::Sequential | BatchPlan::Buffered { .. } => 1,
-            };
-            state.lease.set_weight(&tag, weight);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::mem::{offset_of, size_of};
@@ -454,7 +417,7 @@ mod tests {
     fn absent_segments_are_a_noop() {
         let supervisor = LeaseSupervisor::new();
         assert!(supervisor.stats().is_empty());
-        supervisor.set_weight("@test/model", 3);
+        supervisor.set_weight_on(0, "@test/model", 3);
         supervisor.set_mode(LeaseMode::FreeRun);
     }
 }

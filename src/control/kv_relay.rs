@@ -76,7 +76,10 @@ pub(crate) async fn run(state: Arc<AppState>) {
     let mut scan = tokio::time::interval(SCAN_INTERVAL);
     scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        scan.tick().await;
+        tokio::select! {
+            _ = state.shutdown.cancelled() => break,
+            _ = scan.tick() => {}
+        }
         let ready: HashSet<String> = state.registry.ready_tags().into_iter().collect();
         tasks.retain(|tag, (cancel, handle)| {
             if !ready.contains(tag) {
@@ -95,7 +98,7 @@ pub(crate) async fn run(state: Arc<AppState>) {
                 continue;
             };
             tracing::info!(tag = %tag, endpoint = %endpoint, "kv relay attached");
-            let cancel = CancellationToken::new();
+            let cancel = state.shutdown.child_token();
             let handle = tokio::spawn(relay_model(
                 state.clone(),
                 tag.clone(),
@@ -105,6 +108,11 @@ pub(crate) async fn run(state: Arc<AppState>) {
             ));
             tasks.insert(tag.clone(), (cancel, handle));
         }
+    }
+    // Per-model tokens are children of the shutdown token, so every relay
+    // is already cancelled; wait for them to return.
+    for (_, (_, handle)) in tasks {
+        let _ = handle.await;
     }
 }
 
@@ -122,6 +130,8 @@ async fn discover_endpoint(state: &Arc<AppState>, tag: &str) -> Option<String> {
             &sidecar,
             Some(inputs),
             Some(Acceleration::LocalAuto),
+            None,
+            None,
             None,
             None
         ).await

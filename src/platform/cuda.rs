@@ -119,6 +119,15 @@ impl Platform for Cuda {
         }
         Some(total)
     }
+
+    fn memory_used_mb_on(&self, devices: &[u32]) -> Option<u64> {
+        let mut total = 0u64;
+        for &index in devices {
+            let mem = self.nvml.device_by_index(index).ok()?.memory_info().ok()?;
+            total += mem.used / (1024 * 1024);
+        }
+        Some(total)
+    }
 }
 
 fn check(

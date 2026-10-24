@@ -208,6 +208,8 @@ impl Dispatcher {
                                 Some(inputs),
                                 Some(acceleration),
                                 None,
+                                None,
+                                None,
                                 None
                             ).await;
                             stats.record_latency(start.elapsed());
@@ -248,6 +250,8 @@ impl Dispatcher {
                 Some(inputs),
                 Some(acceleration),
                 None,
+                None,
+                None,
                 None
             ).await;
             let latency = start.elapsed();
@@ -280,6 +284,8 @@ mod tests {
             signature: Signature { inputs: vec![], outputs: vec![] },
             plan,
             stats: Arc::new(ModelStats::new()),
+            devices: None,
+            build: None,
         })
     }
 
