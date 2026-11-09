@@ -1,4 +1,7 @@
-## 0,0,24
+## 0.0.25
+*INCOMPLETE*
+
+## 0.0.24
 + Added `/v1/audio/transcriptions` endpoint for OpenAI-compatible transcriptions.
 + Upgraded `muna` to 0.0.35.
 
