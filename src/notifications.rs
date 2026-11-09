@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 pub(crate) struct NotificationCenter {
     /// Reported node state changed: a model's lifecycle (Loading, Ready,
     /// Failed, unloaded), its cache tier (Caching, Cached, Failed), or the
-    /// drain flag. Awaited by the control-plane heartbeat loop so a
+    /// drain flag, plus throttled resource-download progress. Awaited by the control-plane heartbeat loop so a
     /// transition is reported immediately instead of on the next tick.
     /// `notify_one` stores at most one permit, so any number of changes
     /// during an in-flight beat collapse into exactly one follow-up beat.

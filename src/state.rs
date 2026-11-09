@@ -21,6 +21,7 @@ use crate::serving::dispatch::Dispatcher;
 use crate::serving::download_gate::DownloadGate;
 use crate::serving::lease::LeaseSupervisor;
 use crate::serving::registry::ModelRegistry;
+use crate::serving::preparation::PreparationTracker;
 use crate::serving::remote_images::ImageFetcher;
 
 /// Per-tag deployment keys delivered by control-plane residency directives
@@ -30,8 +31,9 @@ use crate::serving::remote_images::ImageFetcher;
 pub(crate) type KeyStore = Arc<DashMap<String, String>>;
 
 /// Per-tag GPU ordinals (rank order) delivered by control-plane residency
-/// directives. Read by the registry when a load starts; tags without an
-/// entry load on the engine's default devices.
+/// directives. Managed process goals require an explicit assignment: an empty
+/// list selects CPU-only execution; nonempty lists select distinct GPU IDs.
+/// Standalone loads may use engine defaults.
 pub(crate) type DeviceStore = Arc<DashMap<String, Vec<u32>>>;
 
 /// Per-tag lease policy delivered by control-plane residency directives.
@@ -54,6 +56,23 @@ pub(crate) struct NodeContext {
     pub kv_flush_interval: Duration,
 }
 
+/// Loading authority and control-plane wiring are a single startup choice.
+pub(crate) enum ServerMode {
+    /// The server may load models lazily using the loader's default devices.
+    Standalone,
+    /// Only residency reconciliation may load models or assign devices.
+    Managed(NodeContext),
+}
+
+impl ServerMode {
+    pub(crate) fn node(&self) -> Option<&NodeContext> {
+        match self {
+            Self::Standalone => None,
+            Self::Managed(node) => Some(node),
+        }
+    }
+}
+
 pub(crate) struct AppState {
     /// Per-model load-state machine.
     pub registry: ModelRegistry,
@@ -61,9 +80,9 @@ pub(crate) struct AppState {
     pub cache: CacheTracker,
     /// Per-model prediction dispatcher.
     pub dispatcher: Dispatcher,
-    /// Device-lease policy/observability surface over the shared-memory
-    /// segments co-resident nanosgl engines arbitrate GPU time through.
-    pub lease: LeaseSupervisor,
+    /// Owns the Corby runtime, started before predictor loading, plus its
+    /// scheduling policy and observability surface.
+    pub lease: Arc<LeaseSupervisor>,
     /// Per-tag deployment keys from residency directives; see [`KeyStore`].
     pub keys: KeyStore,
     /// Per-tag device assignments; see [`DeviceStore`].
@@ -83,8 +102,8 @@ pub(crate) struct AppState {
     /// no process-wide Muna client: each loaded model owns its own (see
     /// `ReadyModel::muna`).
     pub cache_path: PathBuf,
-    /// Control-plane wiring; `None` in standalone mode.
-    pub node: Option<NodeContext>,
+    /// Startup mode determines who may load models and assign devices.
+    pub mode: ServerMode,
     /// Fetches remote chat images for inlining (public addresses only).
     pub image_fetcher: ImageFetcher,
     /// Process start, for uptime reporting.
@@ -100,19 +119,34 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
+
+    /// Managed requests never initiate loading; residency reconciliation owns it.
+    pub(crate) async fn inference_model(&self, tag: &str) -> Result<Arc<crate::serving::registry::ReadyModel>, crate::serving::registry::RegistryError> {
+        if matches!(&self.mode, ServerMode::Standalone) {
+            return self.registry.ensure_ready(tag).await;
+        }
+        if !self.registry.serves(tag) {
+            return Err(crate::serving::registry::RegistryError::NotServed(tag.to_string()));
+        }
+        self.registry.ready(tag).ok_or(crate::serving::registry::RegistryError::Loading { retry_after: 5 })
+    }
+
     const CHECKIN_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
     const CHECKIN_RETRY_SECONDS: u64 = 60 * 60;
 
     pub(crate) fn new(
         pinned: Option<HashSet<String>>,
-        node: Option<NodeContext>
-    ) -> Self {
+        mode: ServerMode
+    ) -> Result<Self, String> {
         let keys: KeyStore = Arc::new(DashMap::new());
         let devices: DeviceStore = Arc::new(DashMap::new());
+        let policies: PolicyStore = Arc::new(DashMap::new());
+        let lease = Arc::new(LeaseSupervisor::new()?);
         // Throwaway client purely for the env-derived cache location; it
         // holds no credential and makes no requests.
         let cache_path = MunaClient::new(None, None).cache_path().to_path_buf();
         let notifications = Arc::new(NotificationCenter::default());
+        let preparation = PreparationTracker::new(notifications.clone());
         let platform = platform::detect();
         let compute_architecture = match muna::c::Configuration::get_compute_architecture() {
             Ok(architecture) => architecture,
@@ -125,36 +159,40 @@ impl AppState {
         // registry holds the priority side, the cache tracker the waiting
         // side. See `serving/download_gate.rs`.
         let download_gate = Arc::new(DownloadGate::new());
-        Self {
+        Ok(Self {
             registry: ModelRegistry::new(
                 keys.clone(),
                 devices.clone(),
                 pinned,
                 notifications.clone(),
                 platform.clone(),
-                download_gate.clone()
+                download_gate.clone(),
+                Some(lease.clone()),
+                policies.clone(),
+                preparation.clone()
             ),
             cache: CacheTracker::new(
                 keys.clone(),
                 notifications.clone(),
-                download_gate
+                download_gate,
+                preparation
             ),
             dispatcher: Dispatcher::new(),
-            lease: LeaseSupervisor::new(),
+            lease,
             keys,
             devices,
-            policies: Arc::new(DashMap::new()),
+            policies,
             notifications,
             platform,
             compute_architecture,
             cache_path,
-            node,
+            mode,
             image_fetcher: ImageFetcher::new(),
             start_time: Instant::now(),
             shutdown: CancellationToken::new(),
             draining: AtomicBool::new(false),
             runtime_checkins: tokio::sync::RwLock::new(BTreeMap::new()),
-        }
+        })
     }
 
     pub(crate) fn is_draining(&self) -> bool {

@@ -8,7 +8,8 @@
 //! Fake CPU predictors from `tests/predictors/` impersonate
 //! OpenAI-compatible signatures, exercising the full path
 //! HTTP handler -> registry -> dispatcher -> muna FFI -> compiled binary
-//! against an in-process stub control plane.
+//! in standalone mode. Managed lifecycle tests use an in-process stub
+//! control plane and explicit process-residency device assignments.
 //!
 //! Real-engine behavior lives in `tests/llm_gate.rs`.
 //!
@@ -161,6 +162,57 @@ async fn drain_directive_and_endpoint() {
     assert_eq!(status["draining"], json!(true));
 }
 
+/// Managed inference may neither eager-load pinned models nor lazy-load on a
+/// request. This needs no predictor binary: no valid load is authorized here.
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_models_require_residency_and_explicit_devices() {
+    let stub = StubControlPlane::start().await;
+    let tag = "@muna/does-not-exist-xyz";
+    let server = ServerGuard::spawn_with_models(&stub, &[tag]).await;
+    let client = reqwest::Client::new();
+    let status_url = format!("{}/status", server.url());
+
+    wait_for(Duration::from_secs(5), || async { stub.heartbeat_count() >= 2 })
+        .await.expect("managed server did not heartbeat");
+    let status: Value = client.get(&status_url).send().await.unwrap().json().await.unwrap();
+    assert!(status["models"].as_array().unwrap().is_empty(), "managed --models must not eager-load: {status}");
+
+    for (route, body) in [
+        ("/v1/predictions", json!({ "tag": tag, "inputs": { "value": remote_string("hello") } })),
+        ("/v1/chat/completions", json!({ "model": tag, "messages": [{ "role": "user", "content": "hello" }] })),
+        ("/v1/messages", json!({ "model": tag, "max_tokens": 16, "messages": [{ "role": "user", "content": "hello" }] })),
+    ] {
+        let response = client.post(format!("{}{route}", server.url()))
+            .json(&body).send().await.unwrap();
+        assert_eq!(response.status(), 429, "{route} must wait for managed preload");
+        assert!(response.headers().contains_key("Retry-After"));
+    }
+
+    // Deliberately malformed process goal: reject it rather than selecting GPUs.
+    stub.state().directives.models.insert(tag.to_string(), json!({
+        "tag": tag, "residency": "process",
+    }));
+    let beats = stub.heartbeat_count();
+    wait_for(Duration::from_secs(5), || async { stub.heartbeat_count() >= beats + 2 })
+        .await.expect("missing-device goal was not reconciled");
+    let status: Value = client.get(&status_url).send().await.unwrap().json().await.unwrap();
+    assert!(status["models"].as_array().unwrap().is_empty(), "inference or missing-device goal initiated loading: {status}");
+
+    // Even a valid assignment cannot load a tag outside the pinned set.
+    stub.clear_residency(tag);
+    let unlisted = "@muna/unlisted-test-model";
+    stub.set_process_residency(unlisted, &[0]);
+    let beats = stub.heartbeat_count();
+    wait_for(Duration::from_secs(5), || async { stub.heartbeat_count() >= beats + 2 })
+        .await.expect("unlisted goal was not reconciled");
+    let response = client.post(format!("{}/v1/predictions", server.url()))
+        .json(&json!({ "tag": unlisted, "inputs": { "value": remote_string("hello") } }))
+        .send().await.unwrap();
+    assert_eq!(response.status(), 404);
+    let status: Value = client.get(&status_url).send().await.unwrap().json().await.unwrap();
+    assert!(status["models"].as_array().unwrap().is_empty(), "unlisted goal initiated loading: {status}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_load_reported_then_cleared_by_unload() {
     let stub = StubControlPlane::start().await;
@@ -169,7 +221,7 @@ async fn failed_load_reported_then_cleared_by_unload() {
     let status_url = format!("{}/status", server.url());
     let bogus = "@muna/does-not-exist-xyz";
 
-    stub.set_residency(bogus, "process");
+    stub.set_process_residency(bogus, &[0]);
     wait_for(Duration::from_secs(30), || {
         let client = client.clone();
         let url = status_url.clone();
@@ -204,19 +256,17 @@ async fn failed_load_reported_then_cleared_by_unload() {
 async fn loading_window_returns_429_with_retry_after() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_SLOW_COLDSTART);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_standalone_with_models(&[TAG_SLOW_COLDSTART]).await;
     let client = reqwest::Client::new();
     let status_url = format!("{}/status", server.url());
 
-    // Warm via a `gpu` goal (non-blocking), then catch the loading window.
-    stub.set_residency(TAG_SLOW_COLDSTART, "process");
+    // Standalone eager loading runs the CPU probe's slow warmup at boot.
     wait_for(Duration::from_secs(10), || {
         let client = client.clone();
         let url = status_url.clone();
         async move {
             let status: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
-            status["models"].as_array().unwrap().iter().any(|m| m["tag"] == json!(TAG_SLOW_COLDSTART))
+            status["models"].as_array().unwrap().iter().any(|m| m["tag"] == json!(TAG_SLOW_COLDSTART) && m["state"] == json!("loading"))
         }
     })
     .await
@@ -229,7 +279,7 @@ async fn loading_window_returns_429_with_retry_after() {
     // (empty inputs would take muna's raw-prediction path if timing slipped
     // past the load); the runtime ignores unknown inputs.
     let response = client
-        .post(format!("{}/v1/predictions/remote", server.url()))
+        .post(format!("{}/v1/predictions", server.url()))
         .json(&json!({
             "tag": TAG_SLOW_COLDSTART,
             "inputs": { "value": remote_string("hello") },
@@ -265,11 +315,10 @@ async fn loading_window_returns_429_with_retry_after() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn chat_completion_streaming_and_unload() {
+async fn chat_completion_streaming() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_CHAT);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_standalone().await;
     let client = reqwest::Client::new();
     let expected_text = "the quick brown fox";
     let request = json!({
@@ -383,27 +432,13 @@ async fn chat_completion_streaming_and_unload() {
     }
     assert_eq!(streamed_text, expected_text);
     assert_eq!(streamed_reasoning, "thinking really hard");
-
-    // A `none` goal removes the model from /v1/models and /status.
-    stub.set_residency(TAG_CHAT, "none");
-    wait_for(Duration::from_secs(10), || {
-        let client = client.clone();
-        let url = format!("{}/v1/models", server.url());
-        async move {
-            let models: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
-            models["data"].as_array().unwrap().is_empty()
-        }
-    })
-    .await
-    .expect("unload directive did not remove the model");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn chat_completion_caller_fault_is_400() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_CHAT);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_standalone().await;
     let client = reqwest::Client::new();
     // The fake raises `ValueError` before its first yield on this message,
     // standing in for a prompt longer than the model's context length.
@@ -470,8 +505,7 @@ async fn chat_completion_caller_fault_is_400() {
 async fn chat_completion_content_parts() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_CHAT);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_standalone().await;
     let client = reqwest::Client::new();
     let expected_text = "What is the capital of France?";
 
@@ -550,8 +584,7 @@ async fn chat_completion_content_parts() {
 async fn chat_completion_tool_calls() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_TOOLS);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_standalone().await;
     let client = reqwest::Client::new();
     let tools = json!([{
         "type": "function",
@@ -688,8 +721,7 @@ async fn chat_completion_tool_calls() {
 async fn tools_against_undeclared_model_is_400() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_CHAT);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_standalone().await;
     let client = reqwest::Client::new();
     // The text-only fake declares no tools parameter: a tool-bearing
     // request is a clear 400, not a silent drop or a 500.
@@ -729,8 +761,7 @@ async fn tools_against_undeclared_model_is_400() {
 async fn embeddings_shape_determinism_usage() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_EMBEDDINGS);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_standalone().await;
     let client = reqwest::Client::new();
     let request = json!({
         "model": TAG_EMBEDDINGS,
@@ -770,8 +801,7 @@ async fn embeddings_shape_determinism_usage() {
 async fn image_generations_b64_png() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_IMAGE);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_standalone().await;
     let client = reqwest::Client::new();
 
     let response = client
@@ -818,8 +848,7 @@ fn anthropic_sse_frames(sse: &str) -> Vec<(String, Value)> {
 async fn anthropic_messages_non_streaming_and_streaming() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_CHAT);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_standalone().await;
     let client = reqwest::Client::new();
     let expected_text = "the quick brown fox";
     let request = json!({
@@ -918,7 +947,7 @@ async fn anthropic_messages_non_streaming_and_streaming() {
 }
 
 // ---------------------------------------------------------------------------
-// Dispatcher over HTTP (/v1/predictions/remote)
+// Dispatcher over HTTP (/v1/predictions)
 // ---------------------------------------------------------------------------
 
 async fn remote_prediction(
@@ -927,12 +956,13 @@ async fn remote_prediction(
     body: Value,
 ) -> (reqwest::StatusCode, String) {
     let response = client
-        .post(format!("{server_url}/v1/predictions/remote"))
+        .post(format!("{server_url}/v1/predictions"))
         .json(&body)
         .timeout(LOAD_TIMEOUT)
         .send().await.unwrap();
     let status = response.status();
     let text = response.text().await.unwrap();
+    assert_eq!(status, 200, "prediction request failed: {text}");
     (status, text)
 }
 
@@ -958,8 +988,7 @@ fn windows_overlap(a: (f64, f64), b: (f64, f64)) -> bool {
 async fn sequential_dispatch_serializes_requests() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_BATCH_SEQUENTIAL);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_standalone().await;
     let client = reqwest::Client::new();
     let server_url = server.url();
     let request = |value: &str| json!({
@@ -993,8 +1022,7 @@ async fn sequential_dispatch_serializes_requests() {
 async fn buffered_static_merges_full_batch() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_BATCH_STATIC);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_standalone().await;
     let client = reqwest::Client::new();
     let server_url = server.url();
     let request = |item: &str| json!({
@@ -1037,8 +1065,7 @@ async fn buffered_static_merges_full_batch() {
 async fn buffered_dynamic_holds_mismatched_key() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_BATCH_DYNAMIC);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_standalone().await;
     let client = reqwest::Client::new();
     let server_url = server.url();
     let request = |item: &str, prefix: &str| json!({
@@ -1077,8 +1104,7 @@ async fn buffered_dynamic_holds_mismatched_key() {
 async fn continuous_dispatch_overlaps() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_BATCH_CONTINUOUS);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn(&stub).await;
+    let server = ServerGuard::spawn_standalone().await;
     let client = reqwest::Client::new();
     let server_url = server.url();
     let request = |item: &str| json!({
@@ -1119,8 +1145,7 @@ fn model_in<'a>(status: &'a Value, tag: &str) -> Option<&'a Value> {
 async fn pinned_models_eager_load_and_reject_unlisted() {
     skip_without_access_key!();
     skip_if_unpushed!(TAG_BATCH_SEQUENTIAL);
-    let stub = StubControlPlane::start().await;
-    let server = ServerGuard::spawn_with_models(&stub, &[TAG_BATCH_SEQUENTIAL]).await;
+    let server = ServerGuard::spawn_standalone_with_models(&[TAG_BATCH_SEQUENTIAL]).await;
     let client = reqwest::Client::new();
     let status_url = format!("{}/status", server.url());
 
@@ -1146,10 +1171,7 @@ async fn pinned_models_eager_load_and_reject_unlisted() {
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["error"]["code"], json!("model_not_found"));
 
-    // A control-plane `gpu` goal for an unlisted tag is ignored: the tag
-    // never appears in status (neither loaded nor cached).
-    stub.set_residency(TAG_CHAT, "process");
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // A rejected inference must not add the unlisted tag to status.
     let status: Value = client
         .get(&status_url).send().await.unwrap()
         .json().await.unwrap();

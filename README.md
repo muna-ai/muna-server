@@ -14,8 +14,13 @@ travels in each request's `model` field, so one server can serve any predictor o
 | `GET`  | `/v1/models`           | Lists models this process has loaded so far.             |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat completion (JSON or SSE stream).  |
 | `POST` | `/v1/embeddings`       | OpenAI-compatible embeddings.                            |
+| `POST` | `/v1/audio/transcriptions` | OpenAI-compatible audio transcriptions. |
 
 ## Start the Server
+
+Managed fleet nodes receive explicit device assignments through process residency
+goals before loading. Standalone servers retain eager/on-demand loading with
+their configured engine defaults.
 
 ```bash
 # Provide your Muna access key (or put it in a .env file)

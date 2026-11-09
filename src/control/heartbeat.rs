@@ -21,7 +21,7 @@ use crate::serving::cache::CachePriority;
 use crate::state::AppState;
 
 pub(crate) async fn run(state: Arc<AppState>) {
-    let node = state.node.as_ref().expect("heartbeat requires node context");
+    let node = state.mode.node().expect("heartbeat requires node context");
     let url = format!(
         "{}/v1/nodes/{}/heartbeat",
         node.control_plane_url.trim_end_matches('/'),
@@ -92,6 +92,50 @@ async fn beat(
 /// Diff the goal residency map against local state. Every arm is
 /// idempotent, so re-applying the same goal each beat is free.
 async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
+    state.lease.retain_reservations(|tag| state.registry.devices(tag).is_some());
+    let mut rejected = std::collections::HashSet::new();
+    for descriptor in &reconcile.models {
+        if !matches!(descriptor.residency, Residency::Process) || !state.registry.serves(&descriptor.tag) {
+            continue;
+        }
+        let Some(devices) = descriptor.devices.as_deref().filter(|ids| !ids.is_empty() && valid_devices(Some(ids))) else { continue; };
+        let dedicated = descriptor.policy.is_some_and(|policy| policy.dedicated);
+        let current = state.registry.devices(&descriptor.tag);
+        let resident = current.is_some();
+        // Retire a moved assignment first; its old reservation cannot be
+        // replaced until native work and the old engine have drained.
+        if current.as_ref().is_some_and(|ids| ids.as_deref() != Some(devices)) {
+            continue;
+        }
+        // Validate existing peers before loading the dedicated owner. Unknown
+        // loading engines are not evidence of cooperative lease support.
+        let incompatible_peer = dedicated && state.registry.snapshot().iter().any(|(tag, model)| {
+            if tag == &descriptor.tag { return false; }
+            match model {
+                crate::serving::registry::ModelState::Loading { devices: Some(ids), .. } => ids.iter().any(|id| devices.contains(id)),
+                crate::serving::registry::ModelState::Ready(model) => model.devices.as_ref().is_some_and(|ids|
+                    ids.iter().any(|id| devices.contains(id)) && !state.lease.supports(tag, ids)),
+                _ => false,
+            }
+        });
+        // Unverified new engines must not warm up on a live dedicated GPU.
+        // Preload shared peers before admitting its dedicated owner.
+        if incompatible_peer || (!dedicated && !resident && state.lease.protected(devices)) ||
+            (dedicated && !state.lease.reserve_dedicated(&descriptor.tag, devices)) {
+            tracing::error!(tag = %descriptor.tag, "process goal rejected: dedicated reservation or unsupported lease peer");
+            rejected.insert(descriptor.tag.clone());
+        }
+    }
+    // Recheck after all dedicated reservations are known; descriptor order
+    // must not admit an unverified new shared engine in the same heartbeat.
+    for descriptor in &reconcile.models {
+        if matches!(descriptor.residency, Residency::Process) &&
+            !descriptor.policy.is_some_and(|policy| policy.dedicated) &&
+            state.registry.devices(&descriptor.tag).is_none() &&
+            descriptor.devices.as_ref().is_some_and(|ids| state.lease.protected(ids)) {
+            rejected.insert(descriptor.tag.clone());
+        }
+    }
     // Store download credentials and device assignments BEFORE acting on
     // residency: the registry loader and cache downloader read them when
     // the directives below trigger a load. Devices and policy mirror the
@@ -114,6 +158,23 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
     }
     for descriptor in process_first(&reconcile.models) {
         let tag = &descriptor.tag;
+        if rejected.contains(tag) {
+            continue;
+        }
+        if let Some(model) = state.registry.ready(tag) {
+            let dedicated = descriptor.policy.is_some_and(|policy| policy.dedicated);
+            if model.lease.as_ref().is_some_and(|lease| lease.dedicated != dedicated) {
+                state.dispatcher.remove(tag);
+                state.registry.unload(tag).await;
+                continue;
+            }
+        }
+        if matches!(descriptor.residency, Residency::Process) && !valid_devices(descriptor.devices.as_deref()) {
+            tracing::error!(tag = %tag, "process goal requires an explicit device list with distinct valid GPU IDs (empty for CPU)");
+            state.dispatcher.remove(tag);
+            state.registry.unload(tag).await;
+            continue;
+        }
         // A residency goal for a tag outside the pinned set (`--models`) is
         // a control-plane misconfiguration: neither loaded nor cached.
         if !state.registry.serves(tag) {
@@ -141,6 +202,7 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
                         );
                         state.dispatcher.remove(tag);
                         state.registry.unload(tag).await;
+                        continue;
                     }
                 }
                 // Warm FIRST so the gate guard exists before the cache
@@ -176,6 +238,12 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
         tracing::info!(drain = reconcile.drain, "drain state changed by control plane");
         state.set_draining(reconcile.drain);
     }
+}
+
+fn valid_devices(devices: Option<&[u32]>) -> bool {
+    let Some(devices) = devices else { return false; };
+    devices.iter().all(|id| *id <= i32::MAX as u32) &&
+        devices.iter().copied().collect::<std::collections::HashSet<_>>().len() == devices.len()
 }
 
 /// Order directives so `process` goals are applied before the rest.
@@ -219,4 +287,13 @@ mod tests {
         let tags: Vec<&str> = process_first(&models).map(|d| d.tag.as_str()).collect();
         assert_eq!(tags, vec!["@a/gemma", "@a/qwen", "@a/flux", "@a/old"]);
     }
+    #[test]
+    fn process_devices_must_be_explicit_and_distinct() {
+        assert!(!valid_devices(None));
+        assert!(valid_devices(Some(&[])));
+        assert!(!valid_devices(Some(&[0, 0])));
+        assert!(!valid_devices(Some(&[u32::MAX])));
+        assert!(valid_devices(Some(&[2, 0])));
+    }
+
 }

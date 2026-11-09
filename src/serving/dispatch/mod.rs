@@ -90,6 +90,7 @@ impl Dispatcher {
         inputs: HashMap<String, Value>,
         acceleration: Acceleration
     ) -> Result<Prediction, MunaError> {
+        let _admission = model.admit().await?;
         self.ensure_entry(tag, model);
         // Snapshot the entry's dispatch handle without holding the shard
         // lock across an await.
@@ -191,23 +192,26 @@ impl Dispatcher {
                 let tag_owned = tag.to_string();
                 let stats = model.stats.clone();
                 let invoke_lock = lock.clone();
+                let loaded_model = model.clone();
                 let predict_fn: PredictFn = Arc::new(move |inputs, acceleration| {
                     let muna = muna.clone();
                     let tag = tag_owned.clone();
                     let stats = stats.clone();
                     let lock = invoke_lock.clone();
+                    let loaded_model = loaded_model.clone();
                     Box::pin(async move {
                         // The accumulator is already single-consumer; the
                         // lock only contends with `acquire` callers on the
                         // OpenAI surfaces.
                         let guard = lock.lock_owned().await;
-                        predict::run(Some(guard), move || async move {
+                        let devices = loaded_model.device_handles()?;
+                        predict::run_model(loaded_model, Some(guard), move || async move {
                             let start = Instant::now();
                             let result = muna.predictions.create(
                                 &tag,
                                 Some(inputs),
                                 Some(acceleration),
-                                None,
+                                devices.as_deref(),
                                 None,
                                 None,
                                 None
@@ -243,13 +247,14 @@ impl Dispatcher {
         let muna = model.muna.clone();
         let tag_owned = tag.to_string();
         let stats = model.stats.clone();
-        predict::run(guard, move || async move {
+        let devices = model.device_handles()?;
+        predict::run_model(model.clone(), guard, move || async move {
             let start = Instant::now();
             let result = muna.predictions.create(
                 &tag_owned,
                 Some(inputs),
                 Some(acceleration),
-                None,
+                devices.as_deref(),
                 None,
                 None,
                 None
@@ -279,6 +284,8 @@ mod tests {
 
     fn ready_model(plan: BatchPlan) -> Arc<ReadyModel> {
         Arc::new(ReadyModel {
+            lease: None,
+            execution: Arc::default(),
             muna: Arc::new(Muna::new(None, None)),
             loaded_at: Instant::now(),
             signature: Signature { inputs: vec![], outputs: vec![] },

@@ -9,7 +9,6 @@ use std::time::Instant;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use muna::beta::openai::{ImageCreateParams, ImageSize};
-use muna::types::Acceleration;
 use serde::Deserialize;
 
 use crate::handlers::error::{AppError, Json};
@@ -19,6 +18,8 @@ use crate::state::AppState;
 
 #[derive(Deserialize)]
 pub(crate) struct ImageGenerationsRequest {
+    #[serde(flatten)]
+    _device_selection: crate::handlers::body::DeviceSelection,
     model: String,
     prompt: String,
     #[serde(default)]
@@ -42,12 +43,13 @@ pub(crate) async fn image_generations(
         return Err(AppError::unavailable("node is draining".into(), 30));
     }
     let size = parse_size(req.size.as_deref())?;
-    let model = state.registry.ensure_ready(&req.model).await?;
+    let model = state.inference_model(&req.model).await?;
     state.check_in_if_due(&req.model).await;
     state.mark_model_loaded(req.model.clone()).await;
     // Time spent acquiring the sequential guard is this surface's
     // admission wait (zero for continuous models).
     let admitted = Instant::now();
+    let _admission = model.admit().await?;
     let guard = state.dispatcher.acquire(&req.model, &model).await;
     let queue_wait = admitted.elapsed();
     let params = ImageCreateParams {
@@ -58,12 +60,12 @@ pub(crate) async fn image_generations(
         output_format: req.output_format,
         output_compression: req.output_compression,
         size,
-        acceleration: Some(Acceleration::LocalGpu),
-        devices: None,
+        acceleration: Some(model.acceleration()),
+        devices: model.device_handles()?,
     };
     let muna = model.muna.clone();
     let dispatched = Instant::now();
-    let response = predict::run(guard, move || async move {
+    let response = predict::run_model(model.clone(), guard, move || async move {
         muna.beta.openai.images.generate(params).await
     }).await?;
     let images = response.data.as_ref().map_or(0, |data| data.len()) as u32;

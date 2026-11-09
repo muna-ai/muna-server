@@ -12,7 +12,7 @@
 //! `429` with a `Retry-After` derived from load-time history.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,13 +21,15 @@ use muna::types::{Acceleration, Device, Prediction, Signature, Value};
 use muna::Muna;
 
 use crate::client::ServerClient;
+use crate::serving::preparation::{FailureStage, PreparationTracker};
 use crate::platform::Platform;
 use crate::notifications::NotificationCenter;
 use crate::serving::batch::BatchPlan;
 use crate::serving::download_gate::{DownloadGate, PriorityGuard};
 use crate::serving::predict;
 use crate::serving::stats::ModelStats;
-use crate::state::{DeviceStore, KeyStore};
+use crate::state::{DeviceStore, KeyStore, PolicyStore};
+use crate::serving::lease::{BusyGuard, LeaseSupervisor, ModelLease};
 
 /// How long a request waits on a `Loading` model before giving up with 429.
 const HOLD_THRESHOLD: Duration = Duration::from_secs(10);
@@ -50,6 +52,9 @@ pub(crate) struct ReadyModel {
     /// Also carries the model's deployment key when the control plane
     /// supplied one.
     pub muna: Arc<Muna>,
+    /// Native execution must drain before this assignment can be retired.
+    pub execution: Arc<ModelExecution>,
+    pub lease: Option<ModelLease>,
     /// When the load completed (reported as the model's `created` age by
     /// the OpenAI-compatible `/v1/models` handler).
     pub loaded_at: Instant,
@@ -62,11 +67,60 @@ pub(crate) struct ReadyModel {
     /// Live counters (queue depth, prediction totals, latency, load time,
     /// VRAM), shared with the dispatcher and reported in heartbeats.
     pub stats: Arc<ModelStats>,
-    /// GPU ordinals the engine was loaded on, in rank order; `None` when
-    /// the engine picked its own.
+    /// Explicit GPU ordinals the engine was loaded on, in rank order.
+    /// Production GPU loads reject missing or empty assignments.
     pub devices: Option<Vec<u32>>,
     /// Content hash of the loaded predictor build; see [`build_id`].
     pub build: Option<String>,
+}
+
+/// Busy intent drops before the execution read lock permits engine deletion.
+pub(crate) struct ModelAdmission {
+    _busy: Option<BusyGuard>,
+    _execution: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl ReadyModel {
+    pub(crate) async fn admit(&self) -> Result<ModelAdmission, muna::MunaError> {
+        let execution = self.execution.enter().await?;
+        let busy = self.lease.as_ref().map(|lease| lease.enter()).transpose()?;
+        Ok(ModelAdmission { _busy: busy, _execution: execution })
+    }
+
+    pub(crate) fn acceleration(&self) -> Acceleration {
+        if self.devices.as_ref().is_some_and(Vec::is_empty) { Acceleration::LocalCpu }
+        else { Acceleration::LocalGpu }
+    }
+
+    pub(crate) fn device_handles(&self) -> Result<Option<Vec<Device>>, muna::MunaError> {
+        Ok(self.devices.as_ref().map(|ids| ids.iter().map(|id| Device::cuda(*id as i32)).collect()))
+    }
+}
+
+/// One loaded engine's execution lifetime, shared by unary and streaming calls.
+#[derive(Default)]
+pub(crate) struct ModelExecution {
+    gate: Arc<tokio::sync::RwLock<()>>,
+    retired: AtomicBool,
+}
+
+impl ModelExecution {
+
+    pub(crate) async fn enter(&self) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, muna::MunaError> {
+        // The only writer retires this assignment. Never queue a second
+        // read behind it while an admitted request already owns a read:
+        // that would prevent both the invocation and retirement progressing.
+        let guard = self.gate.clone().try_read_owned().map_err(|_|
+            muna::MunaError::Native("Model device assignment retiring; retry the request.".into()))?;
+        if self.retired.load(Ordering::Acquire) {
+            return Err(muna::MunaError::Native("Model device assignment retired; retry the request.".into()));
+        }
+        Ok(guard)
+    }
+
+    pub(crate) fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
 }
 
 /// Lifecycle state of one model. Absent-from-map is the implicit fourth
@@ -168,6 +222,8 @@ struct RegistryInner {
     platform: Arc<dyn Platform>,
     /// Priority side of the process-tier-first download ordering.
     download_gate: Arc<DownloadGate>,
+    lease: Option<Arc<LeaseSupervisor>>,
+    policies: PolicyStore,
 }
 
 impl ModelRegistry {
@@ -183,13 +239,41 @@ impl ModelRegistry {
         pinned: Option<HashSet<String>>,
         notifications: Arc<NotificationCenter>,
         platform: Arc<dyn Platform>,
-        download_gate: Arc<DownloadGate>
+        download_gate: Arc<DownloadGate>,
+        lease: Option<Arc<LeaseSupervisor>>,
+        policies: PolicyStore,
+        preparation: PreparationTracker
     ) -> Self {
+        let load_lease = lease.clone();
+        let load_policies = policies.clone();
         let loader: Loader = Arc::new(move |tag, devices, priority| {
             let key = keys.get(&tag).map(|entry| entry.value().clone());
-            Box::pin(async move { load_model(&tag, key, devices, priority).await })
+            let lease = load_lease.clone();
+            let preparation = preparation.clone();
+            let dedicated = load_policies.get(&tag).is_some_and(|p| p.dedicated);
+            Box::pin(async move {
+                let loaded = load_model(&tag, key, devices.clone(), priority, preparation).await?;
+                if let Some(lease) = &lease {
+                    // CPU predictors need no device registration. Managed GPU
+                    // assignments always require an exact Corby group match.
+                    if let Some(assigned) = devices.clone().filter(|ids| !ids.is_empty()).or_else(|| lease.devices_for(&tag)) {
+                        if let Err(error) = lease.configure(&tag, &assigned, dedicated) {
+                            delete_predictor(&loaded.muna, &tag).await;
+                            return Err(error);
+                        }
+                    } else if dedicated {
+                        delete_predictor(&loaded.muna, &tag).await;
+                        return Err("Dedicated predictors must register with Corby.".into());
+                    }
+                }
+                Ok(loaded)
+            })
         });
-        Self::with_loader(loader, devices, pinned, notifications, platform, download_gate)
+        let mut registry = Self::with_loader(loader, devices, pinned, notifications, platform, download_gate);
+        let inner = Arc::get_mut(&mut registry.inner).unwrap();
+        inner.lease = lease;
+        inner.policies = policies;
+        registry
     }
 
     fn with_loader(
@@ -209,7 +293,9 @@ impl ModelRegistry {
                 last_load_secs: AtomicU64::new(DEFAULT_LOAD_SECS),
                 notifications,
                 platform,
-                download_gate
+                download_gate,
+                lease: None,
+                policies: Arc::new(DashMap::new())
             })
         }
     }
@@ -232,7 +318,8 @@ impl ModelRegistry {
             // Map access is synchronous; waiting happens outside the shard lock.
             let mut waiter = match self.inner.models.entry(tag.to_string()) {
                 dashmap::Entry::Occupied(entry) => match &entry.get().state {
-                    ModelState::Ready(model) => return Ok(model.clone()),
+                    ModelState::Ready(model) if !model.execution.is_retired() => return Ok(model.clone()),
+                    ModelState::Ready(_) => return Err(RegistryError::Loading { retry_after: 1 }),
                     ModelState::Failed { error, .. } => {
                         let error = error.clone();
                         entry.remove();
@@ -355,26 +442,35 @@ impl ModelRegistry {
     /// still-loading tag) is a no-op. Unloading a `Loading` tag defers the
     /// delete to the load task (see `Slot::unload_requested`).
     ///
-    /// Two-step teardown: (1) delete the predictor through the model's OWN
-    /// Muna instance (the handle cache is per-instance, so no other client
-    /// can release it), then (2) drop the slot so the per-model `Arc<Muna>`
-    /// itself drops once in-flight predictions holding the `Arc<ReadyModel>`
-    /// finish.
+    /// Retire the assignment, drain native executions, delete through the
+    /// owning Muna client, then free the slot for a replacement engine.
     pub(crate) async fn unload(&self, tag: &str) {
-        if let Some(mut slot) = self.inner.models.get_mut(tag) {
-            if matches!(slot.state, ModelState::Loading { .. }) {
-                slot.unload_requested = true;
-                tracing::info!(tag = %tag, "unload deferred until in-flight load completes");
-                return;
+        let model = {
+            let Some(mut slot) = self.inner.models.get_mut(tag) else { return; };
+            match &slot.state {
+                ModelState::Loading { .. } => {
+                    slot.unload_requested = true;
+                    return;
+                }
+                ModelState::Ready(model) => Some(model.clone()),
+                ModelState::Failed { .. } => None,
             }
-        }
-        let Some((_, slot)) = self.inner.models.remove(tag) else {
+        };
+        let Some(model) = model else {
+            self.inner.models.remove(tag);
+            self.inner.notifications.status_changed();
             return;
         };
-        self.inner.notifications.status_changed();
-        if let ModelState::Ready(model) = slot.state {
-            delete_predictor(&model.muna, tag).await;
+        if model.execution.retired.swap(true, Ordering::AcqRel) {
+            return;
         }
+        self.inner.notifications.status_changed();
+        // Keep the slot occupied until the old engine is gone. Neither a request
+        // nor the next heartbeat can start a second copy during this drain.
+        let _exclusive = model.execution.gate.clone().write_owned().await;
+        delete_predictor(&model.muna, tag).await;
+        self.inner.models.remove(tag);
+        self.inner.notifications.status_changed();
     }
 
     /// Snapshot every slot's state for status reporting.
@@ -400,7 +496,7 @@ impl ModelRegistry {
     /// Tags currently in the `Ready` state.
     pub(crate) fn ready_tags(&self) -> Vec<String> {
         self.inner.models.iter()
-            .filter(|entry| matches!(entry.state, ModelState::Ready(_)))
+            .filter(|entry| matches!(&entry.state, ModelState::Ready(model) if !model.execution.is_retired()))
             .map(|entry| entry.key().clone())
             .collect()
     }
@@ -409,7 +505,7 @@ impl ModelRegistry {
     /// load (unlike `ensure_ready`).
     pub(crate) fn ready(&self, tag: &str) -> Option<Arc<ReadyModel>> {
         self.inner.models.get(tag).and_then(|slot| match &slot.state {
-            ModelState::Ready(model) => Some(model.clone()),
+            ModelState::Ready(model) if !model.execution.is_retired() => Some(model.clone()),
             _ => None,
         })
     }
@@ -471,6 +567,16 @@ impl ModelRegistry {
                     );
                     loaded_muna = Some(muna.clone());
                     ModelState::Ready(Arc::new(ReadyModel {
+                        lease: inner.lease.as_ref().and_then(|supervisor| {
+                            let assigned = supervisor.devices_for(&tag)?;
+                            Some(ModelLease {
+                                supervisor: supervisor.clone(),
+                                label: tag.clone(),
+                                devices: devices.clone().unwrap_or(assigned),
+                                dedicated: inner.policies.get(&tag).is_some_and(|p| p.dedicated),
+                            })
+                        }),
+                        execution: Arc::default(),
                         muna,
                         loaded_at: Instant::now(),
                         plan: BatchPlan::from_signature(&signature),
@@ -498,10 +604,10 @@ impl ModelRegistry {
                 // Removing the slot drops the watch sender; waiters re-read
                 // the map, find it vacant, and re-warm organically if they
                 // still want the model.
-                inner.models.remove(&tag);
                 if let Some(muna) = loaded_muna {
                     delete_predictor(&muna, &tag).await;
                 }
+                inner.models.remove(&tag);
             }
             // Ready, Failed, or gone: all three are reportable transitions.
             inner.notifications.status_changed();
@@ -525,12 +631,19 @@ async fn load_model(
     tag: &str,
     key: Option<String>,
     devices: Option<Vec<u32>>,
-    priority: PriorityGuard
+    priority: PriorityGuard,
+    preparation: PreparationTracker
 ) -> Result<Loaded, String> {
+    if let Some(ids) = &devices {
+        let unique: HashSet<_> = ids.iter().copied().collect();
+        if unique.len() != ids.len() || ids.iter().any(|id| *id > i32::MAX as u32) {
+            return Err("GPU device assignments must contain distinct valid ordinals.".into());
+        }
+    }
     // One Muna instance per model, keyed with the tag's deployment key when
     // the control plane supplied one. The instance persists on `ReadyModel`
     // because it owns the native predictor handle loaded below.
-    let muna = Arc::new(Muna::with_client(Arc::new(ServerClient::with_key(key))));
+    let muna = Arc::new(Muna::with_client(Arc::new(ServerClient::tracking(key, tag, preparation.clone()))));
     // Phase 1, download. The download-only convention (an empty but present
     // inputs map; see cache.rs) localizes every resource without loading an
     // engine. Doing it as its own step keeps the load timing below a pure
@@ -538,6 +651,10 @@ async fn load_model(
     // a disk-resident node finds everything cached and passes through in
     // well under a second. Same acceleration as the load so the resource
     // set is identical.
+    let acceleration = if devices.as_ref().is_some_and(Vec::is_empty) {
+        Acceleration::LocalCpu
+    } else if devices.is_some() { Acceleration::LocalGpu } else { Acceleration::LocalAuto };
+    let download_acceleration = acceleration.clone();
     let download_started = Instant::now();
     let download_muna = muna.clone();
     let download_tag = tag.to_string();
@@ -545,7 +662,7 @@ async fn load_model(
         download_muna.predictions.create(
             &download_tag,
             Some(HashMap::<String, Value>::new()),
-            Some(Acceleration::LocalGpu),
+            Some(download_acceleration),
             None,
             None,
             None,
@@ -555,6 +672,11 @@ async fn load_model(
     if let Some(error) = downloaded.error {
         return Err(error);
     }
+    let required = downloaded.requirements.as_ref().and_then(|r| r.gpu_count).unwrap_or(0);
+    if devices.as_ref().is_some_and(|ids| ids.len() < required as usize) {
+        return Err(format!("Predictor requires {required} GPUs; the assigned device list is insufficient."));
+    }
+    preparation.cached(tag);
     let download = download_started.elapsed();
     let build = build_id(&downloaded);
     // Everything from here is GPU staging from page cache; disk-tier
@@ -575,21 +697,20 @@ async fn load_model(
     // and they are used here as CUDA ordinals. The two agree only while
     // CUDA_VISIBLE_DEVICES is unset and every GPU on the node is the same
     // model (CUDA's fastest-first order then ties back to PCI bus order).
-    let handles = devices.map(|devices| {
-        devices.iter().map(|&index| Device::cuda(index as i32)).collect::<Vec<_>>()
-    });
+    let handles = devices.map(|ids| ids.into_iter().map(|index| Device::cuda(index as i32)).collect::<Vec<_>>());
     predict::run(None, move || async move {
         let inputs = HashMap::from([("_".to_string(), Value::Null)]);
         warm_muna.predictions.create(
             &warm_tag,
             Some(inputs),
-            Some(Acceleration::LocalGpu),
+            Some(acceleration),
             handles.as_deref(),
             None,
             None,
             None
         ).await
-    }).await.map_err(|e| e.to_string())?;
+    }).await.map_err(|e| { preparation.failed(tag, FailureStage::Load); e.to_string() })?;
+    preparation.cached(tag);
     let load = load_started.elapsed();
     let sig_muna = muna.clone();
     let sig_tag = tag.to_string();
@@ -787,9 +908,13 @@ mod tests {
         // Unload while the load is in flight: the delete is deferred to the
         // load task, and the model must not surface as Ready afterwards.
         registry.unload("@test/model").await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !registry.snapshot().is_empty() {
+                assert!(registry.ready_tags().is_empty());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("deferred deletion must finish before the slot is freed");
         assert!(registry.ready_tags().is_empty());
-        assert!(registry.snapshot().is_empty());
         assert_eq!(loads.load(Ordering::SeqCst), 1);
     }
 
@@ -875,6 +1000,7 @@ mod tests {
         });
         let devices: DeviceStore = Arc::new(DashMap::new());
         devices.insert("@test/model".to_string(), vec![4, 5]);
+        devices.insert("@test/cpu".to_string(), vec![]);
         let registry = ModelRegistry::with_loader(
             loader,
             devices,
@@ -889,7 +1015,13 @@ mod tests {
         let model = registry.ensure_ready("@test/model").await.unwrap();
         assert_eq!(model.devices, Some(vec![4, 5]));
         assert_eq!(model.build.as_deref(), Some("abc123"));
+        assert_eq!(model.acceleration(), Acceleration::LocalGpu);
         assert_eq!(*seen.lock().unwrap(), vec![Some(vec![4, 5])]);
+        let cpu = registry.ensure_ready("@test/cpu").await.unwrap();
+        assert_eq!(cpu.devices, Some(vec![]));
+        assert_eq!(cpu.acceleration(), Acceleration::LocalCpu);
+        assert!(cpu.device_handles().unwrap().unwrap().is_empty());
+        assert!(cpu.lease.is_none());
         // Unassigned tags load on the engine default.
         registry.warm("@test/other");
         assert_eq!(registry.devices("@test/other"), Some(None));
@@ -925,4 +1057,25 @@ mod tests {
         assert_eq!(build_id(&local).as_deref(), Some("9f2c41"));
         assert_eq!(build_id(&prediction(vec![resource("bin", "https://cdn/x")])), None);
     }
+    #[tokio::test]
+    async fn device_move_drains_execution_before_allowing_a_replacement() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let registry = registry_with(loads.clone(), false, Duration::ZERO);
+        let model = registry.ensure_ready("@test/move").await.unwrap();
+        let execution = model.execution.enter().await.unwrap();
+        let retiring = registry.clone();
+        let unload = tokio::spawn(async move { retiring.unload("@test/move").await });
+        while !model.execution.is_retired() { tokio::task::yield_now().await; }
+        assert!(!unload.is_finished());
+        assert!(matches!(registry.ensure_ready("@test/move").await, Err(RegistryError::Loading { .. })));
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        let retry = tokio::time::timeout(Duration::from_millis(100), model.execution.enter()).await;
+        assert!(matches!(retry, Ok(Err(_))), "new native admission must not wait behind retirement while a caller owns an admission guard");
+        drop(execution);
+        unload.await.unwrap();
+        assert!(model.execution.enter().await.is_err());
+        registry.ensure_ready("@test/move").await.unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
+
 }

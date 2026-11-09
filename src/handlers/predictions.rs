@@ -30,10 +30,11 @@ use crate::state::AppState;
 /// Prediction request.
 #[derive(Deserialize)]
 pub(crate) struct CreatePredictionRequest {
+    #[serde(flatten)]
+    _device_selection: crate::handlers::body::DeviceSelection,
     /// Predictor tag.
     tag: String,
     /// Prediction inputs keyed by parameter name.
-    #[serde(default)]
     inputs: HashMap<String, RemoteValue>,
     /// Requested acceleration.
     #[serde(default)]
@@ -53,14 +54,16 @@ pub(crate) async fn predictions(
     if state.is_draining() {
         return Err(AppError::unavailable("node is draining".into(), 30));
     }
-    let acceleration = local_acceleration(req.acceleration.as_ref());
     let tag = req.tag;
     // Parse each remote value input into a native value.
     let mut inputs: HashMap<String, Value> = HashMap::with_capacity(req.inputs.len());
     for (name, remote) in &req.inputs {
         inputs.insert(name.clone(), parse_remote_value(remote)?);
     }
-    let model = state.registry.ensure_ready(&tag).await?;
+    let model = state.inference_model(&tag).await?;
+    let acceleration = if model.devices.as_ref().is_some_and(Vec::is_empty) {
+        model.acceleration()
+    } else { local_acceleration(req.acceleration.as_ref()) };
     state.check_in_if_due(&tag).await;
     state.mark_model_loaded(tag.clone()).await;
     if req.stream {
@@ -87,6 +90,7 @@ async fn stream_prediction(
     // the native stream is dropped. Time spent acquiring the guard is this
     // surface's admission wait.
     let admitted = std::time::Instant::now();
+    let _admission = model.admit().await?;
     let guard = state.dispatcher.acquire(&tag, &model).await;
     // Raw frames are opaque, so only time to the first frame is kept; the
     // meter records its sample when the stream state drops.
@@ -97,8 +101,9 @@ async fn stream_prediction(
     );
     let muna = model.muna.clone();
     let stream_tag = tag.clone();
-    let rx = predict::stream(guard, move || async move {
-        muna.predictions.stream(&stream_tag, inputs, Some(acceleration), None).await
+    let devices = model.device_handles()?;
+    let rx = predict::stream_model(model.clone(), guard, move || async move {
+        muna.predictions.stream(&stream_tag, inputs, Some(acceleration), devices.as_deref()).await
     });
     let event_stream = futures_util::stream::unfold(
         (rx, tag, meter),

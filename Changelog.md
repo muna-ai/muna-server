@@ -1,5 +1,6 @@
 ## 0,0,24
-*INCOMPLETE*
++ Added `/v1/audio/transcriptions` endpoint for OpenAI-compatible transcriptions.
++ Upgraded `muna` to 0.0.35.
 
 ## 0.0.23
 + Added `compute_architecture` to heartbeat node status, so the control plane can discover which models have implementations for the node's GPUs.

@@ -29,6 +29,7 @@ use crate::serving::cache::{CacheState, CacheTracker};
 use crate::serving::lease::RegistrantStats;
 use crate::serving::registry::{ModelRegistry, ModelState};
 use crate::state::AppState;
+use crate::serving::preparation::{FailureStage, PreparationFailure, PreparationProgress};
 
 #[derive(Serialize)]
 pub(crate) struct NodeStatus {
@@ -41,6 +42,8 @@ pub(crate) struct NodeStatus {
     pub uptime_s: u64,
     /// Whether the node is rejecting new inference requests.
     pub draining: bool,
+    /// True only when all resident managed engines use cooperative Corby scheduling.
+    pub strict_lease_priority: bool,
     /// Free space in MB on the resource-cache volume. Resources are never
     /// deleted, so this only shrinks; the control plane uses it to stop
     /// placing models on a full node.
@@ -59,6 +62,7 @@ pub(crate) struct NodeStatus {
     /// cached on disk with no engine loaded.
     pub models: Vec<ModelStatus>,
 }
+
 
 /// Lifecycle state of a model on this node -- the ACTUAL half of the
 /// protocol. Serializes as a lowercase string on the wire (`"caching"`,
@@ -118,10 +122,17 @@ pub(crate) struct ModelStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_mode: Option<DispatchMode>,
     /// Resource download progress percentage, when `state` is `caching`.
-    /// Currently always absent: per-tag attribution needs the muna client
-    /// to expose the resource list, which is a later muna-rs change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_pct: Option<u8>,
+    /// This node's complete preparation attempt, never a fleet aggregate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<PreparationProgress>,
+    /// Sanitized failure summary. Detailed diagnostics remain in `error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<PreparationFailure>,
+    /// Resources are complete on disk even when process loading failed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disk_ready: bool,
     /// Number of predictions currently waiting in the model's dispatch queue.
     pub queue_depth: u32,
     /// Total predictions made.
@@ -142,7 +153,7 @@ pub(crate) struct ModelStatus {
     pub vram_mb: Option<u64>,
     /// Device-lease scheduling weight (share of contended GPU time relative
     /// to co-resident models; never a reservation). Present only when the
-    /// model's engine is registered with the process-wide device lease.
+    /// model's engine is registered with the host-owned Corby runtime.
     /// Optional so the control-plane golden-JSON mirror is not broken.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_weight: Option<u32>,
@@ -173,8 +184,8 @@ pub(crate) struct ModelStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_interval_ms_p95: Option<f64>,
     /// GPU ordinals the engine was loaded on, in rank order, as passed to
-    /// the predictor configuration. Absent when the engine picked its own
-    /// devices. Present for `loading` and `ready`.
+    /// the predictor configuration. Ready GPU models always report their
+    /// explicit control-plane assignment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_ids: Option<Vec<u32>>,
     /// Content hash of the loaded build's predictor `dso` resource (its
@@ -216,7 +227,7 @@ pub(crate) struct ModelDescriptor {
     #[serde(default)]
     pub key: Option<String>,
     /// GPU ordinals to load the engine on, in rank order. Absent means
-    /// the engine default. A `process` goal whose devices differ from the
+    /// rejected for `process`; an explicit empty list selects CPU-only execution. A goal whose devices differ from the
     /// loaded engine's triggers an unload and a reload.
     #[serde(default)]
     pub devices: Option<Vec<u32>>,
@@ -233,6 +244,8 @@ pub(crate) struct ModelDescriptor {
 pub(crate) struct LeasePolicy {
     /// Historical revenue per lease-held GPU-second (USD).
     pub value_per_gpu_s: f64,
+    #[serde(default)]
+    pub dedicated: bool,
     /// Floor on the model's share of each contended device, in [0, 1).
     pub min_share: f64,
 }
@@ -291,10 +304,17 @@ impl NodeStatus {
     pub(crate) fn collect(state: &AppState) -> NodeStatus {
         let disk = state.platform.disk_space_mb(&state.cache_path);
         NodeStatus {
-            node_id: state.node.as_ref().map(|n| n.node_id.clone()),
+            node_id: state.mode.node().map(|n| n.node_id.clone()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_s: state.start_time.elapsed().as_secs(),
             draining: state.is_draining(),
+            strict_lease_priority: matches!(&state.mode, crate::state::ServerMode::Managed(_)) &&
+                state.registry.snapshot().iter().all(|(tag, model)| match model {
+                    ModelState::Loading { devices, .. } => devices.as_ref().is_some_and(Vec::is_empty),
+                    ModelState::Ready(model) => model.devices.as_ref()
+                        .is_some_and(|ids| ids.is_empty() || state.lease.supports(tag, ids)),
+                    ModelState::Failed { .. } => true,
+                }),
             disk_free_mb: disk.map(|(free, _)| free),
             disk_total_mb: disk.map(|(_, total)| total),
             compute_architecture: state.compute_architecture.clone(),
@@ -309,7 +329,7 @@ impl NodeStatus {
 }
 
 /// Fold per-registrant lease counters into a per-label view. A TP engine
-/// registers once per rank device; counters sum across devices. Weights
+/// registers one atomic group; expanded counters sum across devices. Weights
 /// are solved per device, so the reported weight is the smallest: the
 /// rank that bounds the engine's lockstep progress.
 fn collect_lease_stats(state: &AppState) -> HashMap<String, RegistrantStats> {
@@ -350,10 +370,13 @@ fn collect_model_status(
                 let telemetry = model.stats.telemetry.summarize().unwrap_or_default();
                 ModelStatus {
                     tag,
-                    state: ModelLifecycle::Ready,
+                    state: if model.execution.is_retired() { ModelLifecycle::Loading } else { ModelLifecycle::Ready },
                     error: None,
                     batch_mode: Some((&model.plan).into()),
                     progress_pct: None,
+                    preparation: None,
+                    failure: None,
+                    disk_ready: true,
                     queue_depth: model.stats.queue_depth.load(Ordering::Relaxed),
                     total_predictions: model.stats.total_predictions.load(Ordering::Relaxed),
                     avg_latency_ms: model.stats.avg_latency_ms(),
@@ -378,6 +401,9 @@ fn collect_model_status(
             }
         })
         .collect();
+    let cached: std::collections::HashSet<_> = cache.snapshot().into_iter()
+        .filter(|(_, state)| matches!(state, CacheState::Cached))
+        .map(|(tag, _)| tag).collect();
     for (tag, state) in cache.snapshot() {
         if statuses.iter().any(|status| status.tag == tag) {
             continue;
@@ -391,7 +417,31 @@ fn collect_model_status(
         };
         statuses.push(status);
     }
+    for status in &mut statuses {
+        if status.build.is_none() { status.build = cache.build(&status.tag); }
+        apply_preparation(status, cache.progress(&status.tag), cache.failure(&status.tag), cached.contains(&status.tag));
+    }
     statuses
+}
+
+
+fn apply_preparation(
+    status: &mut ModelStatus,
+    progress: Option<PreparationProgress>,
+    failure: Option<PreparationFailure>,
+    cached: bool
+) {
+    status.preparation = progress;
+    status.disk_ready |= cached || status.state == ModelLifecycle::Cached ||
+        status.preparation.as_ref().is_some_and(|p| p.stage == crate::serving::preparation::PreparationStage::Cached);
+    status.progress_pct = status.preparation.as_ref().and_then(|p| p.percent());
+    // Process state wins lifecycle precedence, but its failure must not
+    // erase independently achieved disk residency.
+    if status.state == ModelLifecycle::Failed {
+        status.failure = failure.or_else(|| Some(PreparationFailure::new(
+            if status.disk_ready { FailureStage::Load } else { FailureStage::Resolve }
+        )));
+    }
 }
 
 fn empty_status(
@@ -405,6 +455,9 @@ fn empty_status(
         error,
         batch_mode: None,
         progress_pct: None,
+        preparation: None,
+        failure: None,
+        disk_ready: false,
         queue_depth: 0,
         total_predictions: 0,
         avg_latency_ms: 0.0,
@@ -431,6 +484,24 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn load_failure_keeps_disk_readiness_and_preparation_on_the_wire() {
+        use crate::serving::preparation::{PreparationStage, PreparationProgress};
+        let mut status = empty_status("@a/model".into(), ModelLifecycle::Failed, Some("native diagnostics".into()));
+        let progress = PreparationProgress {
+            stage: PreparationStage::Cached, resources_completed: 2, resources_total: Some(2),
+            bytes_available: 100, bytes_total: Some(100), active_resources: vec![],
+        };
+        apply_preparation(&mut status, Some(progress), None, true);
+        let wire = serde_json::to_value(status).unwrap();
+        assert_eq!(wire["state"], "failed");
+        assert_eq!(wire["disk_ready"], true);
+        assert_eq!(wire["progress_pct"], 100);
+        assert_eq!(wire["preparation"]["stage"], "cached");
+        assert_eq!(wire["failure"]["stage"], "load");
+        assert_eq!(wire["failure"]["code"], "predictor_load_failed");
+    }
+
     /// The node's half of `control-plane/tests/protocol.rs`: the same
     /// descriptor JSON the plane's golden test emits must parse here.
     #[test]
@@ -452,7 +523,7 @@ mod tests {
         assert_eq!(process.devices, Some(vec![2, 3]));
         assert_eq!(
             process.policy,
-            Some(LeasePolicy { value_per_gpu_s: 0.0042, min_share: 0.05 })
+            Some(LeasePolicy { dedicated: false, value_per_gpu_s: 0.0042, min_share: 0.05 })
         );
         assert_eq!(response.models[1].devices, None);
         assert_eq!(response.models[1].policy, None);

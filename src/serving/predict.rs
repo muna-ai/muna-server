@@ -103,6 +103,44 @@ where
     rx
 }
 
+/// Run against one immutable loaded assignment; retirement waits for native completion.
+pub(crate) async fn run_model<T, F, Fut>(
+    model: std::sync::Arc<super::registry::ReadyModel>,
+    guard: Guard,
+    op: F
+) -> Result<T, MunaError>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, MunaError>>,
+    T: Send + 'static,
+{
+    run(guard, move || async move {
+        let _execution = model.admit().await?;
+        op().await
+    }).await
+}
+
+pub(crate) fn stream_model<T, F, Fut, S>(
+    model: std::sync::Arc<super::registry::ReadyModel>,
+    guard: Guard,
+    op: F
+) -> tokio::sync::mpsc::Receiver<Result<T, MunaError>>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<S, MunaError>>,
+    S: futures_util::Stream<Item = Result<T, MunaError>>,
+    T: Send + 'static,
+{
+    stream(guard, move || async move {
+        let execution = model.admit().await?;
+        let stream = op().await?;
+        Ok(stream.map(move |item| {
+            let _keep_execution = &execution;
+            item
+        }))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};

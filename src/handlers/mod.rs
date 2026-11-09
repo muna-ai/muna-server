@@ -48,17 +48,19 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/status", get(status::status))
         .route("/drain", post(drain::drain))
         // Muna remote prediction
-        .route("/v1/predictions/remote", post(predictions::predictions).layer(limit()))
+        .route("/v1/predictions", post(predictions::predictions).layer(limit()))
         // OpenAI compatibility
         .route("/v1/models", get(openai::models))
         .route("/v1/models/{*id}", get(openai::model))
         .route("/v1/chat/completions", post(openai::chat_completions).layer(limit()))
         .route("/v1/embeddings", post(openai::embeddings).layer(limit()))
         .route("/v1/images/generations", post(openai::image_generations).layer(limit()))
+        .route("/v1/audio/transcriptions", post(openai::transcriptions).layer(limit()))
         // Anthropic compatibility
         .route("/v1/messages", post(anthropic::messages).layer(limit()))
         // Fallbacks
         .fallback(not_found::not_found)
+        .layer(axum::middleware::from_fn(body::reject_device_headers))
         // Browser clients need CORS when a node is used standalone via
         // `muna deploy` (mirrors OpenAI's `access-control-allow-origin: *`).
         .layer(
@@ -73,4 +75,47 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
                 ])
                 .expose_headers([header::RETRY_AFTER])
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{NodeContext, ServerMode};
+    use std::time::Duration;
+    use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn native_route_needs_no_assignment_header_and_never_loads_managed_models() {
+        let _serial = crate::serving::lease::RUNTIME_TEST_LOCK.lock().unwrap();
+        let state = Arc::new(AppState::new(None, ServerMode::Managed(NodeContext {
+            node_id: "test-node".into(),
+            control_plane_url: "http://127.0.0.1:1".into(),
+            heartbeat_interval: Duration::from_secs(5),
+            kv_flush_interval: Duration::from_secs(1),
+        })).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = router().with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let response = client.post(format!("{base}/v1/predictions"))
+            .json(&serde_json::json!({"tag":"@test/not-loaded", "inputs":{}}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(state.registry.snapshot().is_empty());
+        for endpoint in ["/v1/predictions", "/v1/chat/completions", "/v1/messages"] {
+            let rejected = client.post(format!("{base}{endpoint}"))
+                .header("x-muna-device-ids", "0")
+                .json(&serde_json::json!({"tag":"@test/not-loaded", "inputs":{}}))
+                .send().await.unwrap();
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        }
+        let removed = client.post(format!("{base}/v1/predictions/remote"))
+            .json(&serde_json::json!({"tag":"@test/not-loaded", "inputs":{}}))
+            .send().await.unwrap();
+        assert_eq!(removed.status(), StatusCode::NOT_FOUND);
+        server.abort();
+        let _ = server.await;
+        state.lease.shutdown().unwrap();
+    }
 }

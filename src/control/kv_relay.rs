@@ -64,7 +64,7 @@ const NOT_FOUND_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Supervisor: keeps one relay task alive per Ready model.
 pub(crate) async fn run(state: Arc<AppState>) {
-    let node = state.node.as_ref().expect("kv relay requires node context");
+    let node = state.mode.node().expect("kv relay requires node context");
     let ingest_url = format!(
         "{}/v1/kv/events",
         node.control_plane_url.trim_end_matches('/')
@@ -214,11 +214,11 @@ async fn relay_model(
     ingest_url: String,
     cancel: CancellationToken
 ) {
-    let node_id = state.node.as_ref()
+    let node_id = state.mode.node()
         .map(|n| n.node_id.clone())
         .unwrap_or_default();
     let token = std::env::var("MUNA_SERVER_TOKEN").ok();
-    let flush_interval = state.node.as_ref()
+    let flush_interval = state.mode.node()
         .map(|n| n.kv_flush_interval)
         .unwrap_or(Duration::from_secs(1));
     let http = match reqwest::Client::builder()

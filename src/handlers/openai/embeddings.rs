@@ -9,7 +9,6 @@ use std::time::Instant;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use muna::beta::openai::EncodingFormat;
-use muna::types::Acceleration;
 use serde::Deserialize;
 
 use crate::handlers::error::{AppError, Json};
@@ -19,6 +18,8 @@ use crate::state::AppState;
 
 #[derive(Deserialize)]
 pub(crate) struct EmbeddingsRequest {
+    #[serde(flatten)]
+    _device_selection: crate::handlers::body::DeviceSelection,
     input: EmbeddingsInput,
     model: String,
     dimensions: Option<i32>,
@@ -50,26 +51,29 @@ pub(crate) async fn embeddings(
     }
     let input = req.input.into_vec();
     let encoding_format = parse_encoding_format(req.encoding_format.as_deref())?;
-    let model = state.registry.ensure_ready(&req.model).await?;
+    let model = state.inference_model(&req.model).await?;
     state.check_in_if_due(&req.model).await;
     state.mark_model_loaded(req.model.clone()).await;
     // Time spent acquiring the sequential guard is this surface's
     // admission wait (zero for continuous models).
     let admitted = Instant::now();
+    let _admission = model.admit().await?;
     let guard = state.dispatcher.acquire(&req.model, &model).await;
     let queue_wait = admitted.elapsed();
     let muna = model.muna.clone();
     let tag = req.model;
     let dimensions = req.dimensions;
+    let devices = model.device_handles()?;
+    let acceleration = model.acceleration();
     let dispatched = Instant::now();
-    let response = predict::run(guard, move || async move {
+    let response = predict::run_model(model.clone(), guard, move || async move {
         muna.beta.openai.embeddings.create(
             input,
             &tag,
             dimensions,
             encoding_format,
-            Some(Acceleration::LocalGpu),
-            None
+            Some(acceleration),
+            devices.as_deref()
         ).await
     }).await?;
     model.stats.telemetry.record(PredictionSample {

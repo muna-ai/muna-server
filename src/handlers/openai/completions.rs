@@ -12,7 +12,6 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::{stream, StreamExt};
 use muna::beta::openai::{ChatCompletionChunk, ChatCompletionCreateParams};
-use muna::types::Acceleration;
 
 use crate::handlers::body::ChatBody;
 use crate::handlers::error::{muna_error_value, AppError, Json};
@@ -34,9 +33,10 @@ pub(crate) async fn chat_completions(
     if state.is_draining() {
         return Err(AppError::unavailable("node is draining".into(), 30));
     }
-    let ChatBody { stream: streaming, mut params } = body;
-    params.acceleration = Some(Acceleration::LocalGpu);
-    let model = state.registry.ensure_ready(&params.model).await?;
+    let ChatBody { stream: streaming, mut params, .. } = body;
+    let model = state.inference_model(&params.model).await?;
+    params.acceleration = Some(model.acceleration());
+    params.devices = model.device_handles()?;
     state.check_in_if_due(&params.model).await;
     state.mark_model_loaded(params.model.clone()).await;
     // Before admission, so a slow image host never holds the dispatch guard.
@@ -44,6 +44,7 @@ pub(crate) async fn chat_completions(
     // Time spent acquiring the sequential guard is this surface's
     // admission wait (zero for continuous models).
     let admitted = Instant::now();
+    let _admission = model.admit().await?;
     let guard = state.dispatcher.acquire(&params.model, &model).await;
     let queue_wait = admitted.elapsed();
     let muna = model.muna.clone();
@@ -57,7 +58,7 @@ pub(crate) async fn chat_completions(
         // released once the native stream is dropped; the meter travels
         // with the stream state and records its telemetry sample when the
         // response body drops (stream end or client disconnect).
-        let mut rx = predict::stream(guard, move || async move {
+        let mut rx = predict::stream_model(model.clone(), guard, move || async move {
             muna.beta.openai.chat.completions.stream(params).await
         });
         // Commit the response status on the first item. Failures raised
@@ -100,7 +101,7 @@ pub(crate) async fn chat_completions(
         Ok(Sse::new(event_stream).into_response())
     } else {
         let dispatched = Instant::now();
-        let completion = predict::run(guard, move || async move {
+        let completion = predict::run_model(model.clone(), guard, move || async move {
             muna.beta.openai.chat.completions.create(params).await
         }).await?;
         // Non-streamed chat records `Unary`: whole-response latency has no

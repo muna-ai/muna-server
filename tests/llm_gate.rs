@@ -9,7 +9,7 @@
 //! prefix-cache `cached_tokens`, engine-internal continuous batching, and
 //! the KV relay handshake - driven against the GLM zero-fill tag.
 //! Run with:
-//! `MUNA_LLM_GATE_TAG=<tag> cargo test --test llm_gate -- --ignored`
+//! `MUNA_LLM_GATE_TAG=<tag> MUNA_LLM_GATE_DEVICES=0,1 cargo test --test llm_gate -- --ignored`
 //!
 //! The signature-driven local tier lives in `tests/serving.rs`.
 
@@ -34,6 +34,18 @@ fn gate_tag() -> Option<String> {
             None
         }
     }
+}
+
+/// Physical ordinals for the compiled model's TP group; defaults to one GPU.
+fn gate_devices() -> Vec<u32> {
+    let value = std::env::var("MUNA_LLM_GATE_DEVICES").unwrap_or_else(|_| "0".into());
+    let devices: Vec<u32> = value.split(',').map(|id| {
+        id.trim().parse().expect("MUNA_LLM_GATE_DEVICES must be comma-separated GPU ordinals")
+    }).collect();
+    assert!(!devices.is_empty());
+    assert!(devices.iter().all(|id| *id <= i32::MAX as u32));
+    assert_eq!(devices.iter().collect::<std::collections::HashSet<_>>().len(), devices.len());
+    devices
 }
 
 /// Real engine loads take minutes (weights staging + CUDA graph capture).
@@ -77,7 +89,7 @@ async fn gpu_real_load_chat_and_cached_tokens() {
 
     // Real loading window: the engine takes minutes; a chat that arrives
     // mid-load must 429 with Retry-After.
-    stub.set_residency(&tag, "process");
+    stub.set_process_residency(&tag, &gate_devices());
     wait_for(Duration::from_secs(30), || {
         let client = client.clone();
         let url = format!("{}/status", server.url());
@@ -129,7 +141,7 @@ async fn gpu_concurrent_chats_overlap() {
     let stub = StubControlPlane::start().await;
     let server = ServerGuard::spawn(&stub).await;
     let client = reqwest::Client::new();
-    stub.set_residency(&tag, "process");
+    stub.set_process_residency(&tag, &gate_devices());
     wait_until_ready(&client, &server.url(), &tag).await;
 
     // Baseline single-request latency.
@@ -186,7 +198,7 @@ async fn gpu_kv_relay_snapshot_delta_need_snapshot_unload() {
     let client = reqwest::Client::new();
     // v2: no callback registration -- the relay derives the well-known
     // `/v1/kv/events` ingest route from the control-plane URL by itself.
-    stub.set_residency(&tag, "process");
+    stub.set_process_residency(&tag, &gate_devices());
     wait_until_ready(&client, &server.url(), &tag).await;
 
     // Drive KV traffic so the engine admits blocks.
@@ -261,6 +273,11 @@ async fn gpu_kv_relay_snapshot_delta_need_snapshot_unload() {
     })
     .await
     .expect("unload never completed");
+    let models: Value = client
+        .get(format!("{}/v1/models", server.url()))
+        .send().await.unwrap().json().await.unwrap();
+    assert!(!models["data"].as_array().unwrap().iter().any(|model| model["id"] == json!(tag)),
+        "unloaded model must disappear from /v1/models");
     let count_after_unload = stub.state().kv_batches.len();
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(

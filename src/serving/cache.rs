@@ -27,6 +27,7 @@ use crate::client::ServerClient;
 use crate::notifications::NotificationCenter;
 use crate::serving::download_gate::DownloadGate;
 use crate::serving::predict;
+use crate::serving::preparation::{FailureStage, PreparationFailure, PreparationProgress, PreparationTracker};
 use crate::state::KeyStore;
 
 /// A failed cache attempt is not retried until this backoff elapses, so a
@@ -70,6 +71,7 @@ type Downloader = Arc<
 pub(crate) struct CacheTracker {
     /// Performs the download for one tag.
     downloader: Downloader,
+    preparation: PreparationTracker,
     /// Waiting side of the process-tier-first download ordering.
     download_gate: Arc<DownloadGate>,
     /// Per-tag disk state. Absent-from-map means never requested (or
@@ -85,13 +87,18 @@ impl CacheTracker {
     pub(crate) fn new(
         keys: KeyStore,
         notifications: Arc<NotificationCenter>,
-        download_gate: Arc<DownloadGate>
+        download_gate: Arc<DownloadGate>,
+        preparation: PreparationTracker
     ) -> Self {
+        let progress = preparation.clone();
         let downloader: Downloader = Arc::new(move |tag| {
             let key = keys.get(&tag).map(|entry| entry.value().clone());
-            Box::pin(async move { download_resources(tag, key).await })
+            let progress = progress.clone();
+            Box::pin(async move { download_resources(tag, key, progress).await })
         });
-        Self::with_downloader(downloader, notifications, download_gate)
+        let mut tracker = Self::with_downloader(downloader, notifications, download_gate);
+        tracker.preparation = preparation;
+        tracker
     }
 
     fn with_downloader(
@@ -101,6 +108,7 @@ impl CacheTracker {
     ) -> Self {
         Self {
             downloader,
+            preparation: PreparationTracker::new(notifications.clone()),
             download_gate,
             states: Arc::new(DashMap::new()),
             notifications
@@ -128,6 +136,7 @@ impl CacheTracker {
                 entry.insert(CacheState::Caching);
             }
         }
+        self.preparation.begin(tag);
         self.notifications.status_changed();
         self.spawn_download(tag.to_string(), priority);
     }
@@ -140,6 +149,7 @@ impl CacheTracker {
         let removed = self.states
             .remove_if(tag, |_, state| matches!(state, CacheState::Failed { .. }));
         if removed.is_some() {
+            self.preparation.forget(tag);
             self.notifications.status_changed();
         }
     }
@@ -152,11 +162,24 @@ impl CacheTracker {
             .collect()
     }
 
+    pub(crate) fn build(&self, tag: &str) -> Option<String> {
+        self.preparation.build(tag)
+    }
+
+    pub(crate) fn progress(&self, tag: &str) -> Option<PreparationProgress> {
+        self.preparation.snapshot(tag)
+    }
+
+    pub(crate) fn failure(&self, tag: &str) -> Option<PreparationFailure> {
+        self.preparation.failure(tag)
+    }
+
     fn spawn_download(&self, tag: String, priority: CachePriority) {
         let downloader = self.downloader.clone();
         let states = self.states.clone();
         let notifications = self.notifications.clone();
         let gate = self.download_gate.clone();
+        let progress = self.preparation.clone();
         tokio::spawn(async move {
             if priority == CachePriority::Prefetch {
                 let queued = Instant::now();
@@ -172,6 +195,7 @@ impl CacheTracker {
             let start = Instant::now();
             let state = match downloader(tag.clone()).await {
                 Ok(()) => {
+                    progress.cached(&tag);
                     tracing::info!(
                         tag = %tag,
                         elapsed_ms = %format!("{:.0}", start.elapsed().as_secs_f64() * 1000.0),
@@ -181,6 +205,7 @@ impl CacheTracker {
                 }
                 Err(error) => {
                     tracing::warn!(tag = %tag, error = %error, "cache download failed");
+                    if progress.failure(&tag).is_none() { progress.failed(&tag, FailureStage::Resolve); }
                     CacheState::Failed { error, at: Instant::now() }
                 }
             };
@@ -197,9 +222,10 @@ impl CacheTracker {
 /// outlives this call (unlike the registry's persistent per-model instance).
 async fn download_resources(
     tag: String,
-    key: Option<String>
+    key: Option<String>,
+    progress: PreparationTracker
 ) -> Result<(), String> {
-    let muna = Arc::new(Muna::with_client(Arc::new(ServerClient::with_key(key))));
+    let muna = Arc::new(Muna::with_client(Arc::new(ServerClient::tracking(key, &tag, progress))));
     // Download-only convention: an empty (but present) inputs map makes the
     // muna client create a raw prediction and localize its resources without
     // loading any engine. Acceleration must be a LOCAL flavor: without it

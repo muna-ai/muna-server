@@ -9,10 +9,10 @@
 //!   control plane (v2 protocol: declarative residency goals). Tests mutate
 //!   the goal map directly; the spawned muna-server reconciles against it
 //!   on every heartbeat.
-//! - `ServerGuard`: spawns the real `muna-server` binary against the stub
-//!   and kills it on drop, so panicking tests never leak processes.
+//! - `ServerGuard`: spawns the real `muna-server` binary in standalone mode
+//!   or against the stub, and kills it on drop so tests never leak processes.
 //! - `wait_for`: polling helper used instead of bare sleeps.
-//! - Remote-value helpers for the `/v1/predictions/remote` wire format
+//! - Remote-value helpers for the `/v1/predictions` wire format
 //!   (inline base64 `data:` URLs).
 
 #![allow(dead_code)]
@@ -37,9 +37,9 @@ use serde_json::{json, Value};
 /// Tests mutate these through `StubControlPlane::state()`.
 #[derive(Default)]
 pub struct Directives {
-    /// Goal residency per tag: `"process"` | `"disk"` | `"none"`. An
-    /// absent tag means "no opinion".
-    pub models: std::collections::HashMap<String, String>,
+    /// Full goal descriptors keyed by tag. Process goals include physical
+    /// device IDs; an absent tag means "no opinion".
+    pub models: std::collections::HashMap<String, Value>,
     pub drain: bool,
 }
 
@@ -88,12 +88,23 @@ impl StubControlPlane {
         self.state.lock().unwrap()
     }
 
-    /// Set one tag's goal residency (`"process"` | `"disk"` | `"none"`).
+    /// Set a non-process goal. Process residency must include devices.
     pub fn set_residency(&self, tag: &str, residency: &str) {
-        self.state()
-            .directives
-            .models
-            .insert(tag.to_string(), residency.to_string());
+        assert!(matches!(residency, "disk" | "none"));
+        self.state().directives.models.insert(
+            tag.to_string(),
+            json!({ "tag": tag, "residency": residency }),
+        );
+    }
+
+    /// Preload a managed model on an explicit physical device group.
+    pub fn set_process_residency(&self, tag: &str, devices: &[u32]) {
+        assert!(!devices.is_empty());
+        assert_eq!(devices.iter().collect::<std::collections::HashSet<_>>().len(), devices.len());
+        self.state().directives.models.insert(
+            tag.to_string(),
+            json!({ "tag": tag, "residency": "process", "devices": devices }),
+        );
     }
 
     /// Drop the goal for a tag entirely ("no opinion").
@@ -121,8 +132,8 @@ async fn heartbeat(
     // Wire shape: a flat list of goal descriptors, one per tag.
     let models: Vec<Value> = directives
         .models
-        .iter()
-        .map(|(tag, residency)| json!({ "tag": tag, "residency": residency }))
+        .values()
+        .cloned()
         .collect();
     Json(json!({
         "models": models,
@@ -162,33 +173,48 @@ impl ServerGuard {
         stub: &StubControlPlane,
         node_id: &str
     ) -> Self {
-        Self::spawn_with_options(stub, node_id, &[]).await
+        Self::spawn_with_options(Some((stub, node_id)), &[]).await
     }
 
-    /// Spawn with a pinned model set (`--models`): the tags eager-load at
-    /// boot and any other tag is rejected with 404.
+    /// Spawn a managed server with a pinned model set. The tags only load
+    /// when assigned by residency directives; unlisted tags return 404.
     pub async fn spawn_with_models(
         stub: &StubControlPlane,
         models: &[&str]
     ) -> Self {
-        Self::spawn_with_options(stub, "test-node", models).await
+        Self::spawn_with_options(Some((stub, "test-node")), models).await
+    }
+
+    /// Standalone serving permits lazy loading without device assignments.
+    pub async fn spawn_standalone() -> Self {
+        Self::spawn_with_options(None, &[]).await
+    }
+
+    /// Standalone pinned models eager-load at boot.
+    pub async fn spawn_standalone_with_models(models: &[&str]) -> Self {
+        Self::spawn_with_options(None, models).await
     }
 
     async fn spawn_with_options(
-        stub: &StubControlPlane,
-        node_id: &str,
+        managed: Option<(&StubControlPlane, &str)>,
         models: &[&str]
     ) -> Self {
         let port = ephemeral_port();
         let mut command = Command::new(env!("CARGO_BIN_EXE_muna-server"));
         command
             .arg("--port").arg(port.to_string())
-            .arg("--control-plane-url").arg(stub.url())
-            .arg("--node-id").arg(node_id)
-            .arg("--heartbeat-interval").arg("1")
-            .arg("--kv-flush-interval").arg("1")
+            .env_remove("MUNA_SERVER_CONTROL_PLANE_URL")
+            .env_remove("MUNA_SERVER_ID")
+            .env_remove("MUNA_SERVER_MODELS")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some((stub, node_id)) = managed {
+            command
+                .arg("--control-plane-url").arg(stub.url())
+                .arg("--node-id").arg(node_id)
+                .arg("--heartbeat-interval").arg("1")
+                .arg("--kv-flush-interval").arg("1");
+        }
         if !models.is_empty() {
             command.arg("--models").arg(models.join(","));
         }
@@ -296,7 +322,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// /v1/predictions/remote wire format helpers
+// /v1/predictions wire format helpers
 // ---------------------------------------------------------------------------
 
 fn encode_data_url(buffer: &[u8], mime: &str) -> String {

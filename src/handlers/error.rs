@@ -104,6 +104,16 @@ impl AppError {
         }
     }
 
+    /// Multipart failures use the same envelope and preserve upload size failures.
+    pub(crate) fn multipart(status: StatusCode, message: String) -> Self {
+        let mut error = Self::bad_request(message);
+        if status == StatusCode::PAYLOAD_TOO_LARGE {
+            error.status = status;
+            error.body["error"]["code"] = json!("request_too_large");
+        }
+        error
+    }
+
     /// 503: the node itself cannot serve (draining).
     pub(crate) fn unavailable(message: String, retry_after: u64) -> Self {
         Self {

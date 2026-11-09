@@ -17,6 +17,8 @@ use muna::client::{
 };
 use muna::MunaClient;
 
+use crate::serving::preparation::{FailureStage, PreparationTracker};
+
 /// Muna client for server use: wraps the default [`MunaClient`] and
 /// overrides `download` with per-path single-flight, eventual durability,
 /// and progress presentation (an indicatif bar on a TTY, throttled tracing
@@ -43,6 +45,7 @@ pub(crate) struct ServerClient {
     /// unrelated to CDN traffic, and the durability policy lives with the
     /// caller of `muna::download`, not with `MunaClient`.
     http: reqwest::Client,
+    preparation: Option<(String, PreparationTracker)>,
 }
 
 impl ServerClient {
@@ -57,7 +60,15 @@ impl ServerClient {
         Self {
             inner: MunaClient::new(access_key.as_deref(), url.as_deref()),
             http: cdn_client(),
+            preparation: None,
         }
+    }
+
+    pub(crate) fn tracking(key: Option<String>, tag: &str, tracker: PreparationTracker) -> Self {
+        tracker.begin(tag);
+        let mut client = Self::with_key(key);
+        client.preparation = Some((tag.to_owned(), tracker));
+        client
     }
 }
 
@@ -84,12 +95,35 @@ impl Client for ServerClient {
         self.inner.url()
     }
 
+    fn inference_url(&self) -> &str {
+        self.inner.inference_url()
+    }
+
     fn cache_path(&self) -> &Path {
         self.inner.cache_path()
     }
 
     async fn request(&self, input: RequestInput) -> Result<serde_json::Value> {
-        Client::request(&self.inner, input).await
+        let base = input.base_url.as_deref().unwrap_or(self.url());
+        let resolving = input.path == "/predictions" && input.method == reqwest::Method::POST &&
+            base.trim_end_matches('/') == self.url().trim_end_matches('/') &&
+            self.preparation.as_ref().is_some_and(|(tag, _)|
+                input.body.as_ref().and_then(|body| body.get("tag")).and_then(|tag| tag.as_str()) == Some(tag.as_str()));
+        let response = Client::request(&self.inner, input).await;
+        if resolving {
+            if let Some((tag, tracker)) = &self.preparation {
+                match &response {
+                    Ok(body) => {
+                        let resources = body.get("resources").cloned().unwrap_or(serde_json::json!([]));
+                        if let Ok(resources) = serde_json::from_value::<Vec<muna::types::PredictionResource>>(resources) {
+                            tracker.manifest(tag, self.cache_path(), &resources).await;
+                        }
+                    }
+                    Err(_) => tracker.failed(tag, FailureStage::Resolve),
+                }
+            }
+        }
+        response
     }
 
     async fn stream(&self, input: RequestInput) -> Result<SseStream<serde_json::Value>> {
@@ -112,22 +146,33 @@ impl Client for ServerClient {
             .clone();
         let result = {
             let _guard = lock.lock().await;
-            // A waiter that lost the race finds the file already in place.
-            if tokio::fs::try_exists(path).await.unwrap_or(false) {
+            // All keyed clients observe the same path, including waiters whose
+            // shared resource was downloaded by a different predictor.
+            if let Ok(metadata) = tokio::fs::metadata(path).await {
+                if let Some((_, tracker)) = &self.preparation {
+                    tracker.finished(path, Some(metadata.len()));
+                }
                 Ok(())
-            } else if let Some(callback) = progress {
-                // A caller-provided callback wins over our presentation.
-                self.download_eventual(url, path, callback).await
             } else {
-                let presentation = DownloadProgress::new(path);
-                let callback = {
-                    let presentation = presentation.clone();
-                    Arc::new(move |increment: u64, total: Option<u64>| {
-                        presentation.advance(increment, total)
-                    }) as DownloadProgressFn
-                };
+                if let Some((_, tracker)) = &self.preparation { tracker.started(path); }
+                let presentation = progress.is_none().then(|| DownloadProgress::new(path));
+                let observer = self.preparation.clone();
+                let observed_path = path.to_path_buf();
+                let draw = presentation.clone();
+                let callback = Arc::new(move |increment: u64, total: Option<u64>| {
+                    if let Some((_, tracker)) = &observer { tracker.advance(&observed_path, increment, total); }
+                    if let Some(callback) = &progress { callback(increment, total); }
+                    if let Some(draw) = &draw { draw.advance(increment, total); }
+                }) as DownloadProgressFn;
                 let result = self.download_eventual(url, path, callback).await;
-                presentation.finish(result.is_ok());
+                if let Some(presentation) = presentation { presentation.finish(result.is_ok()); }
+                if let Some((tag, tracker)) = &self.preparation {
+                    let bytes = if result.is_ok() {
+                        tokio::fs::metadata(path).await.ok().map(|m| m.len())
+                    } else { None };
+                    tracker.finished(path, bytes);
+                    if result.is_err() { tracker.failed(tag, FailureStage::Download); }
+                }
                 result
             }
         };
@@ -302,6 +347,7 @@ mod tests {
         ServerClient {
             inner: MunaClient::new(None, None),
             http: cdn_client(),
+            preparation: None,
         }
     }
 
@@ -363,5 +409,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(payload, vec![7u8; 1024]);
         assert_eq!(names, vec![std::ffi::OsString::from("resource.bin")]);
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    use crate::notifications::NotificationCenter;
+    use crate::serving::preparation::PreparationStage;
+
+    #[tokio::test]
+    async fn manifests_are_observed_before_downloads_and_sidecar_resolutions_do_not_replace_them() {
+        use axum::routing::post;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route("/predictions", post(|| async {
+            axum::Json(serde_json::json!({ "resources": [
+                { "type": "dso", "url": "https://cdn.example/resources/progress-test-unique?signature=secret", "size": 100 }
+            ] }))
+        }));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let tracker = PreparationTracker::new(Arc::new(NotificationCenter::default()));
+        let mut client = ServerClient::tracking(None, "@a/main", tracker.clone());
+        client.inner = MunaClient::new(None, Some(&url));
+        Client::request(&client, RequestInput::post("/predictions").body(serde_json::json!({"tag":"@a/sidecar"}))).await.unwrap();
+        assert!(tracker.snapshot("@a/main").unwrap().resources_total.is_none());
+        Client::request(&client, RequestInput::post("/predictions").body(serde_json::json!({"tag":"@a/main"}))).await.unwrap();
+        let progress = tracker.snapshot("@a/main").unwrap();
+        assert_eq!(progress.resources_total, Some(1));
+        assert_eq!(progress.bytes_total, Some(100));
+        assert_eq!(progress.stage, PreparationStage::Downloading);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn supplied_callbacks_do_not_disable_tracking_and_waiters_observe_the_same_file() {
+        use std::sync::atomic::AtomicUsize;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/resource", listener.local_addr().unwrap());
+        let request_hits = hits.clone();
+        let app = axum::Router::new().route("/resource", axum::routing::get(move || {
+            let hits = request_hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                vec![7u8; 1024]
+            }
+        }));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = std::env::temp_dir().join(format!("muna-progress-download-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("resource");
+        let tracker = PreparationTracker::new(Arc::new(NotificationCenter::default()));
+        let resource = muna::types::PredictionResource { kind: "dso".into(), url: url.clone(), name: None, size: Some(1024) };
+        tracker.manifest("a", &root, &[resource.clone()]).await;
+        tracker.manifest("b", &root, &[resource]).await;
+        let a = ServerClient::tracking(None, "a", tracker.clone());
+        let b = ServerClient::tracking(None, "b", tracker.clone());
+        let callback_bytes = Arc::new(AtomicU64::new(0));
+        let observed = callback_bytes.clone();
+        let callback: DownloadProgressFn = Arc::new(move |bytes, _| { observed.fetch_add(bytes, Ordering::Relaxed); });
+        let (first, second) = tokio::join!(Client::download(&a, &url, &path, Some(callback)), Client::download(&b, &url, &path, None));
+        first.unwrap(); second.unwrap();
+        assert_eq!(callback_bytes.load(Ordering::Relaxed), 1024);
+        for tag in ["a", "b"] {
+            let progress = tracker.snapshot(tag).unwrap();
+            assert_eq!(progress.resources_completed, 1);
+            assert_eq!(progress.bytes_available, 1024);
+            assert!(progress.active_resources.is_empty());
+        }
+        let downloaded_hits = hits.load(Ordering::SeqCst);
+        Client::download(&b, &url, &path, None).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), downloaded_hits);
+        task.abort();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolution_and_download_failures_are_structured_and_sanitized() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::FORBIDDEN });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let tracker = PreparationTracker::new(Arc::new(NotificationCenter::default()));
+        let mut client = ServerClient::tracking(None, "a", tracker.clone());
+        client.inner = MunaClient::new(None, Some(&base));
+        assert!(Client::request(&client, RequestInput::post("/predictions").body(serde_json::json!({"tag":"a"}))).await.is_err());
+        assert_eq!(tracker.failure("a").unwrap().stage, FailureStage::Resolve);
+        let path = std::env::temp_dir().join(format!("muna-progress-failed-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(Client::download(&client, &format!("{base}/resource?signature=secret"), &path, None).await.is_err());
+        let failure = tracker.failure("a").unwrap();
+        assert_eq!(failure.stage, FailureStage::Download);
+        assert!(failure.retrying);
+        assert!(!serde_json::to_string(&failure).unwrap().contains("secret"));
+        task.abort();
     }
 }

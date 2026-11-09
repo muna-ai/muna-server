@@ -13,7 +13,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::stream;
 use muna::beta::anthropic::{MessageCreateParams, RawMessageStreamEvent};
-use muna::types::Acceleration;
 
 use crate::handlers::body::ChatBody;
 use crate::handlers::error::{
@@ -41,9 +40,10 @@ pub(crate) async fn messages(
     if state.is_draining() {
         return Err(AppError::unavailable("node is draining".into(), 30).into());
     }
-    let ChatBody { stream: streaming, mut params } = body;
-    params.acceleration = Some(Acceleration::LocalGpu);
-    let model = state.registry.ensure_ready(&params.model).await?;
+    let ChatBody { stream: streaming, mut params, .. } = body;
+    let model = state.inference_model(&params.model).await?;
+    params.acceleration = Some(model.acceleration());
+    params.devices = model.device_handles()?;
     state.check_in_if_due(&params.model).await;
     state.mark_model_loaded(params.model.clone()).await;
     // Before admission, so a slow image host never holds the dispatch guard.
@@ -51,6 +51,7 @@ pub(crate) async fn messages(
     // Time spent acquiring the sequential guard is this surface's
     // admission wait (zero for continuous models).
     let admitted = Instant::now();
+    let _admission = model.admit().await?;
     let guard = state.dispatcher.acquire(&params.model, &model).await;
     let queue_wait = admitted.elapsed();
     let muna = model.muna.clone();
@@ -62,7 +63,7 @@ pub(crate) async fn messages(
         );
         // The guard rides with the pump onto the blocking thread and is
         // released once the native stream is dropped.
-        let mut rx = predict::stream(guard, move || async move {
+        let mut rx = predict::stream_model(model.clone(), guard, move || async move {
             muna.beta.anthropic.messages.stream(params).await
         });
         // Commit the response status on the first item. Failures raised
@@ -109,7 +110,7 @@ pub(crate) async fn messages(
         Ok(Sse::new(event_stream).into_response())
     } else {
         let dispatched = Instant::now();
-        let message = predict::run(guard, move || async move {
+        let message = predict::run_model(model.clone(), guard, move || async move {
             muna.beta.anthropic.messages.create(params).await
         }).await?;
         // Non-streamed messages record `Unary`: whole-response latency has

@@ -20,7 +20,7 @@ mod platform;
 mod serving;
 mod state;
 
-use state::{AppState, NodeContext};
+use state::{AppState, NodeContext, ServerMode};
 
 /// How long in-flight requests get to finish after the first signal.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -74,8 +74,8 @@ async fn main() {
 }
 
 async fn serve(cli: &Cli) -> Result<(), String> {
-    let node = match (&cli.control_plane_url, &cli.node_id) {
-        (Some(url), Some(node_id)) => Some(NodeContext {
+    let mode = match (&cli.control_plane_url, &cli.node_id) {
+        (Some(url), Some(node_id)) => ServerMode::Managed(NodeContext {
             node_id: node_id.clone(),
             control_plane_url: url.clone(),
             heartbeat_interval: Duration::from_secs(cli.heartbeat_interval.max(1)),
@@ -84,7 +84,7 @@ async fn serve(cli: &Cli) -> Result<(), String> {
         (Some(_), None) => {
             return Err("--control-plane-url requires --node-id".into());
         }
-        _ => None,
+        _ => ServerMode::Standalone,
     };
     // There is no process-wide Muna client: the registry builds one keyed
     // ServerClient-backed instance per loaded model (see ReadyModel::muna).
@@ -93,7 +93,7 @@ async fn serve(cli: &Cli) -> Result<(), String> {
     } else {
         Some(cli.models.iter().cloned().collect())
     };
-    let state = Arc::new(AppState::new(pinned, node));
+    let state = Arc::new(AppState::new(pinned, mode)?);
     // Warm the platform driver off the runtime thread: a cold driver load
     // under disk pressure can take seconds, and the listener must bind
     // regardless. Fail-soft: the engine's own init still works without it.
@@ -124,19 +124,19 @@ async fn serve(cli: &Cli) -> Result<(), String> {
     }
     // Eager load: fire-and-forget warms so the port binds immediately;
     // mid-load requests get 429 + Retry-After.
-    for tag in &cli.models {
+    for tag in cli.models.iter().filter(|_| matches!(&state.mode, ServerMode::Standalone)) {
         tracing::info!(tag = %tag, "eager-loading pinned model");
         state.registry.warm(tag);
     }
     // Background loops exit when `state.shutdown` is cancelled; the tracker
     // lets shutdown wait for them (the heartbeat's final report included).
     let loops = TaskTracker::new();
-    if state.node.is_some() {
+    if matches!(&state.mode, ServerMode::Managed(_)) {
         loops.spawn(control::heartbeat::run(state.clone()));
         loops.spawn(control::kv_relay::run(state.clone()));
         tracing::info!("control-plane mode: heartbeat + KV relay enabled");
     }
-    // Co-resident NanoSGL engines arbitrate GPU time through the device lease
+    // Co-resident NanoSGL engines attach to the host-owned Corby runtime.
     loops.spawn(serving::lease_weights::run(state.clone()));
     loops.close();
     tokio::spawn(watch_signals(state.clone()));
@@ -165,6 +165,19 @@ async fn serve(cli: &Cli) -> Result<(), String> {
     }
     if tokio::time::timeout(LOOP_SHUTDOWN_TIMEOUT, loops.wait()).await.is_err() {
         tracing::warn!("background loops did not exit in time");
+    }
+    // Withdraw predictor registrations before stopping their coordinator.
+    let unload = async {
+        for (tag, _) in state.registry.snapshot() {
+            state.registry.unload(&tag).await;
+        }
+    };
+    if tokio::time::timeout(DRAIN_TIMEOUT, unload).await.is_err() {
+        tracing::warn!("predictor unload exceeded shutdown deadline");
+    }
+    if let Err(error) = state.lease.shutdown() {
+        // Busy runtimes stay pinned; never revoke a lease from native work.
+        tracing::warn!(%error, "Corby runtime retained while engines drain");
     }
     Ok(())
 }

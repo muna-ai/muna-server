@@ -3,7 +3,11 @@
 CPU-only fake predictors that impersonate model signatures so
 `tests/serving.rs` can exercise muna-server's full serving path
 (HTTP handler -> registry -> dispatcher -> muna FFI -> compiled binary)
-without a GPU or real weights. Each script's `EXPLAINER` docstring
+without a GPU or real weights. These predictors run in standalone mode;
+managed GPU loading is exercised by `tests/llm_gate.rs` with
+`MUNA_LLM_GATE_DEVICES` (comma-separated physical ordinals, default `0`).
+Managed loading-authority checks use the stub control plane without loading
+CPU predictors as GPU models. Each script's `EXPLAINER` docstring
 documents the contract it satisfies and the Rust tests that consume it.
 
 | Script | Tag | Probes |

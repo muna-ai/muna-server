@@ -14,6 +14,8 @@ use serde::Deserialize;
 /// control plane's router sidecar) with no server change.
 #[derive(Deserialize)]
 pub(crate) struct ChatBody<T> {
+    #[serde(flatten)]
+    _device_selection: DeviceSelection,
     /// Whether to stream the response as server-sent events.
     #[serde(default)]
     pub stream: bool,
@@ -27,6 +29,27 @@ mod tests {
     use super::*;
     use muna::beta::anthropic::{MessageCreateParams, ThinkingConfig};
     use muna::beta::openai::{ChatCompletionCreateParams, ChatCompletionReasoningEffort};
+
+    #[test]
+    fn inference_device_fields_are_rejected_even_when_null() {
+        for key in ["devices", "device_ids"] {
+            for value in [serde_json::json!([0]), serde_json::Value::Null] {
+                let mut chat = serde_json::json!({
+                    "model": "@a/x", "messages": [{"role": "user", "content": "hi"}]
+                });
+                chat[key] = value.clone();
+                assert!(serde_json::from_value::<ChatBody<ChatCompletionCreateParams>>(chat.clone()).is_err());
+                chat["max_tokens"] = serde_json::json!(8);
+                assert!(serde_json::from_value::<ChatBody<MessageCreateParams>>(chat).is_err());
+                let mut raw = serde_json::json!({"tag": "@a/x", "inputs": {}});
+                raw[key] = value.clone();
+                assert!(serde_json::from_value::<crate::handlers::predictions::CreatePredictionRequest>(raw).is_err());
+                let mut embedding = serde_json::json!({"model": "@a/x", "input": "hi"});
+                embedding[key] = value.clone();
+                assert!(serde_json::from_value::<DeviceSelection>(embedding).is_err());
+            }
+        }
+    }
 
     #[test]
     fn openai_body_forwards_sampling_and_reasoning_knobs() {
@@ -87,4 +110,30 @@ mod tests {
         }));
         assert!(missing.is_err());
     }
+}
+
+
+/// Device assignment is loader policy in both managed and standalone mode.
+#[derive(Default, Deserialize)]
+pub(crate) struct DeviceSelection {
+    #[serde(default, rename = "devices", deserialize_with = "reject_devices")]
+    _devices: (),
+    #[serde(default, rename = "device_ids", deserialize_with = "reject_devices")]
+    _device_ids: (),
+}
+
+fn reject_devices<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(serde::de::Error::custom("Device selection is not supported on inference requests; devices are assigned when loading the model."))
+}
+
+pub(crate) async fn reject_device_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if request.method() == axum::http::Method::POST && request.uri().path().starts_with("/v1/") &&
+        request.headers().contains_key("x-muna-device-ids") {
+        return super::error::AppError::bad_request("Device selection is not supported on inference requests.".into()).into_response();
+    }
+    next.run(request).await
 }

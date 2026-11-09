@@ -207,6 +207,7 @@ fn policy_for(
     label: &str
 ) -> LeasePolicy {
     let default = LeasePolicy {
+        dedicated: false,
         value_per_gpu_s: DEFAULT_VALUE,
         min_share: DEFAULT_MIN_SHARE,
     };
@@ -214,6 +215,7 @@ fn policy_for(
         return default;
     };
     LeasePolicy {
+        dedicated: policy.dedicated,
         value_per_gpu_s: if policy.value_per_gpu_s.is_finite() {
             policy.value_per_gpu_s.max(0.0)
         } else {
@@ -257,8 +259,15 @@ pub(crate) async fn run(state: Arc<AppState>) {
                 (stat.device, stat.label.clone(), input)
             })
             .collect();
+        // Corby grants a TP group atomically and gives it one common weight.
+        // Use the bottleneck share, rather than whichever device was last.
+        let mut groups: HashMap<&str, (i32, f64)> = HashMap::new();
         for ((device, label, _), share) in inputs.iter().zip(plan_shares(&inputs)) {
-            state.lease.set_weight_on(*device, label, weight(share));
+            groups.entry(label).and_modify(|(_, minimum)| *minimum = minimum.min(share))
+                .or_insert((*device, share));
+        }
+        for (label, (device, share)) in groups {
+            state.lease.set_weight_on(device, label, weight(share));
         }
     }
 }
