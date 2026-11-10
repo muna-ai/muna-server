@@ -16,6 +16,7 @@ pub(crate) mod lease;
 pub(crate) mod lease_weights;
 pub(crate) mod predict;
 pub(crate) mod preparation;
+pub(crate) mod prepared;
 pub(crate) mod registry;
 pub(crate) mod remote_images;
 pub(crate) mod stats;

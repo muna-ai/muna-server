@@ -20,13 +20,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use muna::types::{Acceleration, Value};
-use muna::Muna;
 
-use crate::client::ServerClient;
 use crate::notifications::NotificationCenter;
 use crate::serving::download_gate::DownloadGate;
-use crate::serving::predict;
+use crate::serving::prepared::PreparedModels;
 use crate::serving::preparation::{FailureStage, PreparationFailure, PreparationProgress, PreparationTracker};
 use crate::state::KeyStore;
 
@@ -72,6 +69,7 @@ pub(crate) struct CacheTracker {
     /// Performs the download for one tag.
     downloader: Downloader,
     preparation: PreparationTracker,
+    prepared: PreparedModels,
     /// Waiting side of the process-tier-first download ordering.
     download_gate: Arc<DownloadGate>,
     /// Per-tag disk state. Absent-from-map means never requested (or
@@ -90,16 +88,20 @@ impl CacheTracker {
         keys: KeyStore,
         notifications: Arc<NotificationCenter>,
         download_gate: Arc<DownloadGate>,
-        preparation: PreparationTracker
+        preparation: PreparationTracker,
+        prepared: PreparedModels
     ) -> Self {
         let progress = preparation.clone();
+        let models = prepared.clone();
         let downloader: Downloader = Arc::new(move |tag| {
             let key = keys.get(&tag).map(|entry| entry.value().clone());
             let progress = progress.clone();
-            Box::pin(async move { download_resources(tag, key, progress).await })
+            let models = models.clone();
+            Box::pin(async move { models.prepare(&tag, key, progress).await.map(|_| ()) })
         });
         let mut tracker = Self::with_downloader(downloader, notifications, download_gate);
         tracker.preparation = preparation;
+        tracker.prepared = prepared;
         tracker
     }
 
@@ -111,6 +113,7 @@ impl CacheTracker {
         Self {
             downloader,
             preparation: PreparationTracker::new(notifications.clone()),
+            prepared: PreparedModels::default(),
             download_gate,
             states: Arc::new(DashMap::new()),
             downloads: Arc::default(),
@@ -154,6 +157,7 @@ impl CacheTracker {
         }
         self.states.remove(tag);
         self.preparation.forget(tag);
+        self.prepared.forget(tag);
         self.notifications.status_changed();
     }
 
@@ -219,39 +223,6 @@ impl CacheTracker {
             states.insert(tag, state);
             notifications.status_changed();
         })
-    }
-}
-
-/// Localize a tag's resources through the download-only prediction.
-///
-/// Ephemeral keyed instance per download: the download-only prediction
-/// localizes resources without loading a native predictor, so no handle
-/// outlives this call (unlike the registry's persistent per-model instance).
-async fn download_resources(
-    tag: String,
-    key: Option<String>,
-    progress: PreparationTracker
-) -> Result<(), String> {
-    let muna = Arc::new(Muna::with_client(Arc::new(ServerClient::tracking(key, &tag, progress))));
-    // Download-only convention: an empty (but present) inputs map makes the
-    // muna client create a raw prediction and localize its resources without
-    // loading any engine. Acceleration must be a LOCAL flavor: without it
-    // the API resolves the tag as a remote predictor, which compiled models
-    // do not have.
-    let prediction = predict::run(None, move || async move {
-        muna.predictions.create(
-            &tag,
-            Some(HashMap::<String, Value>::new()),
-            Some(Acceleration::LocalAuto),
-            None,
-            None,
-            None,
-            None
-        ).await
-    }).await.map_err(|e| e.to_string())?;
-    match prediction.error {
-        Some(error) => Err(error),
-        None => Ok(())
     }
 }
 

@@ -22,6 +22,7 @@ use crate::serving::download_gate::DownloadGate;
 use crate::serving::lease::LeaseSupervisor;
 use crate::serving::registry::ModelRegistry;
 use crate::serving::preparation::PreparationTracker;
+use crate::serving::prepared::PreparedModels;
 use crate::serving::remote_images::ImageFetcher;
 
 /// Per-tag deployment keys delivered by control-plane residency directives
@@ -147,6 +148,7 @@ impl AppState {
         let cache_path = MunaClient::new(None, None).cache_path().to_path_buf();
         let notifications = Arc::new(NotificationCenter::default());
         let preparation = PreparationTracker::new(notifications.clone());
+        let prepared = PreparedModels::default();
         let platform = platform::detect();
         let compute_architecture = match muna::c::Configuration::get_compute_architecture() {
             Ok(architecture) => architecture,
@@ -169,13 +171,15 @@ impl AppState {
                 download_gate.clone(),
                 Some(lease.clone()),
                 policies.clone(),
-                preparation.clone()
+                preparation.clone(),
+                prepared.clone()
             ),
             cache: CacheTracker::new(
                 keys.clone(),
                 notifications.clone(),
                 download_gate,
-                preparation
+                preparation,
+                prepared
             ),
             dispatcher: Dispatcher::new(),
             lease,

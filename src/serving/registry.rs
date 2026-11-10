@@ -20,7 +20,7 @@ use dashmap::DashMap;
 use muna::types::{Acceleration, Device, Prediction, Signature, Value};
 use muna::Muna;
 
-use crate::client::ServerClient;
+use crate::serving::prepared::PreparedModels;
 use crate::serving::preparation::{FailureStage, PreparationTracker};
 use crate::platform::Platform;
 use crate::notifications::NotificationCenter;
@@ -242,7 +242,8 @@ impl ModelRegistry {
         download_gate: Arc<DownloadGate>,
         lease: Option<Arc<LeaseSupervisor>>,
         policies: PolicyStore,
-        preparation: PreparationTracker
+        preparation: PreparationTracker,
+        prepared: PreparedModels
     ) -> Self {
         let load_lease = lease.clone();
         let load_policies = policies.clone();
@@ -250,9 +251,10 @@ impl ModelRegistry {
             let key = keys.get(&tag).map(|entry| entry.value().clone());
             let lease = load_lease.clone();
             let preparation = preparation.clone();
+            let prepared = prepared.clone();
             let dedicated = load_policies.get(&tag).is_some_and(|p| p.dedicated);
             Box::pin(async move {
-                let loaded = load_model(&tag, key, devices.clone(), priority, preparation).await?;
+                let loaded = load_model(&tag, key, devices.clone(), priority, preparation, prepared).await?;
                 if let Some(lease) = &lease {
                     // CPU predictors need no device registration. Managed GPU
                     // assignments always require an exact Corby group match.
@@ -516,7 +518,7 @@ impl ModelRegistry {
     }
 
     /// Spawn the single-flight warmup: sentinel prediction (reaches the
-    /// engine's `load_predictor`), then signature fetch and plan derivation.
+    /// engine's `load_predictor`), then plan derivation from its prepared signature.
     ///
     /// Callers invoke this synchronously right after inserting the
     /// `Loading` slot, so the download-gate guard taken here exists before
@@ -632,7 +634,8 @@ async fn load_model(
     key: Option<String>,
     devices: Option<Vec<u32>>,
     priority: PriorityGuard,
-    preparation: PreparationTracker
+    preparation: PreparationTracker,
+    prepared: PreparedModels
 ) -> Result<Loaded, String> {
     if let Some(ids) = &devices {
         let unique: HashSet<_> = ids.iter().copied().collect();
@@ -640,45 +643,25 @@ async fn load_model(
             return Err("GPU device assignments must contain distinct valid ordinals.".into());
         }
     }
-    // One Muna instance per model, keyed with the tag's deployment key when
-    // the control plane supplied one. The instance persists on `ReadyModel`
-    // because it owns the native predictor handle loaded below.
-    let muna = Arc::new(Muna::with_client(Arc::new(ServerClient::tracking(key, tag, preparation.clone()))));
-    // Phase 1, download. The download-only convention (an empty but present
-    // inputs map; see cache.rs) localizes every resource without loading an
-    // engine. Doing it as its own step keeps the load timing below a pure
-    // cold start: a node that has never seen the tag pays the fetch here,
-    // a disk-resident node finds everything cached and passes through in
-    // well under a second. Same acceleration as the load so the resource
-    // set is identical.
     let acceleration = if devices.as_ref().is_some_and(Vec::is_empty) {
         Acceleration::LocalCpu
     } else if devices.is_some() { Acceleration::LocalGpu } else { Acceleration::LocalAuto };
-    let download_acceleration = acceleration.clone();
+    // A completed disk preparation already localized the resources and fetched
+    // the signature. Reuse that keyed client; native loading below still owns
+    // token validation and refresh through the SDK's persistent cache.
     let download_started = Instant::now();
-    let download_muna = muna.clone();
-    let download_tag = tag.to_string();
-    let downloaded = predict::run(None, move || async move {
-        download_muna.predictions.create(
-            &download_tag,
-            Some(HashMap::<String, Value>::new()),
-            Some(download_acceleration),
-            None,
-            None,
-            None,
-            None
-        ).await
-    }).await.map_err(|e| e.to_string())?;
-    if let Some(error) = downloaded.error {
-        return Err(error);
-    }
+    let prepared = prepared.prepare(tag, key, preparation.clone()).await?;
+    // A fresh service owns exactly this engine's handles; the shared prepared
+    // snapshot retains only its HTTP transport and cannot extend engine life.
+    let muna = Arc::new(Muna::with_client(prepared.client.clone()));
+    let downloaded = &prepared.prediction;
     let required = downloaded.requirements.as_ref().and_then(|r| r.gpu_count).unwrap_or(0);
     if devices.as_ref().is_some_and(|ids| ids.len() < required as usize) {
         return Err(format!("Predictor requires {required} GPUs; the assigned device list is insufficient."));
     }
     preparation.cached(tag);
     let download = download_started.elapsed();
-    let build = build_id(&downloaded);
+    let build = build_id(downloaded);
     // Everything from here is GPU staging from page cache; disk-tier
     // prefetch may start writing again. (An `Err` above drops the guard on
     // the way out, so failures release it too.)
@@ -712,13 +695,7 @@ async fn load_model(
     }).await.map_err(|e| { preparation.failed(tag, FailureStage::Load); e.to_string() })?;
     preparation.cached(tag);
     let load = load_started.elapsed();
-    let sig_muna = muna.clone();
-    let sig_tag = tag.to_string();
-    let predictor = predict::run(None, move || async move {
-        sig_muna.predictors.retrieve(&sig_tag).await
-    }).await.map_err(|e| e.to_string())?;
-    let predictor = predictor.ok_or_else(|| format!("predictor {tag} not found"))?;
-    Ok(Loaded { signature: predictor.signature, muna, download, load, build })
+    Ok(Loaded { signature: prepared.signature.clone(), muna, download, load, build })
 }
 
 /// Content hash of a prediction's build: the URL path stem of its last
