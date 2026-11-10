@@ -113,7 +113,7 @@ async fn boot_health_status_heartbeats() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn drain_directive_and_endpoint() {
+async fn drain_directive_and_undrain() {
     let stub = StubControlPlane::start().await;
     let server = ServerGuard::spawn(&stub).await;
     let client = reqwest::Client::new();
@@ -152,14 +152,28 @@ async fn drain_directive_and_endpoint() {
     })
     .await
     .expect("un-drain did not take effect");
+}
 
-    // The local /drain endpoint flips the same flag.
+#[tokio::test(flavor = "multi_thread")]
+async fn standalone_drain_endpoint() {
+    // Managed heartbeats authoritatively set the drain flag, so a stub sending
+    // drain=false can undo /drain before its status is observed. Exercise the
+    // local endpoint without a competing control-plane directive.
+    let server = ServerGuard::spawn_standalone().await;
+    let client = reqwest::Client::new();
+    let status_url = format!("{}/status", server.url());
     let response = client
         .post(format!("{}/drain", server.url()))
         .send().await.unwrap();
     assert_eq!(response.status(), 200);
     let status: Value = client.get(&status_url).send().await.unwrap().json().await.unwrap();
     assert_eq!(status["draining"], json!(true));
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.url()))
+        .json(&json!({ "model": TAG_CHAT, "messages": [] }))
+        .send().await.unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(response.headers().contains_key("Retry-After"));
 }
 
 /// Managed inference may neither eager-load pinned models nor lazy-load on a
