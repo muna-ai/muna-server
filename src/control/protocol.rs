@@ -204,9 +204,8 @@ pub(crate) enum Residency {
     Process,
     /// Resources complete on disk; no engine. The few-second-coldstart tier.
     Disk,
-    /// No residency guarantee: engine unloaded; disk eviction PERMITTED
-    /// but not required (node-local GC under disk pressure decides --
-    /// preserves the "resources are never deleted" behavior for now).
+    /// Retire the engine and stop reporting the model. Cached resource files
+    /// remain on disk for reuse by future deployments.
     None,
 }
 

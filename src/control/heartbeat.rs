@@ -223,14 +223,14 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
                 state.cache.ensure_cached(tag, CachePriority::Prefetch);
             }
             Residency::None => {
-                // Engine out. Disk eviction is PERMITTED but not required;
-                // genuinely cached resources stay (and keep reporting
-                // `cached`) until node-local GC under disk pressure exists.
-                // A failed cache record, by contrast, is forgotten: nothing
-                // is on disk, so there is nothing to keep reporting.
+                // Retirement only drops logical residency. Content-addressed
+                // resources remain available for a future deployment.
                 state.dispatcher.remove(tag);
                 state.registry.unload(tag).await;
-                state.cache.forget_failed(tag);
+                state.cache.forget(tag);
+                state.keys.remove(tag);
+                state.devices.remove(tag);
+                state.policies.remove(tag);
             }
         }
     }

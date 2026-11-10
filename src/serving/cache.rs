@@ -16,7 +16,7 @@
 //! principle).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -75,9 +75,11 @@ pub(crate) struct CacheTracker {
     /// Waiting side of the process-tier-first download ordering.
     download_gate: Arc<DownloadGate>,
     /// Per-tag disk state. Absent-from-map means never requested (or
-    /// forgotten after a failure); shared with the download tasks, which
+    /// retired by the control plane); shared with the download tasks, which
     /// write the terminal `Cached` / `Failed` state on completion.
     states: Arc<DashMap<String, CacheState>>,
+    /// Serializes task completion with retirement so late downloads cannot reannounce tags.
+    downloads: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// Poked on every tier write so the heartbeat reports it at once.
     notifications: Arc<NotificationCenter>,
 }
@@ -111,6 +113,7 @@ impl CacheTracker {
             preparation: PreparationTracker::new(notifications.clone()),
             download_gate,
             states: Arc::new(DashMap::new()),
+            downloads: Arc::default(),
             notifications
         }
     }
@@ -120,6 +123,7 @@ impl CacheTracker {
     /// only after backoff. `Prefetch` requests queue behind in-flight
     /// process-tier downloads; `Immediate` ones start at once.
     pub(crate) fn ensure_cached(&self, tag: &str, priority: CachePriority) {
+        let mut downloads = self.downloads.lock().unwrap();
         match self.states.entry(tag.to_string()) {
             dashmap::Entry::Occupied(mut entry) => {
                 match entry.get() {
@@ -138,20 +142,19 @@ impl CacheTracker {
         }
         self.preparation.begin(tag);
         self.notifications.status_changed();
-        self.spawn_download(tag.to_string(), priority);
+        let task = self.spawn_download(tag.to_string(), priority);
+        downloads.insert(tag.to_string(), task);
     }
 
-    /// Drop a failed cache record (nothing was achieved on disk, so there
-    /// is nothing truthful to keep reporting). `Cached` records are kept:
-    /// the resources genuinely are on disk, and the plane's placement wants
-    /// to see that even under a `none` goal.
-    pub(crate) fn forget_failed(&self, tag: &str) {
-        let removed = self.states
-            .remove_if(tag, |_, state| matches!(state, CacheState::Failed { .. }));
-        if removed.is_some() {
-            self.preparation.forget(tag);
-            self.notifications.status_changed();
+    /// Stop advertising a tag without deleting its content-addressed files.
+    pub(crate) fn forget(&self, tag: &str) {
+        let mut downloads = self.downloads.lock().unwrap();
+        if let Some(task) = downloads.remove(tag) {
+            task.abort();
         }
+        self.states.remove(tag);
+        self.preparation.forget(tag);
+        self.notifications.status_changed();
     }
 
     /// Snapshot every tracked tag for status reporting.
@@ -174,7 +177,8 @@ impl CacheTracker {
         self.preparation.failure(tag)
     }
 
-    fn spawn_download(&self, tag: String, priority: CachePriority) {
+    fn spawn_download(&self, tag: String, priority: CachePriority) -> tokio::task::JoinHandle<()> {
+        let downloads = self.downloads.clone();
         let downloader = self.downloader.clone();
         let states = self.states.clone();
         let notifications = self.notifications.clone();
@@ -193,7 +197,9 @@ impl CacheTracker {
                 }
             }
             let start = Instant::now();
-            let state = match downloader(tag.clone()).await {
+            let result = downloader(tag.clone()).await;
+            let mut downloads = downloads.lock().unwrap();
+            let state = match result {
                 Ok(()) => {
                     progress.cached(&tag);
                     tracing::info!(
@@ -209,9 +215,10 @@ impl CacheTracker {
                     CacheState::Failed { error, at: Instant::now() }
                 }
             };
+            downloads.remove(&tag);
             states.insert(tag, state);
             notifications.status_changed();
-        });
+        })
     }
 }
 
@@ -316,6 +323,80 @@ mod tests {
         tracker.ensure_cached("@a/process", CachePriority::Immediate);
         assert!(wait_until(&tracker, "@a/process", |s| matches!(s, CacheState::Cached)).await);
         assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn forgetting_cached_tag_keeps_files_and_allows_readmission() {
+        let file = std::env::temp_dir().join(format!("muna-cache-retirement-{}", std::process::id()));
+        std::fs::write(&file, b"cached resource").unwrap();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let tracker = tracker(starts.clone(), Arc::new(DownloadGate::new()));
+        tracker.ensure_cached("@a/x", CachePriority::Immediate);
+        assert!(wait_until(&tracker, "@a/x", |s| matches!(s, CacheState::Cached)).await);
+        tracker.preparation.manifest("@a/x", file.parent().unwrap(), &[
+            muna::types::PredictionResource {
+                kind: "dso".into(),
+                url: format!("https://cdn.example/resources/{}", file.file_name().unwrap().to_str().unwrap()),
+                name: None,
+                size: Some(15),
+            }
+        ]).await;
+        assert!(tracker.build("@a/x").is_some());
+        assert_eq!(tracker.progress("@a/x").unwrap().resources_completed, 1);
+        tracker.forget("@a/x");
+        assert!(tracker.snapshot().is_empty());
+        assert!(tracker.progress("@a/x").is_none());
+        assert!(tracker.build("@a/x").is_none());
+        assert_eq!(std::fs::read(&file).unwrap(), b"cached resource");
+        tracker.ensure_cached("@a/x", CachePriority::Immediate);
+        assert!(wait_until(&tracker, "@a/x", |s| matches!(s, CacheState::Cached)).await);
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[tokio::test]
+    async fn forgetting_queued_download_prevents_reannouncement() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(DownloadGate::new());
+        let tracker = tracker(starts.clone(), gate.clone());
+        let priority = gate.enter_priority();
+        tracker.ensure_cached("@a/x", CachePriority::Prefetch);
+        tracker.forget("@a/x");
+        drop(priority);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(tracker.snapshot().is_empty());
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn forgetting_inflight_download_cancels_completion() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let downloader: Downloader = {
+            let started = started.clone();
+            let completed = completed.clone();
+            let release = release.clone();
+            Arc::new(move |_| {
+                let started = started.clone();
+                let completed = completed.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        };
+        let tracker = CacheTracker::with_downloader(downloader, Arc::new(NotificationCenter::default()), Arc::new(DownloadGate::new()));
+        tracker.ensure_cached("@a/x", CachePriority::Immediate);
+        started.notified().await;
+        tracker.forget("@a/x");
+        release.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(tracker.snapshot().is_empty());
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
