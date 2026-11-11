@@ -78,7 +78,7 @@ pub(crate) async fn image_generations(
     Ok(Json(response).into_response())
 }
 
-fn parse_size(value: Option<&str>) -> Result<Option<ImageSize>, AppError> {
+pub(super) fn parse_size(value: Option<&str>) -> Result<Option<ImageSize>, AppError> {
     match value {
         None                => Ok(None),
         Some("auto")        => Ok(None),

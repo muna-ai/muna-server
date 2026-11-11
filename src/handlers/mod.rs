@@ -55,6 +55,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/v1/chat/completions", post(openai::chat_completions).layer(limit()))
         .route("/v1/embeddings", post(openai::embeddings).layer(limit()))
         .route("/v1/images/generations", post(openai::image_generations).layer(limit()))
+        .route("/v1/images/edits", post(openai::image_edits).layer(limit()))
         .route("/v1/audio/transcriptions", post(openai::transcriptions).layer(limit()))
         // Anthropic compatibility
         .route("/v1/messages", post(anthropic::messages).layer(limit()))

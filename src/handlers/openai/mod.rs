@@ -9,12 +9,14 @@
 
 mod completions;
 mod embeddings;
+mod image_edits;
 mod images;
 mod models;
 mod transcriptions;
 
 pub(super) use completions::chat_completions;
 pub(super) use embeddings::embeddings;
+pub(super) use image_edits::image_edits;
 pub(super) use images::image_generations;
 pub(super) use models::{model, models};
 pub(super) use transcriptions::transcriptions;

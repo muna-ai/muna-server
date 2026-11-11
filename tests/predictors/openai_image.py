@@ -37,8 +37,8 @@ image = Image.open(BytesIO(image_response.content))
 )
 def image_model(
     prompt: Annotated[
-        list[str],
-        Parameter.Generic(description="Text descriptions of the desired images.")
+        str,
+        Parameter.Generic(description="Text description of the desired image.")
     ],
     *,
     width: Annotated[int, Annotations.ImageWidth(
@@ -64,8 +64,8 @@ def image_model(
     Fake model compatible with the OpenAI Images API.
     """
     resized_image = image.resize((width, height))
-    return [resized_image] * (num_images * len(prompt))
+    return [resized_image] * num_images
 
 if __name__ == "__main__":
-    results = image_model(["image of a dog"])
+    results = image_model("image of a dog")
     results[0].show()
