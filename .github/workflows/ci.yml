@@ -26,6 +26,12 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
 
+      - name: Install native crash reporter build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libunwind-dev zlib1g-dev autoconf automake libtool
+          python3 -m pip install cmake==3.28.3
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
@@ -35,3 +41,8 @@ jobs:
 
       - name: Test
         run: cargo test --locked --target "$TARGET"
+
+      - name: Verify panic and fatal-signal reports in isolated subprocesses
+        run: |
+          cargo build --locked --target "$TARGET" --example crash_probe
+          python3 tests/check_crash_reporting.py "target/$TARGET/debug/examples/crash_probe"

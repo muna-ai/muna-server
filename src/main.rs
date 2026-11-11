@@ -14,6 +14,7 @@ use tokio_util::task::TaskTracker;
 
 mod client;
 mod control;
+mod crash_reporting;
 mod handlers;
 mod notifications;
 mod platform;
@@ -57,8 +58,18 @@ struct Cli {
     models: Vec<String>,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    crash_reporting::run_reporter_if_requested();
+    crash_reporting::install();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(crash_reporting::register_thread)
+        .build()
+        .expect("could not build Tokio runtime")
+        .block_on(async_main());
+}
+
+async fn async_main() {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(

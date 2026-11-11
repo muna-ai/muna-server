@@ -23,6 +23,12 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
 
+      - name: Install native crash reporter build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libunwind-dev zlib1g-dev autoconf automake libtool
+          python3 -m pip install cmake==3.28.3
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 

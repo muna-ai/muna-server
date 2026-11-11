@@ -1,5 +1,6 @@
 ## 0.0.29
-*INCOMPLETE*
++ Added crash reporting.
++ Updated `/v1/images/edits` to accept JSON payload.
 
 ## 0.0.28
 + Added `/v1/images/edits` OpenAI-compatible image editing endpoint.

@@ -23,7 +23,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use futures_util::{stream, StreamExt};
 use muna::beta::anthropic::{ContentBlockParam, ImageSource, MessageContent, MessageCreateParams};
-use muna::beta::openai::{ChatCompletionContent, ChatCompletionContentPart, ChatCompletionCreateParams};
+use muna::beta::openai::{
+    ChatCompletionContent, ChatCompletionContentPart, ChatCompletionCreateParams,
+};
 use muna::MunaError;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect::Policy;
@@ -99,7 +101,7 @@ impl ImageFetcher {
     /// `data:` URLs. `data:` URLs are left untouched.
     pub(crate) async fn inline_openai(
         &self,
-        params: &mut ChatCompletionCreateParams
+        params: &mut ChatCompletionCreateParams,
     ) -> Result<(), MunaError> {
         let mut targets: Vec<&mut String> = params
             .messages
@@ -111,7 +113,10 @@ impl ImageFetcher {
             .flatten()
             .filter_map(|part| match part {
                 ChatCompletionContentPart::ImageUrl { image_url }
-                    if !image_url.url.starts_with("data:") => Some(&mut image_url.url),
+                    if !image_url.url.starts_with("data:") =>
+                {
+                    Some(&mut image_url.url)
+                }
                 _ => None,
             })
             .collect();
@@ -131,7 +136,7 @@ impl ImageFetcher {
     /// rewritten; muna-rs rejects images anywhere else.
     pub(crate) async fn inline_anthropic(
         &self,
-        params: &mut MessageCreateParams
+        params: &mut MessageCreateParams,
     ) -> Result<(), MunaError> {
         let mut targets: Vec<&mut ImageSource> = params
             .messages
@@ -143,7 +148,10 @@ impl ImageFetcher {
             .flatten()
             .filter_map(|block| match block {
                 ContentBlockParam::Image { source }
-                    if matches!(source, ImageSource::Url { .. }) => Some(source),
+                    if matches!(source, ImageSource::Url { .. }) =>
+                {
+                    Some(source)
+                }
                 _ => None,
             })
             .collect();
@@ -168,15 +176,12 @@ impl ImageFetcher {
     }
 
     /// Fetch images concurrently, in order, within the per-request budget.
-    async fn fetch_all(
-        &self,
-        urls: Vec<String>
-    ) -> Result<Vec<FetchedImage>, MunaError> {
+    async fn fetch_all(&self, urls: Vec<String>) -> Result<Vec<FetchedImage>, MunaError> {
         let mut fetches = stream::iter(urls)
             .map(|url| async move {
-                self.fetch(&url).await.map_err(|reason| MunaError::InvalidInput(
-                    format!("Failed to fetch image at {url}: {reason}")
-                ))
+                self.fetch(&url).await.map_err(|reason| {
+                    MunaError::InvalidInput(format!("Failed to fetch image at {url}: {reason}"))
+                })
             })
             .buffered(MAX_CONCURRENT_FETCHES);
         let mut images = Vec::new();
@@ -195,10 +200,63 @@ impl ImageFetcher {
         Ok(images)
     }
 
+    /// Resolve editing inputs in order, with the same network restrictions as chat.
+    /// Data URLs share the per-image and total decoded-byte limits with remote images.
+    pub(crate) async fn resolve_images(&self, urls: Vec<String>) -> Result<Vec<Vec<u8>>, String> {
+        let mut inputs = stream::iter(urls)
+            .map(|url| async move {
+                if let Some(data) = url.strip_prefix("data:") {
+                    let (header, encoded) =
+                        data.split_once(',').ok_or("Malformed image data URL.")?;
+                    if !header.starts_with("image/") || !header.ends_with(";base64") {
+                        return Err("Expected a base64 image data URL.".to_owned());
+                    }
+                    if encoded.len() > self.max_image_bytes.div_ceil(3) * 4 {
+                        return Err("Image exceeds the per-image byte limit.".to_owned());
+                    }
+                    let bytes = BASE64
+                        .decode(encoded)
+                        .map_err(|_| "Invalid base64 image data.".to_owned())?;
+                    if bytes.is_empty() || bytes.len() > self.max_image_bytes {
+                        return Err(
+                            "Image is empty or exceeds the per-image byte limit.".to_owned()
+                        );
+                    }
+                    Ok(bytes)
+                } else {
+                    let image = self
+                        .fetch(&url)
+                        .await
+                        .map_err(|reason| format!("Failed to fetch input image: {reason}"))?;
+                    if image.data.is_empty() {
+                        return Err("Image is empty.".to_owned());
+                    }
+                    Ok(image.data)
+                }
+            })
+            .buffered(MAX_CONCURRENT_FETCHES);
+        let mut images = Vec::new();
+        let mut total = 0;
+        while let Some(image) = inputs.next().await {
+            let image = image?;
+            total += image.len();
+            if total > MAX_TOTAL_BYTES {
+                return Err("Images exceed the 64 MB total byte limit per request.".to_owned());
+            }
+            images.push(image);
+        }
+        Ok(images)
+    }
+
     async fn fetch(&self, url: &str) -> Result<FetchedImage, String> {
         let url = Url::parse(url).map_err(|e| format!("invalid URL ({e})"))?;
         check_url(&url, self.allow_private)?;
-        let mut response = self.http.get(url).send().await.map_err(|e| error_chain(&e))?;
+        let mut response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| error_chain(&e))?;
         if !response.status().is_success() {
             return Err(format!("server responded with {}", response.status()));
         }
@@ -212,8 +270,16 @@ impl ImageFetcher {
         if !mime.starts_with("image/") {
             return Err(format!("content type `{mime}` is not an image"));
         }
-        let too_large = || format!("image exceeds the {} MB limit", self.max_image_bytes / (1024 * 1024));
-        if response.content_length().is_some_and(|length| length > self.max_image_bytes as u64) {
+        let too_large = || {
+            format!(
+                "image exceeds the {} MB limit",
+                self.max_image_bytes / (1024 * 1024)
+            )
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.max_image_bytes as u64)
+        {
             return Err(too_large());
         }
         let mut data = Vec::new();
@@ -231,7 +297,6 @@ impl ImageFetcher {
 struct PublicResolver;
 
 impl Resolve for PublicResolver {
-
     fn resolve(&self, name: Name) -> Resolving {
         Box::pin(async move {
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host((name.as_str(), 0))
@@ -239,7 +304,9 @@ impl Resolve for PublicResolver {
                 .filter(|addr| is_public_ip(addr.ip()))
                 .collect();
             if addrs.is_empty() {
-                return Err(format!("{} does not resolve to a public address", name.as_str()).into());
+                return Err(
+                    format!("{} does not resolve to a public address", name.as_str()).into(),
+                );
             }
             Ok(Box::new(addrs.into_iter()) as Addrs)
         })
@@ -248,17 +315,19 @@ impl Resolve for PublicResolver {
 
 /// Accept `http` / `https` URLs whose host is a hostname (checked at
 /// resolution) or a public IP literal.
-fn check_url(
-    url: &Url,
-    allow_private: bool
-) -> Result<(), String> {
+fn check_url(url: &Url, allow_private: bool) -> Result<(), String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("unsupported URL scheme `{}`", url.scheme()));
     }
     let host = url.host_str().ok_or("URL has no host")?;
-    let literal = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>();
+    let literal = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>();
     match literal {
-        Ok(ip) if !allow_private && !is_public_ip(ip) => Err(format!("{ip} is not a public address")),
+        Ok(ip) if !allow_private && !is_public_ip(ip) => {
+            Err(format!("{ip} is not a public address"))
+        }
         _ => Ok(()),
     }
 }
@@ -279,7 +348,8 @@ fn is_public_ip(ip: IpAddr) -> bool {
                 (s[0] & 0xfe00) == 0xfc00               ||  // unique local fc00::/7
                 (s[0] & 0xffc0) == 0xfe80               ||  // link-local fe80::/10
                 (s[0] == 0x2001 && s[1] == 0x0db8)      ||  // documentation 2001:db8::/32
-                (s[0] == 0x0064 && s[1] == 0xff9b)          // NAT64 64:ff9b::/96 can embed private IPv4
+                (s[0] == 0x0064 && s[1] == 0xff9b)
+                // NAT64 64:ff9b::/96 can embed private IPv4
             )
         }
     }
@@ -299,7 +369,8 @@ fn is_public_ipv4(ip: Ipv4Addr) -> bool {
         (a == 192 && b == 0 && (c == 0 || c == 2)) ||  // protocol assignments, TEST-NET-1
         (a == 198 && (b & 0xfe) == 18)          ||  // benchmarking 198.18/15
         (a == 198 && b == 51 && c == 100)       ||  // TEST-NET-2
-        (a == 203 && b == 0 && c == 113)            // TEST-NET-3
+        (a == 203 && b == 0 && c == 113)
+        // TEST-NET-3
     )
 }
 
@@ -333,19 +404,32 @@ mod tests {
     async fn serve() -> String {
         let png = BASE64.decode(RED_PNG_B64).unwrap();
         let big = vec![0u8; 4096];
-        let app = Router::new()
-            .route("/red.png", get(move || async move {
-                ([(header::CONTENT_TYPE, "image/png")], png).into_response()
-            }))
-            .route("/big.png", get(move || async move {
-                ([(header::CONTENT_TYPE, "image/png")], big).into_response()
-            }))
-            .route("/page.html", get(|| async {
-                ([(header::CONTENT_TYPE, "text/html")], "<html></html>").into_response()
-            }))
-            .route("/missing.png", get(|| async { StatusCode::NOT_FOUND }))
-            .route("/redirect", get(|| async { Redirect::temporary("/red.png") }))
-            .route("/loop", get(|| async { Redirect::temporary("/loop") }));
+        let app =
+            Router::new()
+                .route(
+                    "/red.png",
+                    get(move || async move {
+                        ([(header::CONTENT_TYPE, "image/png")], png).into_response()
+                    }),
+                )
+                .route(
+                    "/big.png",
+                    get(move || async move {
+                        ([(header::CONTENT_TYPE, "image/png")], big).into_response()
+                    }),
+                )
+                .route(
+                    "/page.html",
+                    get(|| async {
+                        ([(header::CONTENT_TYPE, "text/html")], "<html></html>").into_response()
+                    }),
+                )
+                .route("/missing.png", get(|| async { StatusCode::NOT_FOUND }))
+                .route(
+                    "/redirect",
+                    get(|| async { Redirect::temporary("/red.png") }),
+                )
+                .route("/loop", get(|| async { Redirect::temporary("/loop") }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -359,11 +443,15 @@ mod tests {
 
     fn openai_params(urls: &[String]) -> ChatCompletionCreateParams {
         let mut parts = vec![json!({ "type": "text", "text": "describe" })];
-        parts.extend(urls.iter().map(|url| json!({ "type": "image_url", "image_url": { "url": url } })));
+        parts.extend(
+            urls.iter()
+                .map(|url| json!({ "type": "image_url", "image_url": { "url": url } })),
+        );
         serde_json::from_value(json!({
             "model": "@a/x",
             "messages": [{ "role": "user", "content": parts }],
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn image_urls(params: &ChatCompletionCreateParams) -> Vec<String> {
@@ -379,17 +467,69 @@ mod tests {
             .collect()
     }
 
+    #[tokio::test]
+    async fn editing_resolves_mixed_inputs_in_order_and_rejects_bad_data() {
+        let base = serve().await;
+        let urls = vec![
+            "data:image/png;base64,Zmlyc3Q=".to_owned(),
+            format!("{base}/red.png"),
+        ];
+        let result = test_fetcher().resolve_images(urls).await.unwrap();
+        assert_eq!(result[0], b"first");
+        assert_eq!(result[1], BASE64.decode(RED_PNG_B64).unwrap());
+        for url in [
+            "data:image/png;base64,%%%",
+            "data:image/png;base64,",
+            "data:text/plain;base64,Zmlyc3Q=",
+            "data:image/png,raw",
+            "file:///etc/passwd",
+            "http://169.254.169.254/metadata",
+        ] {
+            assert!(
+                ImageFetcher::new()
+                    .resolve_images(vec![url.to_owned()])
+                    .await
+                    .is_err(),
+                "{url}"
+            );
+        }
+        let too_big = format!("data:image/png;base64,{}", BASE64.encode(vec![0; 1025]));
+        assert!(test_fetcher().resolve_images(vec![too_big]).await.is_err());
+    }
+
     #[test]
     fn classifies_public_and_private_addresses() {
-        for ip in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"] {
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "2606:4700:4700::1111",
+            "::ffff:8.8.8.8",
+        ] {
             assert!(is_public_ip(ip.parse().unwrap()), "{ip}");
         }
         for ip in [
-            "0.0.0.0", "10.0.0.1", "127.0.0.1", "100.64.0.1", "169.254.169.254",
-            "172.16.0.1", "172.31.255.255", "192.168.1.1", "192.0.2.1", "198.18.0.1",
-            "224.0.0.1", "255.255.255.255", "::", "::1", "::ffff:127.0.0.1",
-            "::ffff:169.254.169.254", "fc00::1", "fd12::1", "fe80::1", "2001:db8::1",
-            "64:ff9b::a00:1", "ff02::1"
+            "0.0.0.0",
+            "10.0.0.1",
+            "127.0.0.1",
+            "100.64.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "192.0.2.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "fc00::1",
+            "fd12::1",
+            "fe80::1",
+            "2001:db8::1",
+            "64:ff9b::a00:1",
+            "ff02::1",
         ] {
             assert!(!is_public_ip(ip.parse().unwrap()), "{ip}");
         }
@@ -412,11 +552,19 @@ mod tests {
     async fn public_fetcher_refuses_loopback() {
         let base = serve().await;
         let fetcher = ImageFetcher::new();
-        let error = fetcher.fetch(&format!("{base}/red.png")).await.err().unwrap();
+        let error = fetcher
+            .fetch(&format!("{base}/red.png"))
+            .await
+            .err()
+            .unwrap();
         assert!(error.contains("not a public address"), "{error}");
         // Hostnames go through the resolver, which drops loopback.
         let port = base.rsplit(':').next().unwrap();
-        let error = fetcher.fetch(&format!("http://localhost:{port}/red.png")).await.err().unwrap();
+        let error = fetcher
+            .fetch(&format!("http://localhost:{port}/red.png"))
+            .await
+            .err()
+            .unwrap();
         assert!(error.contains("public address"), "{error}");
     }
 
@@ -462,7 +610,8 @@ mod tests {
                 { "type": "image", "source": { "type": "url", "url": format!("{base}/red.png") } },
                 { "type": "text", "text": "what is this?" }
             ] }],
-        })).unwrap();
+        }))
+        .unwrap();
         test_fetcher().inline_anthropic(&mut params).await.unwrap();
         let MessageContent::Blocks(blocks) = &params.messages[0].content else {
             panic!("expected blocks content");

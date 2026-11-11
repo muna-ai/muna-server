@@ -44,4 +44,5 @@ objc2-metal = "0.3"
 opt-level = 2
 lto = true
 codegen-units = 1
-strip = true
+debug = 1
+strip = false
