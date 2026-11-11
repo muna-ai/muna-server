@@ -1,3 +1,6 @@
+## 0.0.29
+*INCOMPLETE*
+
 ## 0.0.28
 + Added `/v1/images/edits` OpenAI-compatible image editing endpoint.
 + Upgraded `muna` to 0.0.37.
