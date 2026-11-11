@@ -1,5 +1,5 @@
 ## 0.0.30
-*INCOMPLETE*
++ Upgraded `muna` to 0.0.38.
 
 ## 0.0.29
 + Added crash reporting.

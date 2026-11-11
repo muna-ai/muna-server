@@ -1188,9 +1188,9 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "muna"
-version = "0.0.37"
+version = "0.0.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34312f668e8f88b811e591840c18d5cd1e77d4f20494702128d9e89dc8d85f8d"
+checksum = "f908ca24716f8e5b4733093a2cbc5e39490e6ff10d87588db4d509e68e708334"
 dependencies = [
  "async-stream",
  "async-trait",

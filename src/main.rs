@@ -15,6 +15,8 @@ use tokio_util::task::TaskTracker;
 mod client;
 mod control;
 mod crash_reporting;
+#[cfg(feature = "crash-reporting-tests")]
+mod crash_reporting_tests;
 mod handlers;
 mod notifications;
 mod platform;
@@ -151,7 +153,12 @@ async fn serve(cli: &Cli) -> Result<(), String> {
     loops.spawn(serving::lease_weights::run(state.clone()));
     loops.close();
     tokio::spawn(watch_signals(state.clone()));
-    let app = handlers::router().with_state(state.clone());
+    let app = {
+        let router = handlers::router();
+        #[cfg(feature = "crash-reporting-tests")]
+        let router = router.merge(crash_reporting_tests::router());
+        router.with_state(state.clone())
+    };
     // Bind listener
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
     let listener = tokio::net::TcpListener::bind(addr)
