@@ -1,3 +1,6 @@
+## 0.0.30
+*INCOMPLETE*
+
 ## 0.0.29
 + Added crash reporting.
 + Updated `/v1/images/edits` to accept JSON payload.
