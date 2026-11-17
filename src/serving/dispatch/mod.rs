@@ -214,6 +214,7 @@ impl Dispatcher {
                                 devices.as_deref(),
                                 None,
                                 None,
+                                None,
                                 None
                             ).await;
                             stats.record_latency(start.elapsed());
@@ -257,6 +258,7 @@ impl Dispatcher {
                 devices.as_deref(),
                 None,
                 None,
+                None,
                 None
             ).await;
             let latency = start.elapsed();
@@ -289,6 +291,7 @@ mod tests {
             muna: Arc::new(Muna::new(None, None)),
             loaded_at: Instant::now(),
             signature: Signature { inputs: vec![], outputs: vec![] },
+            adapters: crate::serving::adapters::Adapters::new(Signature { inputs: vec![], outputs: vec![] }),
             plan,
             stats: Arc::new(ModelStats::new()),
             devices: None,

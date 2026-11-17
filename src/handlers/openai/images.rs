@@ -8,7 +8,8 @@ use std::time::Instant;
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use muna::beta::openai::{ImageCreateParams, ImageSize};
+use muna::beta::adapters::{Adapter, OpenAIImageOptions};
+use muna::beta::openai::ImageSize;
 use serde::Deserialize;
 
 use crate::handlers::error::{AppError, Json};
@@ -29,7 +30,8 @@ pub(crate) struct ImageGenerationsRequest {
     #[serde(default)]
     output_format: Option<String>,
     #[serde(default)]
-    background: Option<String>,
+    #[serde(rename = "background")]
+    _background: Option<String>,
     #[serde(default)]
     output_compression: Option<i32>,
 }
@@ -52,22 +54,38 @@ pub(crate) async fn image_generations(
     let _admission = model.admit().await?;
     let guard = state.dispatcher.acquire(&req.model, &model).await;
     let queue_wait = admitted.elapsed();
-    let params = ImageCreateParams {
-        prompt: req.prompt,
-        model: req.model,
-        background: req.background,
-        n: req.n,
-        output_format: req.output_format,
-        output_compression: req.output_compression,
-        size,
-        acceleration: Some(model.acceleration()),
-        devices: model.device_handles()?,
-    };
+    let adapter = model.adapters.images()?;
+    let (width, height) = size.unwrap_or(ImageSize::Auto).dimensions();
+    let inputs = adapter.inputs(req.prompt, req.n, width, height);
+    let devices = model.device_handles()?;
+    let acceleration = model.acceleration();
     let muna = model.muna.clone();
     let dispatched = Instant::now();
     let response = predict::run_model(model.clone(), guard, move || async move {
-        muna.beta.openai.images.generate(params).await
-    }).await?;
+        let prediction = muna
+            .predictions
+            .create(
+                &req.model,
+                Some(inputs),
+                Some(acceleration),
+                devices.as_deref(),
+                None,
+                None,
+                None,
+                Some(true),
+            )
+            .await?;
+        adapter
+            .adapt(
+                prediction,
+                Some(OpenAIImageOptions {
+                    output_format: req.output_format.unwrap_or_else(|| "png".into()),
+                    output_compression: req.output_compression,
+                }),
+            )
+            .await
+    })
+    .await?;
     let images = response.data.as_ref().map_or(0, |data| data.len()) as u32;
     model.stats.telemetry.record(PredictionSample {
         at: Instant::now(),
@@ -80,15 +98,15 @@ pub(crate) async fn image_generations(
 
 pub(super) fn parse_size(value: Option<&str>) -> Result<Option<ImageSize>, AppError> {
     match value {
-        None                => Ok(None),
-        Some("auto")        => Ok(None),
-        Some("256x256")     => Ok(Some(ImageSize::Size256x256)),
-        Some("512x512")     => Ok(Some(ImageSize::Size512x512)),
-        Some("1024x1024")   => Ok(Some(ImageSize::Size1024x1024)),
-        Some("1536x1024")   => Ok(Some(ImageSize::Size1536x1024)),
-        Some("1024x1536")   => Ok(Some(ImageSize::Size1024x1536)),
-        Some("1792x1024")   => Ok(Some(ImageSize::Size1792x1024)),
-        Some("1024x1792")   => Ok(Some(ImageSize::Size1024x1792)),
-        Some(value)   => Err(AppError::bad_request(format!("unsupported size `{value}`"))),
+        None => Ok(None),
+        Some("auto") => Ok(None),
+        Some("256x256") => Ok(Some(ImageSize::Size256x256)),
+        Some("512x512") => Ok(Some(ImageSize::Size512x512)),
+        Some("1024x1024") => Ok(Some(ImageSize::Size1024x1024)),
+        Some("1536x1024") => Ok(Some(ImageSize::Size1536x1024)),
+        Some("1024x1536") => Ok(Some(ImageSize::Size1024x1536)),
+        Some("1792x1024") => Ok(Some(ImageSize::Size1792x1024)),
+        Some("1024x1792") => Ok(Some(ImageSize::Size1024x1792)),
+        Some(value) => Err(AppError::bad_request(format!("unsupported size `{value}`"))),
     }
 }

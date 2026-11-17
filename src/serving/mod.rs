@@ -8,10 +8,11 @@
 //! the registry (ensure the model is loaded), then the dispatcher (apply the
 //! model's batch plan), which executes through `predict`.
 
+pub(crate) mod adapters;
 pub(crate) mod batch;
 pub(crate) mod cache;
 pub(crate) mod dispatch;
-pub(crate) mod download_gate;
+pub(crate) mod downloads;
 pub(crate) mod lease;
 pub(crate) mod lease_weights;
 pub(crate) mod predict;

@@ -133,6 +133,7 @@ async fn discover_endpoint(state: &Arc<AppState>, tag: &str) -> Option<String> {
             None,
             None,
             None,
+            None,
             None
         ).await
     }).await;

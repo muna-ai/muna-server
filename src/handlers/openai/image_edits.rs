@@ -3,13 +3,16 @@
 *   Copyright © 2026 NatML Inc. All Rights Reserved.
 */
 
-//! JSON-only OpenAI Images editing with scalar prompts and image URL references.
+//! OpenAI Images editing with JSON references or multipart image uploads.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{FromRequest, Multipart, Request, State};
 use axum::response::{IntoResponse, Response};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use muna::beta::adapters::{Adapter, DepthFormat, OpenAIDepthOptions, OpenAIImageOptions};
 use muna::beta::openai::ImageEditParams;
 
 use crate::handlers::error::{AppError, Json};
@@ -19,12 +22,21 @@ use crate::state::AppState;
 
 pub(crate) async fn image_edits(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<ImageEditsRequest>,
+    request: ImageEditsRequest,
 ) -> Result<Response, AppError> {
     if state.is_draining() {
         return Err(AppError::unavailable("node is draining".into(), 30));
     }
     let (mut params, urls) = request.into_params()?;
+    let model = state.inference_model(&params.model).await?;
+    let depth = model
+        .signature
+        .outputs
+        .iter()
+        .any(|p| p.denotation.as_deref() == Some("depth_map"));
+    let depth_adapter = depth.then(|| model.adapters.depth()).transpose()?;
+    let image_adapter = (!depth).then(|| model.adapters.edits()).transpose()?;
+    let encoding = depth_options(depth, &params)?;
     params.image = state
         .image_fetcher
         .resolve_images(urls)
@@ -33,7 +45,6 @@ pub(crate) async fn image_edits(
         .into_iter()
         .map(Into::into)
         .collect();
-    let model = state.inference_model(&params.model).await?;
     params.devices = model.device_handles()?;
     params.acceleration = Some(model.acceleration());
     state.check_in_if_due(&params.model).await;
@@ -45,7 +56,45 @@ pub(crate) async fn image_edits(
     let muna = model.muna.clone();
     let dispatched = Instant::now();
     let response = predict::run_model(model.clone(), guard, move || async move {
-        muna.beta.openai.images.edit(params).await
+        let (width, height) = params
+            .size
+            .unwrap_or(muna::beta::openai::ImageSize::Auto)
+            .dimensions();
+        let inputs = if let Some(adapter) = &depth_adapter {
+            adapter.inputs(params.image, params.prompt, params.n, width, height)?
+        } else {
+            image_adapter
+                .as_ref()
+                .expect("image adapter selected")
+                .inputs(params.image, params.prompt, params.n, width, height)?
+        };
+        let prediction = muna
+            .predictions
+            .create(
+                &params.model,
+                Some(inputs),
+                params.acceleration,
+                params.devices.as_deref(),
+                None,
+                None,
+                None,
+                Some(true),
+            )
+            .await?;
+        if let Some(adapter) = depth_adapter {
+            adapter.adapt(prediction, Some(encoding)).await
+        } else {
+            image_adapter
+                .expect("image adapter selected")
+                .adapt(
+                    prediction,
+                    Some(OpenAIImageOptions {
+                        output_format: params.output_format.unwrap_or_else(|| "png".into()),
+                        output_compression: params.output_compression,
+                    }),
+                )
+                .await
+        }
     })
     .await?;
     let images = response.data.as_ref().map_or(0, |data| data.len()) as u32;
@@ -79,7 +128,6 @@ struct ImageReference {
 }
 
 impl ImageEditsRequest {
-
     fn into_params(self) -> Result<(ImageEditParams, Vec<String>), AppError> {
         if self.model.trim().is_empty() {
             return Err(bad("The model must not be empty."));
@@ -104,7 +152,7 @@ impl ImageEditsRequest {
         if self
             .output_format
             .as_deref()
-            .is_some_and(|s| !matches!(s, "png" | "jpeg" | "webp"))
+            .is_some_and(|s| !matches!(s, "png" | "jpeg" | "webp" | "npy" | "npz"))
         {
             return Err(bad("Unsupported image output format."));
         }
@@ -128,7 +176,7 @@ impl ImageEditsRequest {
             } else {
                 self.model
             },
-            prompt: self.prompt,
+            prompt: Some(self.prompt),
             n: self.n,
             size: super::images::parse_size(self.size.as_deref())?,
             output_format: self.output_format,
@@ -143,6 +191,96 @@ impl ImageEditsRequest {
                 .map(|image| image.image_url)
                 .collect(),
         ))
+    }
+}
+
+// Keep the JSON URL-reference surface while accepting the multipart body
+// produced by OpenAI's image= file argument. Existing fetch limits apply to
+// uploaded images too, after converting them to data URL references.
+impl<S: Send + Sync> FromRequest<S> for ImageEditsRequest {
+    type Rejection = AppError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let multipart = request
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("multipart/form-data"))
+            });
+        if !multipart {
+            return Json::<Self>::from_request(request, state)
+                .await
+                .map(|Json(value)| value);
+        }
+        let mut multipart = Multipart::from_request(request, state)
+            .await
+            .map_err(|error| bad(&error.to_string()))?;
+        let mut fields = serde_json::Map::new();
+        let mut images = Vec::new();
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|error| AppError::multipart(error.status(), error.body_text()))?
+        {
+            let name = field.name().unwrap_or_default().to_owned();
+            if matches!(name.as_str(), "image" | "image[]") {
+                if field.file_name().is_none() {
+                    return Err(bad("Multipart image fields must contain uploaded files."));
+                }
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|error| AppError::multipart(error.status(), error.body_text()))?;
+                if bytes.is_empty() || images.len() >= 1024 {
+                    return Err(bad(
+                        "Image files must be nonempty; at most 1024 are supported.",
+                    ));
+                }
+                images.push(serde_json::json!({
+                    "image_url": format!("data:image/png;base64,{}", BASE64.encode(bytes))
+                }));
+                continue;
+            }
+            if !matches!(
+                name.as_str(),
+                "model"
+                    | "prompt"
+                    | "n"
+                    | "size"
+                    | "output_format"
+                    | "output_compression"
+                    | "background"
+                    | "response_format"
+            ) {
+                return Err(bad(&format!("Unsupported image edit field `{name}`.")));
+            }
+            if fields.contains_key(&name) || field.file_name().is_some() {
+                return Err(bad(&format!(
+                    "Duplicate or invalid image edit field `{name}`."
+                )));
+            }
+            let value = field
+                .text()
+                .await
+                .map_err(|error| AppError::multipart(error.status(), error.body_text()))?;
+            let value = if matches!(name.as_str(), "n" | "output_compression") {
+                serde_json::Value::from(
+                    value
+                        .parse::<i32>()
+                        .map_err(|_| bad("Image count/compression must be integers."))?,
+                )
+            } else {
+                serde_json::Value::String(value)
+            };
+            fields.insert(name, value);
+        }
+        fields.insert("images".into(), serde_json::Value::Array(images));
+        serde_json::from_value(serde_json::Value::Object(fields))
+            .map_err(|error| bad(&error.to_string()))
     }
 }
 
@@ -171,7 +309,7 @@ mod tests {
             .into_params()
             .unwrap_or_else(|_| panic!("valid request"));
         assert_eq!(params.model, "@owner/albedo");
-        assert_eq!(params.prompt, "");
+        assert_eq!(params.prompt.as_deref(), Some(""));
         assert_eq!(params.n, Some(2));
         assert_eq!(params.size.unwrap().dimensions(), (Some(512), Some(512)));
         assert_eq!(
@@ -219,13 +357,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_multipart_body() {
+    async fn accepts_sdk_multipart_upload_and_rejects_duplicate_scalars() {
+        let body = concat!(
+            "--test\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nowner/depth\r\n",
+            "--test\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n\r\n",
+            "--test\r\nContent-Disposition: form-data; name=\"output_format\"\r\n\r\nnpy\r\n",
+            "--test\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nimage bytes\r\n",
+            "--test--\r\n"
+        );
         let request = Request::builder()
             .header("content-type", "multipart/form-data; boundary=test")
-            .body(Body::from("--test--\r\n"))
+            .body(Body::from(body))
             .unwrap();
-        assert!(axum::Json::<ImageEditsRequest>::from_request(request, &())
+        let parsed = ImageEditsRequest::from_request(request, &())
             .await
-            .is_err());
+            .ok()
+            .unwrap();
+        let (params, images) = parsed.into_params().ok().unwrap();
+        assert_eq!(params.output_format.as_deref(), Some("npy"));
+        assert_eq!(images.len(), 1);
+        let duplicate = body.replace(
+            "--test--",
+            "--test\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nother\r\n--test--",
+        );
+        let request = Request::builder()
+            .header("content-type", "multipart/form-data; boundary=test")
+            .body(Body::from(duplicate))
+            .unwrap();
+        assert!(ImageEditsRequest::from_request(request, &()).await.is_err());
     }
+}
+
+// Output format belongs to the HTTP response, never to predictor arguments.
+fn depth_options(depth: bool, params: &ImageEditParams) -> Result<OpenAIDepthOptions, AppError> {
+    let format = match params.output_format.as_deref() {
+        Some("npy") if depth => DepthFormat::Npy,
+        Some("npz") if depth => DepthFormat::Npz,
+        _ if depth => return Err(bad("Depth output requires output_format=npy or npz.")),
+        Some("npy" | "npz") => {
+            return Err(bad(
+                "NumPy output requires an array_list annotated as depth_map.",
+            ))
+        }
+        _ => return Ok(OpenAIDepthOptions::default()),
+    };
+    if params.background.is_some() || params.output_compression.is_some() {
+        return Err(bad(
+            "Depth output does not accept background or output_compression.",
+        ));
+    }
+    Ok(OpenAIDepthOptions { format })
 }

@@ -12,18 +12,13 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::stream;
+use muna::beta::adapters::Adapter;
 use muna::beta::anthropic::{MessageCreateParams, RawMessageStreamEvent};
 
 use crate::handlers::body::ChatBody;
-use crate::handlers::error::{
-    anthropic_error_value, AnthropicError,
-    AnthropicJson, AppError
-};
+use crate::handlers::error::{anthropic_error_value, AnthropicError, AnthropicJson, AppError};
 use crate::serving::predict;
-use crate::serving::stats::{
-    PredictionSample, SampleDetail, StreamKind,
-    StreamMeter
-};
+use crate::serving::stats::{PredictionSample, SampleDetail, StreamKind, StreamMeter};
 use crate::state::AppState;
 
 /// Messages via the muna-rs Anthropic client, wrapped with the model
@@ -40,7 +35,11 @@ pub(crate) async fn messages(
     if state.is_draining() {
         return Err(AppError::unavailable("node is draining".into(), 30).into());
     }
-    let ChatBody { stream: streaming, mut params, .. } = body;
+    let ChatBody {
+        stream: streaming,
+        mut params,
+        ..
+    } = body;
     let model = state.inference_model(&params.model).await?;
     params.acceleration = Some(model.acceleration());
     params.devices = model.device_handles()?;
@@ -56,15 +55,23 @@ pub(crate) async fn messages(
     let queue_wait = admitted.elapsed();
     let muna = model.muna.clone();
     if streaming {
-        let meter = StreamMeter::new(
-            model.stats.clone(),
-            StreamKind::Llm,
-            queue_wait
-        );
+        let adapter = model.adapters.messages()?;
+        let meter = StreamMeter::new(model.stats.clone(), StreamKind::Llm, queue_wait);
         // The guard rides with the pump onto the blocking thread and is
         // released once the native stream is dropped.
         let mut rx = predict::stream_model(model.clone(), guard, move || async move {
-            muna.beta.anthropic.messages.stream(params).await
+            let inputs = adapter.inputs(&params)?;
+            let predictions = muna
+                .predictions
+                .stream(
+                    &params.model,
+                    inputs,
+                    params.acceleration,
+                    params.devices.as_deref(),
+                    Some(true),
+                )
+                .await?;
+            adapter.adapt(predictions, None).await
         });
         // Commit the response status on the first item. Failures raised
         // before the predictor's first output (context length, malformed
@@ -74,9 +81,12 @@ pub(crate) async fn messages(
         let first = match rx.recv().await {
             Some(Ok(message_event)) => message_event,
             Some(Err(e)) => return Err(AppError::from(e).into()),
-            None => return Err(AppError::internal(
-                "prediction stream ended before producing output".into()
-            ).into()),
+            None => {
+                return Err(AppError::internal(
+                    "prediction stream ended before producing output".into(),
+                )
+                .into())
+            }
         };
         // Anthropic SSE frames are named events with no `[DONE]` terminator:
         // the stream simply ends after `message_stop`. Mid-stream errors are
@@ -95,7 +105,9 @@ pub(crate) async fn messages(
                     Ok(message_event) => {
                         stamp_event(&mut meter, &message_event);
                         let json = serde_json::to_string(&message_event).unwrap_or_default();
-                        Event::default().event(message_event.event_type()).data(json)
+                        Event::default()
+                            .event(message_event.event_type())
+                            .data(json)
                     }
                     Err(e) => {
                         tracing::warn!("muna stream error: {e}");
@@ -105,14 +117,15 @@ pub(crate) async fn messages(
                     }
                 };
                 Some((Ok::<Event, Infallible>(event), (rx, meter, pending)))
-            }
+            },
         );
         Ok(Sse::new(event_stream).into_response())
     } else {
         let dispatched = Instant::now();
         let message = predict::run_model(model.clone(), guard, move || async move {
             muna.beta.anthropic.messages.create(params).await
-        }).await?;
+        })
+        .await?;
         // Non-streamed messages record `Unary`: whole-response latency has
         // no first-yield boundary and must not fatten the TTFT percentiles.
         model.stats.telemetry.record(PredictionSample {
@@ -129,10 +142,7 @@ pub(crate) async fn messages(
 /// content-bearing; `message_delta` carries the cumulative output token
 /// count used for the yield-invariant interval normalization. Start/stop
 /// envelope frames are wire consistency only.
-fn stamp_event(
-    meter: &mut StreamMeter,
-    event: &RawMessageStreamEvent
-) {
+fn stamp_event(meter: &mut StreamMeter, event: &RawMessageStreamEvent) {
     match event {
         RawMessageStreamEvent::ContentBlockDelta { .. } => meter.on_output(true),
         RawMessageStreamEvent::MessageDelta { usage, .. } => {

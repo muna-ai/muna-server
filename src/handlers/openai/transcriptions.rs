@@ -12,6 +12,7 @@ use std::time::Instant;
 use axum::extract::multipart::MultipartRejection;
 use axum::extract::{Multipart, State};
 use axum::response::{IntoResponse, Response};
+use muna::beta::adapters::{Adapter, OpenAITranscriptionsOptions};
 use muna::beta::openai::TranscriptionCreateParams;
 
 use crate::handlers::error::{AppError, Json};
@@ -37,10 +38,38 @@ pub(crate) async fn transcriptions(
     let guard = state.dispatcher.acquire(&params.model, &model).await;
     let queue_wait = admitted.elapsed();
     params.acceleration = Some(model.acceleration());
+    let adapter = model.adapters.transcriptions()?;
     let muna = model.muna.clone();
     let dispatched = Instant::now();
     let response = predict::run_model(model.clone(), guard, move || async move {
-        muna.beta.openai.audio.transcriptions.create(params).await
+        let inputs = adapter.inputs(
+            params.file,
+            params.language,
+            params.prompt,
+            params.temperature,
+        )?;
+        let duration = adapter.duration(&inputs)?;
+        let prediction = muna
+            .predictions
+            .create(
+                &params.model,
+                Some(inputs),
+                params.acceleration,
+                params.devices.as_deref(),
+                None,
+                None,
+                None,
+                Some(true),
+            )
+            .await?;
+        adapter
+            .adapt(
+                prediction,
+                Some(OpenAITranscriptionsOptions {
+                    duration: Some(duration),
+                }),
+            )
+            .await
     })
     .await?;
     model.stats.telemetry.record(PredictionSample {

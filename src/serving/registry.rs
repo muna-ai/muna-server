@@ -25,7 +25,6 @@ use crate::serving::preparation::{FailureStage, PreparationTracker};
 use crate::platform::Platform;
 use crate::notifications::NotificationCenter;
 use crate::serving::batch::BatchPlan;
-use crate::serving::download_gate::{DownloadGate, PriorityGuard};
 use crate::serving::predict;
 use crate::serving::stats::ModelStats;
 use crate::state::{DeviceStore, KeyStore, PolicyStore};
@@ -61,6 +60,7 @@ pub(crate) struct ReadyModel {
     /// The predictor signature: the batch plan derives from it, and the
     /// `/v1/models` rows advertise its limits and capabilities.
     pub signature: Signature,
+    pub adapters: super::adapters::Adapters,
     /// How the dispatcher batches predictions for this model, derived from
     /// the signature's batch config.
     pub plan: BatchPlan,
@@ -192,11 +192,10 @@ pub(crate) struct Loaded {
 /// the given devices. Injectable so single-flight behavior is testable
 /// without a live engine.
 ///
-/// Receives the download-gate guard and owns its release: the real loader
-/// drops it once resources are on disk, before the engine load, so
-/// disk-tier prefetch resumes while weights stage from page cache.
+/// The delegate promotes queued resources before spawning preparation; the
+/// resource scheduler owns transfers independently of model loading.
 type Loader = Arc<
-    dyn Fn(String, Option<Vec<u32>>, PriorityGuard)
+    dyn Fn(String, Option<Vec<u32>>)
         -> futures_util::future::BoxFuture<'static, Result<Loaded, String>>
         + Send
         + Sync
@@ -220,8 +219,6 @@ struct RegistryInner {
     notifications: Arc<NotificationCenter>,
     /// Device memory source for the load-time VRAM delta.
     platform: Arc<dyn Platform>,
-    /// Priority side of the process-tier-first download ordering.
-    download_gate: Arc<DownloadGate>,
     lease: Option<Arc<LeaseSupervisor>>,
     policies: PolicyStore,
 }
@@ -239,7 +236,6 @@ impl ModelRegistry {
         pinned: Option<HashSet<String>>,
         notifications: Arc<NotificationCenter>,
         platform: Arc<dyn Platform>,
-        download_gate: Arc<DownloadGate>,
         lease: Option<Arc<LeaseSupervisor>>,
         policies: PolicyStore,
         preparation: PreparationTracker,
@@ -247,14 +243,15 @@ impl ModelRegistry {
     ) -> Self {
         let load_lease = lease.clone();
         let load_policies = policies.clone();
-        let loader: Loader = Arc::new(move |tag, devices, priority| {
+        let loader: Loader = Arc::new(move |tag, devices| {
+            prepared.set_process(&tag, true);
             let key = keys.get(&tag).map(|entry| entry.value().clone());
             let lease = load_lease.clone();
             let preparation = preparation.clone();
             let prepared = prepared.clone();
             let dedicated = load_policies.get(&tag).is_some_and(|p| p.dedicated);
             Box::pin(async move {
-                let loaded = load_model(&tag, key, devices.clone(), priority, preparation, prepared).await?;
+                let loaded = load_model(&tag, key, devices.clone(), preparation, prepared).await?;
                 if let Some(lease) = &lease {
                     // CPU predictors need no device registration. Managed GPU
                     // assignments always require an exact Corby group match.
@@ -271,7 +268,7 @@ impl ModelRegistry {
                 Ok(loaded)
             })
         });
-        let mut registry = Self::with_loader(loader, devices, pinned, notifications, platform, download_gate);
+        let mut registry = Self::with_loader(loader, devices, pinned, notifications, platform);
         let inner = Arc::get_mut(&mut registry.inner).unwrap();
         inner.lease = lease;
         inner.policies = policies;
@@ -283,8 +280,7 @@ impl ModelRegistry {
         devices: DeviceStore,
         pinned: Option<HashSet<String>>,
         notifications: Arc<NotificationCenter>,
-        platform: Arc<dyn Platform>,
-        download_gate: Arc<DownloadGate>
+        platform: Arc<dyn Platform>
     ) -> Self {
         Self {
             inner: Arc::new(RegistryInner {
@@ -295,7 +291,6 @@ impl ModelRegistry {
                 last_load_secs: AtomicU64::new(DEFAULT_LOAD_SECS),
                 notifications,
                 platform,
-                download_gate,
                 lease: None,
                 policies: Arc::new(DashMap::new())
             })
@@ -520,17 +515,15 @@ impl ModelRegistry {
     /// Spawn the single-flight warmup: sentinel prediction (reaches the
     /// engine's `load_predictor`), then plan derivation from its prepared signature.
     ///
-    /// Callers invoke this synchronously right after inserting the
-    /// `Loading` slot, so the download-gate guard taken here exists before
-    /// any disk-tier prefetch spawned later in the same reconcile pass
-    /// checks the gate (see `download_gate.rs`).
+    /// Invoking the loader synchronously promotes this tag's queued resources
+    /// before subsequently scheduled disk-only preparations can start.
     fn spawn_load(
         &self,
         tag: String,
         devices: Option<Vec<u32>>
     ) {
-        let priority = self.inner.download_gate.enter_priority();
         let inner = self.inner.clone();
+        let loading = (inner.loader)(tag.clone(), devices.clone());
         tokio::spawn(async move {
             let start = Instant::now();
             // Measured over the assigned devices only, so a concurrent load
@@ -541,7 +534,7 @@ impl ModelRegistry {
             };
             let vram_before = memory_used_mb();
             let stats = Arc::new(ModelStats::new());
-            let outcome = (inner.loader)(tag.clone(), devices.clone(), priority).await;
+            let outcome = loading.await;
             let vram_after = memory_used_mb();
             if let (Some(before), Some(after)) = (vram_before, vram_after) {
                 if after > before {
@@ -582,6 +575,7 @@ impl ModelRegistry {
                         muna,
                         loaded_at: Instant::now(),
                         plan: BatchPlan::from_signature(&signature),
+                        adapters: super::adapters::Adapters::new(signature.clone()),
                         signature,
                         stats,
                         devices,
@@ -633,7 +627,6 @@ async fn load_model(
     tag: &str,
     key: Option<String>,
     devices: Option<Vec<u32>>,
-    priority: PriorityGuard,
     preparation: PreparationTracker,
     prepared: PreparedModels
 ) -> Result<Loaded, String> {
@@ -662,10 +655,6 @@ async fn load_model(
     preparation.cached(tag);
     let download = download_started.elapsed();
     let build = build_id(downloaded);
-    // Everything from here is GPU staging from page cache; disk-tier
-    // prefetch may start writing again. (An `Err` above drops the guard on
-    // the way out, so failures release it too.)
-    drop(priority);
     // Phase 2, load. Preload convention: create a prediction that
     // deliberately excludes the predictor's required inputs. Loading the
     // predictor runs all constructors and initializers (the actual engine
@@ -688,6 +677,7 @@ async fn load_model(
             Some(inputs),
             Some(acceleration),
             handles.as_deref(),
+            None,
             None,
             None,
             None
@@ -751,7 +741,7 @@ mod tests {
         pinned: Option<HashSet<String>>,
         notifications: Arc<NotificationCenter>
     ) -> ModelRegistry {
-        let loader: Loader = Arc::new(move |_tag, _devices, _priority| {
+        let loader: Loader = Arc::new(move |_tag, _devices| {
             let loads = loads.clone();
             Box::pin(async move {
                 loads.fetch_add(1, Ordering::SeqCst);
@@ -774,65 +764,8 @@ mod tests {
             Arc::new(DashMap::new()),
             pinned,
             notifications,
-            Arc::new(crate::platform::NullPlatform),
-            Arc::new(DownloadGate::new())
+            Arc::new(crate::platform::NullPlatform)
         )
-    }
-
-    /// A registry whose loader holds the gate guard until `release` fires,
-    /// then succeeds or fails per `fail`, so gate accounting is observable.
-    fn registry_gated(
-        gate: Arc<DownloadGate>,
-        release: Arc<tokio::sync::Notify>,
-        fail: bool
-    ) -> ModelRegistry {
-        let loader: Loader = Arc::new(move |_tag, _devices, priority| {
-            let release = release.clone();
-            Box::pin(async move {
-                // The real loader holds the guard through the download
-                // phase only; `release` stands in for "resources on disk".
-                release.notified().await;
-                drop(priority);
-                if fail {
-                    Err("boom".to_string())
-                } else {
-                    Ok(Loaded {
-                        signature: Signature { inputs: vec![], outputs: vec![] },
-                        muna: Arc::new(Muna::new(None, None)),
-                        download: Duration::ZERO,
-                        load: Duration::ZERO,
-                        build: None
-                    })
-                }
-            })
-        });
-        ModelRegistry::with_loader(
-            loader,
-            Arc::new(DashMap::new()),
-            None,
-            Arc::new(NotificationCenter::default()),
-            Arc::new(crate::platform::NullPlatform),
-            gate
-        )
-    }
-
-    #[tokio::test]
-    async fn warm_holds_gate_through_download_and_releases_on_both_outcomes() {
-        for fail in [false, true] {
-            let gate = Arc::new(DownloadGate::new());
-            let release = Arc::new(tokio::sync::Notify::new());
-            let registry = registry_gated(gate.clone(), release.clone(), fail);
-            // Synchronous: the guard exists before the load task runs.
-            registry.warm("@test/model");
-            assert_eq!(gate.inflight(), 1);
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(gate.inflight(), 1, "held while downloading");
-            release.notify_one();
-            tokio::time::timeout(Duration::from_secs(1), gate.wait_idle())
-                .await
-                .expect("gate released after the download phase");
-            assert_eq!(gate.inflight(), 0, "fail={fail}");
-        }
     }
 
     #[tokio::test]
@@ -962,7 +895,7 @@ mod tests {
     async fn loads_on_assigned_devices() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let loader_seen = seen.clone();
-        let loader: Loader = Arc::new(move |_tag, devices, _priority| {
+        let loader: Loader = Arc::new(move |_tag, devices| {
             loader_seen.lock().unwrap().push(devices);
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -983,8 +916,7 @@ mod tests {
             devices,
             None,
             Arc::new(NotificationCenter::default()),
-            Arc::new(crate::platform::NullPlatform),
-            Arc::new(DownloadGate::new())
+            Arc::new(crate::platform::NullPlatform)
         );
         assert_eq!(registry.devices("@test/model"), None);
         registry.warm("@test/model");

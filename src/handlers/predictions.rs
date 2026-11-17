@@ -16,8 +16,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use muna::c;
 use muna::types::{
-    Acceleration, Dtype, Prediction, RemoteData, RemotePrediction,
-    RemoteValue, Tensor, TensorData, Value,
+    Acceleration, Dtype, Prediction, RemoteData, RemoteValue, Tensor, TensorData, Value,
 };
 use muna::MunaError;
 use serde::Deserialize;
@@ -178,7 +177,13 @@ async fn stream_prediction(
     let devices = model.device_handles()?;
     let rx = predict::stream_model(model.clone(), guard, move || async move {
         muna.predictions
-            .stream(&stream_tag, inputs, Some(acceleration), devices.as_deref())
+            .stream(
+                &stream_tag,
+                inputs,
+                Some(acceleration),
+                devices.as_deref(),
+                None,
+            )
             .await
     });
     let event_stream = futures_util::stream::unfold(
@@ -215,35 +220,34 @@ fn local_acceleration(acceleration: Option<&Acceleration>) -> Acceleration {
 }
 
 fn to_remote_prediction(
-    prediction: Prediction,
+    mut prediction: Prediction,
     encoding: &ImageEncoding,
-) -> Result<RemotePrediction, MunaError> {
-    let results = match prediction.results {
-        Some(values) => {
-            let mut remote_values = Vec::with_capacity(values.len());
-            for value in &values {
-                remote_values.push(create_remote_value(value, encoding)?);
-            }
-            Some(remote_values)
-        }
-        None => None,
-    };
-    Ok(RemotePrediction {
-        id: prediction.id,
-        tag: prediction.tag,
-        created: prediction.created,
-        results,
-        latency: prediction.latency,
-        error: prediction.error,
-        logs: prediction.logs,
-    })
+) -> Result<Prediction, MunaError> {
+    prediction.results = prediction
+        .results
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| create_remote_value(value, encoding).map(Value::Remote))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    // Configuration and download metadata belong to the SDK's loading path,
+    // not to a hosted inference response.
+    prediction.configuration = None;
+    prediction.resources = None;
+    prediction.requirements = None;
+    Ok(prediction)
 }
 
-fn error_prediction(tag: &str, message: &str) -> RemotePrediction {
-    RemotePrediction {
+fn error_prediction(tag: &str, message: &str) -> Prediction {
+    Prediction {
         id: create_prediction_id(),
         tag: tag.to_string(),
         created: crate::state::unix_now().to_string(),
+        configuration: None,
+        resources: None,
+        requirements: None,
         results: None,
         latency: None,
         error: Some(message.to_string()),
@@ -337,6 +341,7 @@ fn parse_remote_value(remote: &RemoteValue) -> Result<Value, MunaError> {
 
 fn create_remote_value(value: &Value, encoding: &ImageEncoding) -> Result<RemoteValue, MunaError> {
     match value {
+        Value::Remote(remote) => Ok(remote.clone()),
         Value::Null => Ok(RemoteValue {
             data: None,
             dtype: Dtype::Null,
@@ -540,6 +545,33 @@ mod image_transport_tests {
                 matches!(parse_remote_value(&remote).unwrap(), Value::ImageList(images) if images.len() == 2)
             );
         }
+    }
+
+    #[test]
+    fn wire_envelope_preserves_encoded_results_without_sdk_metadata() {
+        let mut prediction: Prediction = serde_json::from_value(serde_json::json!({
+            "id":"pred_test", "tag":"@test/model", "created":"2026-11-17T00:00:00.123456789Z",
+            "latency":0.25, "configuration":"private-runtime-token",
+            "resources":[{"type":"dso", "url":"https://example.com/private.so"}],
+            "requirements":{"gpuCount":2},
+        }))
+        .unwrap();
+        let encoded = RemoteValue {
+            dtype: Dtype::Image,
+            data: Some("data:image/png;base64,cGFzc3Rocm91Z2g=".to_owned().into()),
+        };
+        prediction.results = Some(vec![Value::Remote(encoded.clone())]);
+        let response = to_remote_prediction(prediction, &ImageEncoding::default()).unwrap();
+        assert!(response.configuration.is_none());
+        assert!(response.resources.is_none());
+        assert!(response.requirements.is_none());
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["results"][0], serde_json::to_value(encoded).unwrap());
+        assert_eq!(wire["created"], "2026-11-17T00:00:00.123456789Z");
+        assert_eq!(wire["latency"], 0.25);
+        assert_eq!(wire.get("configuration"), Some(&JsonValue::Null));
+        assert_eq!(wire.get("resources"), Some(&JsonValue::Null));
+        assert!(wire.get("requirements").is_none());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 ## 0.0.31
-*INCOMPLETE*
++ Upgraded `muna` to 0.0.39.
 
 ## 0.0.30
 + Upgraded `muna` to 0.0.38.

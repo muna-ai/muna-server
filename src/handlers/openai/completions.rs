@@ -11,6 +11,7 @@ use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::{stream, StreamExt};
+use muna::beta::adapters::{Adapter, OpenAICompletionsOptions};
 use muna::beta::openai::{ChatCompletionChunk, ChatCompletionCreateParams};
 
 use crate::handlers::body::ChatBody;
@@ -33,7 +34,11 @@ pub(crate) async fn chat_completions(
     if state.is_draining() {
         return Err(AppError::unavailable("node is draining".into(), 30));
     }
-    let ChatBody { stream: streaming, mut params, .. } = body;
+    let ChatBody {
+        stream: streaming,
+        mut params,
+        ..
+    } = body;
     let model = state.inference_model(&params.model).await?;
     params.acceleration = Some(model.acceleration());
     params.devices = model.device_handles()?;
@@ -49,17 +54,32 @@ pub(crate) async fn chat_completions(
     let queue_wait = admitted.elapsed();
     let muna = model.muna.clone();
     if streaming {
-        let meter = StreamMeter::new(
-            model.stats.clone(),
-            StreamKind::Llm,
-            queue_wait
-        );
+        let adapter = model.adapters.completions()?;
+        let meter = StreamMeter::new(model.stats.clone(), StreamKind::Llm, queue_wait);
         // The guard rides with the pump onto the blocking thread and is
         // released once the native stream is dropped; the meter travels
         // with the stream state and records its telemetry sample when the
         // response body drops (stream end or client disconnect).
         let mut rx = predict::stream_model(model.clone(), guard, move || async move {
-            muna.beta.openai.chat.completions.stream(params).await
+            let inputs = adapter.inputs(&params)?;
+            let predictions = muna
+                .predictions
+                .stream(
+                    &params.model,
+                    inputs,
+                    params.acceleration,
+                    params.devices.as_deref(),
+                    Some(true),
+                )
+                .await?;
+            adapter
+                .adapt(
+                    predictions,
+                    Some(OpenAICompletionsOptions {
+                        include_usage: true,
+                    }),
+                )
+                .await
         });
         // Commit the response status on the first item. Failures raised
         // before the predictor's first output (context length, malformed
@@ -69,9 +89,11 @@ pub(crate) async fn chat_completions(
         let first = match rx.recv().await {
             Some(Ok(chunk)) => chunk,
             Some(Err(e)) => return Err(e.into()),
-            None => return Err(AppError::internal(
-                "prediction stream ended before producing output".into()
-            )),
+            None => {
+                return Err(AppError::internal(
+                    "prediction stream ended before producing output".into(),
+                ))
+            }
         };
         let event_stream = stream::unfold(
             (rx, meter, Some(first)),
@@ -93,7 +115,7 @@ pub(crate) async fn chat_completions(
                     }
                 };
                 Some((Ok::<Event, Infallible>(event), (rx, meter, pending)))
-            }
+            },
         )
         .chain(stream::once(async {
             Ok::<Event, Infallible>(Event::default().data("[DONE]"))
@@ -103,7 +125,8 @@ pub(crate) async fn chat_completions(
         let dispatched = Instant::now();
         let completion = predict::run_model(model.clone(), guard, move || async move {
             muna.beta.openai.chat.completions.create(params).await
-        }).await?;
+        })
+        .await?;
         // Non-streamed chat records `Unary`: whole-response latency has no
         // first-yield boundary and must not fatten the TTFT percentiles.
         model.stats.telemetry.record(PredictionSample {
@@ -120,15 +143,15 @@ pub(crate) async fn chat_completions(
 /// any choice's delta carries text (content or reasoning) or tool call
 /// fragments, or when it is the terminal usage frame -- role-only
 /// wire-consistency frames are not.
-fn stamp_chunk(
-    meter: &mut StreamMeter,
-    chunk: &ChatCompletionChunk
-) {
+fn stamp_chunk(meter: &mut StreamMeter, chunk: &ChatCompletionChunk) {
     let has_text = chunk.choices.iter().any(|choice| {
         choice.delta.as_ref().is_some_and(|delta| {
-            delta.content.as_deref().is_some_and(|c| !c.is_empty())             ||
-            delta.reasoning_content.as_deref().is_some_and(|c| !c.is_empty())   ||
-            delta.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+            delta.content.as_deref().is_some_and(|c| !c.is_empty())
+                || delta
+                    .reasoning_content
+                    .as_deref()
+                    .is_some_and(|c| !c.is_empty())
+                || delta.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
         })
     });
     if let Some(usage) = &chunk.usage {

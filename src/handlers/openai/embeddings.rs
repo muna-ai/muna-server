@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use muna::beta::openai::EncodingFormat;
+use muna::beta::adapters::{Adapter, EncodingFormat, OpenAIEmbeddingsOptions};
 use serde::Deserialize;
 
 use crate::handlers::error::{AppError, Json};
@@ -60,22 +60,37 @@ pub(crate) async fn embeddings(
     let _admission = model.admit().await?;
     let guard = state.dispatcher.acquire(&req.model, &model).await;
     let queue_wait = admitted.elapsed();
+    let adapter = model.adapters.embeddings()?;
+    let inputs = adapter.inputs(input, req.dimensions);
     let muna = model.muna.clone();
     let tag = req.model;
-    let dimensions = req.dimensions;
     let devices = model.device_handles()?;
     let acceleration = model.acceleration();
     let dispatched = Instant::now();
     let response = predict::run_model(model.clone(), guard, move || async move {
-        muna.beta.openai.embeddings.create(
-            input,
-            &tag,
-            dimensions,
-            encoding_format,
-            Some(acceleration),
-            devices.as_deref()
-        ).await
-    }).await?;
+        let prediction = muna
+            .predictions
+            .create(
+                &tag,
+                Some(inputs),
+                Some(acceleration),
+                devices.as_deref(),
+                None,
+                None,
+                None,
+                Some(true),
+            )
+            .await?;
+        adapter
+            .adapt(
+                prediction,
+                Some(OpenAIEmbeddingsOptions {
+                    encoding_format: encoding_format.unwrap_or_default(),
+                }),
+            )
+            .await
+    })
+    .await?;
     model.stats.telemetry.record(PredictionSample {
         at: Instant::now(),
         queue_wait,

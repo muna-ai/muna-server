@@ -4,12 +4,13 @@
 */
 
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use muna::client::{
     Client, DownloadDurability, DownloadProgressFn,
@@ -18,27 +19,12 @@ use muna::client::{
 use muna::MunaClient;
 
 use crate::serving::preparation::{FailureStage, PreparationTracker};
+use crate::serving::downloads::{Downloads, Priority};
 
-/// Muna client for server use: wraps the default [`MunaClient`] and
-/// overrides `download` with per-path single-flight, eventual durability,
-/// and progress presentation (an indicatif bar on a TTY, throttled tracing
-/// lines in containers/CI).
-///
-/// The registry already single-flights loads per tag, but two *different*
-/// tags loading concurrently can share a resource file (e.g. `libtvm_ffi.so`);
-/// the single-flight guard prevents
-/// concurrent writes to one destination path. The lock map is
-/// process-global (see [`download_locks`]) because the server constructs
-/// one keyed client per model, and per-instance maps would not protect
-/// across them.
-///
-/// Durability: fleet nodes bootstrap onto a fresh disk every time, so a
-/// cache file torn by a crash is never read back. What matters is how soon
-/// the engine can stage weights from page cache, and the default client's
-/// fsync-before-rename makes that wait for the disk to absorb every byte.
-/// On some network root volumes (~130 MB/s) that is the difference between
-/// ~30 s and ~4 min for a 30 GB model, so downloads here are published
-/// with [`DownloadDurability::Eventual`].
+/// Server transport. All keyed clients on a node share a resource scheduler;
+/// only the active transfer updates physical bytes in the preparation tracker.
+/// Cache publication uses eventual durability so loading can read page cache
+/// without waiting for a slow ephemeral disk's writeback.
 pub(crate) struct ServerClient {
     inner: MunaClient,
     /// Dedicated CDN client for `download`. The API client's pool is
@@ -46,6 +32,8 @@ pub(crate) struct ServerClient {
     /// caller of `muna::download`, not with `MunaClient`.
     http: reqwest::Client,
     preparation: Option<(String, PreparationTracker)>,
+    downloads: Downloads,
+    priority: Priority,
 }
 
 impl ServerClient {
@@ -61,13 +49,28 @@ impl ServerClient {
             inner: MunaClient::new(access_key.as_deref(), url.as_deref()),
             http: cdn_client(),
             preparation: None,
+            downloads: Downloads::default(),
+            priority: Priority::default(),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn tracking(key: Option<String>, tag: &str, tracker: PreparationTracker) -> Self {
+        Self::scheduled(key, tag, tracker, Downloads::default(), Priority::default())
+    }
+
+    pub(crate) fn scheduled(
+        key: Option<String>,
+        tag: &str,
+        tracker: PreparationTracker,
+        downloads: Downloads,
+        priority: Priority
+    ) -> Self {
         tracker.begin(tag);
         let mut client = Self::with_key(key);
         client.preparation = Some((tag.to_owned(), tracker));
+        client.downloads = downloads;
+        client.priority = priority;
         client
     }
 }
@@ -78,14 +81,6 @@ fn cdn_client() -> reqwest::Client {
         .user_agent("muna-server")
         .build()
         .expect("failed to build reqwest client")
-}
-
-/// Process-global in-flight download locks, keyed by destination path.
-/// Shared across every `ServerClient` instance so concurrent loads through
-/// different per-model clients still single-flight shared resource files.
-fn download_locks() -> &'static DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>> {
-    static LOCKS: OnceLock<DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> = OnceLock::new();
-    LOCKS.get_or_init(DashMap::new)
 }
 
 #[async_trait]
@@ -140,70 +135,44 @@ impl Client for ServerClient {
         path: &Path,
         progress: Option<DownloadProgressFn>,
     ) -> Result<()> {
-        let lock = download_locks()
-            .entry(path.to_path_buf())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let result = {
-            let _guard = lock.lock().await;
-            // All keyed clients observe the same path, including waiters whose
-            // shared resource was downloaded by a different predictor.
-            if let Ok(metadata) = tokio::fs::metadata(path).await {
-                if let Some((_, tracker)) = &self.preparation {
-                    tracker.finished(path, Some(metadata.len()));
-                }
-                Ok(())
-            } else {
-                if let Some((_, tracker)) = &self.preparation { tracker.started(path); }
-                let presentation = progress.is_none().then(|| DownloadProgress::new(path));
-                let observer = self.preparation.clone();
-                let observed_path = path.to_path_buf();
+        let http = self.http.clone();
+        let url = url.to_owned();
+        let destination = path.to_owned();
+        let observer = self.preparation.clone();
+        let draw_progress = progress.is_none();
+        let result = self.downloads.download(path, self.priority.clone(), progress, move |subscribers| {
+            Box::pin(async move {
+                if let Some((_, tracker)) = &observer { tracker.started(&destination); }
+                let presentation = draw_progress.then(|| DownloadProgress::new(&destination));
+                let tracked = observer.clone();
+                let observed_path = destination.clone();
                 let draw = presentation.clone();
-                let callback = Arc::new(move |increment: u64, total: Option<u64>| {
-                    if let Some((_, tracker)) = &observer { tracker.advance(&observed_path, increment, total); }
-                    if let Some(callback) = &progress { callback(increment, total); }
+                let callback: DownloadProgressFn = Arc::new(move |increment, total| {
+                    if let Some((_, tracker)) = &tracked { tracker.advance(&observed_path, increment, total); }
+                    subscribers(increment, total);
                     if let Some(draw) = &draw { draw.advance(increment, total); }
-                }) as DownloadProgressFn;
-                let result = self.download_eventual(url, path, callback).await;
+                });
+                let result = muna::download(&http, &url, &destination, Some(callback), DownloadDurability::Eventual).await;
                 if let Some(presentation) = presentation { presentation.finish(result.is_ok()); }
-                if let Some((tag, tracker)) = &self.preparation {
-                    let bytes = if result.is_ok() {
-                        tokio::fs::metadata(path).await.ok().map(|m| m.len())
-                    } else { None };
-                    tracker.finished(path, bytes);
-                    if result.is_err() { tracker.failed(tag, FailureStage::Download); }
+                if let Some((_, tracker)) = &observer {
+                    let bytes = if result.is_ok() { tokio::fs::metadata(&destination).await.ok().map(|m| m.len()) } else { None };
+                    tracker.finished(&destination, bytes);
                 }
-                result
+                result.map_err(|error| error.to_string())
+            })
+        }).await;
+        if let Some((tag, tracker)) = &self.preparation {
+            if result.is_ok() {
+                tracker.finished(path, tokio::fs::metadata(path).await.ok().map(|m| m.len()));
+            } else {
+                tracker.failed(tag, FailureStage::Download);
             }
-        };
-        // Best-effort cleanup: drop the map entry once no download holds it.
-        download_locks()
-            .remove_if(&path.to_path_buf(), |_, lock| Arc::strong_count(lock) <= 2);
-        result
+        }
+        result.map_err(muna::MunaError::Native)
     }
 
     async fn upload(&self, path: &Path) -> Result<String> {
         self.inner.upload(path).await
-    }
-}
-
-impl ServerClient {
-
-    /// Publish as soon as the bytes are in page cache; see the type-level
-    /// durability note.
-    async fn download_eventual(
-        &self,
-        url: &str,
-        path: &Path,
-        progress: DownloadProgressFn,
-    ) -> Result<()> {
-        muna::download(
-            &self.http,
-            url,
-            path,
-            Some(progress),
-            DownloadDurability::Eventual
-        ).await
     }
 }
 
@@ -348,6 +317,8 @@ mod tests {
             inner: MunaClient::new(None, None),
             http: cdn_client(),
             preparation: None,
+            downloads: Downloads::default(),
+            priority: Priority::default(),
         }
     }
 
@@ -465,8 +436,9 @@ mod preparation_tests {
         let resource = muna::types::PredictionResource { kind: "dso".into(), url: url.clone(), name: None, size: Some(1024) };
         tracker.manifest("a", &root, &[resource.clone()]).await;
         tracker.manifest("b", &root, &[resource]).await;
-        let a = ServerClient::tracking(None, "a", tracker.clone());
-        let b = ServerClient::tracking(None, "b", tracker.clone());
+        let downloads = Downloads::default();
+        let a = ServerClient::scheduled(None, "a", tracker.clone(), downloads.clone(), Priority::default());
+        let b = ServerClient::scheduled(None, "b", tracker.clone(), downloads, Priority::default());
         let callback_bytes = Arc::new(AtomicU64::new(0));
         let observed = callback_bytes.clone();
         let callback: DownloadProgressFn = Arc::new(move |bytes, _| { observed.fetch_add(bytes, Ordering::Relaxed); });

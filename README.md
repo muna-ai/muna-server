@@ -13,6 +13,8 @@ travels in each request's `model` field, so one server can serve any predictor o
 | `GET`  |  `/health`             | Health check (`{"status":"ok"}`).                        |
 | `GET`  | `/v1/models`           | Lists models this process has loaded so far.             |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat completion (JSON or SSE stream).  |
+| `POST` | `/v1/images/generations` | OpenAI-compatible image generation. |
+| `POST` | `/v1/images/edits` | Image editing and depth estimation (JSON references or multipart uploads). |
 | `POST` | `/v1/embeddings`       | OpenAI-compatible embeddings.                            |
 | `POST` | `/v1/audio/transcriptions` | OpenAI-compatible audio transcriptions. |
 

@@ -205,19 +205,16 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
                         continue;
                     }
                 }
-                // Warm FIRST so the gate guard exists before the cache
-                // request. `process` implies `disk`: track the cached tier
-                // too, so a later demotion reports `cached` instead of
-                // vanishing. The engine load downloads the same resources
-                // and the client's per-path single-flight de-duplicates,
-                // so the cache request is `Immediate` rather than queued.
+                // Promote queued files before scheduling background preparations.
+                // Process residency also tracks the cached tier for demotion;
+                // both paths share one preparation and resource queue.
                 state.registry.warm_reconcile(tag);
                 state.cache.ensure_cached(tag, CachePriority::Immediate);
             }
             Residency::Disk => {
                 // Demote: engine out (idempotent no-op when not loaded),
-                // resources on disk. Prefetch queues behind process-tier
-                // downloads.
+                // resources on disk. Individual prefetch files queue behind
+                // resources needed by process-tier models.
                 state.dispatcher.remove(tag);
                 state.registry.unload(tag).await;
                 state.cache.ensure_cached(tag, CachePriority::Prefetch);
@@ -248,9 +245,8 @@ fn valid_devices(devices: Option<&[u32]>) -> bool {
 
 /// Order directives so `process` goals are applied before the rest.
 ///
-/// `warm` takes the download-gate guard synchronously, so every disk-tier
-/// prefetch applied after the `process` pass queues behind the loads the
-/// plane is actually waiting on, whatever order the plane listed them in.
+/// Warming promotes the tag's resource queue priority synchronously, before
+/// disk-tier preparations are scheduled later in this reconcile pass.
 /// Stable within each group.
 fn process_first(models: &[ModelDescriptor]) -> impl Iterator<Item = &ModelDescriptor> {
     let (process, rest): (Vec<_>, Vec<_>) = models

@@ -18,7 +18,6 @@ use crate::notifications::NotificationCenter;
 use crate::platform::{self, Platform};
 use crate::serving::cache::CacheTracker;
 use crate::serving::dispatch::Dispatcher;
-use crate::serving::download_gate::DownloadGate;
 use crate::serving::lease::LeaseSupervisor;
 use crate::serving::registry::ModelRegistry;
 use crate::serving::preparation::PreparationTracker;
@@ -157,10 +156,6 @@ impl AppState {
                 None
             }
         };
-        // Orders process-tier downloads ahead of disk-tier prefetch; the
-        // registry holds the priority side, the cache tracker the waiting
-        // side. See `serving/download_gate.rs`.
-        let download_gate = Arc::new(DownloadGate::new());
         Ok(Self {
             registry: ModelRegistry::new(
                 keys.clone(),
@@ -168,7 +163,6 @@ impl AppState {
                 pinned,
                 notifications.clone(),
                 platform.clone(),
-                download_gate.clone(),
                 Some(lease.clone()),
                 policies.clone(),
                 preparation.clone(),
@@ -177,7 +171,6 @@ impl AppState {
             cache: CacheTracker::new(
                 keys.clone(),
                 notifications.clone(),
-                download_gate,
                 preparation,
                 prepared
             ),
@@ -228,7 +221,7 @@ impl AppState {
         let result = ready
             .muna
             .predictions
-            .create(model, None, None, None, None, None, None)
+            .create(model, None, None, None, None, None, None, None)
             .await;
         let delay = if result.is_ok() {
             Self::CHECKIN_INTERVAL_SECONDS
