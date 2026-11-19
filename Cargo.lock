@@ -1188,9 +1188,9 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "muna"
-version = "0.0.39"
+version = "0.0.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fed55fa528b02533d6c2b6b6426e043abfc3ff297aa774e2bfb13a015ead02a"
+checksum = "38ec3180a82db1af2d5484046bd4ff0e203aeb9b02069af3b8086eafffe29eac"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1235,6 +1235,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-util",
  "tower-http",

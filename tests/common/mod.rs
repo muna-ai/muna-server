@@ -197,9 +197,23 @@ impl ServerGuard {
         Self::spawn_with_options(None, models).await
     }
 
+    pub async fn spawn_with_api(stub: &StubControlPlane, api: &str, home: &std::path::Path) -> Self {
+        Self::spawn_configured(Some((stub, "test-node")), &[], &[
+            ("MUNA_API_URL", api), ("MUNA_HOME", home.to_str().unwrap()),
+        ]).await
+    }
+
     async fn spawn_with_options(
         managed: Option<(&StubControlPlane, &str)>,
         models: &[&str]
+    ) -> Self {
+        Self::spawn_configured(managed, models, &[]).await
+    }
+
+    async fn spawn_configured(
+        managed: Option<(&StubControlPlane, &str)>,
+        models: &[&str],
+        environment: &[(&str, &str)]
     ) -> Self {
         let port = ephemeral_port();
         let mut command = Command::new(env!("CARGO_BIN_EXE_muna-server"));
@@ -227,6 +241,7 @@ impl ServerGuard {
                 command.env("MUNA_ACCESS_KEY", key);
             }
         }
+        command.envs(environment.iter().copied());
         let child = command.spawn().expect("failed to spawn muna-server");
         let guard = Self { child, port };
         let health = format!("{}/health", guard.url());

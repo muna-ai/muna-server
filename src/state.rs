@@ -25,7 +25,7 @@ use crate::serving::prepared::PreparedModels;
 use crate::serving::remote_images::ImageFetcher;
 
 /// Per-tag deployment keys delivered by control-plane residency directives
-/// (`HeartbeatResponse::keys`). Read by the registry loader and the cache
+/// (`ModelDescriptor::key`). Read by the registry loader and the cache
 /// downloader when constructing per-model Muna clients; tags without an
 /// entry fall back to the process-wide `$MUNA_ACCESS_KEY`.
 pub(crate) type KeyStore = Arc<DashMap<String, String>>;

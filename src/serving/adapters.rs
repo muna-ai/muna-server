@@ -15,7 +15,7 @@ use muna::beta::adapters::{
 use muna::client::{MunaError, Result};
 use muna::Signature;
 
-type Slot<T> = OnceLock<std::result::Result<Arc<T>, String>>;
+type Slot<T> = OnceLock<Option<Arc<T>>>;
 
 /// A signature belongs to this set for its entire lifetime. Cache failures too:
 /// an unsupported surface cannot become supported until the signature changes.
@@ -87,16 +87,13 @@ impl Adapters {
     }
 }
 
-fn cached<T>(slot: &Slot<T>, create: impl FnOnce() -> Result<T>) -> Result<Arc<T>> {
-    slot.get_or_init(|| {
-        create().map(Arc::new).map_err(|error| match error {
-            MunaError::InvalidInput(message) => message,
-            error => error.to_string(),
+fn cached<T>(slot: &Slot<T>, create: impl FnOnce() -> Option<T>) -> Result<Arc<T>> {
+    slot.get_or_init(|| create().map(Arc::new))
+        .as_ref()
+        .map(Arc::clone)
+        .ok_or_else(|| {
+            MunaError::InvalidInput("Predictor signature is incompatible with this endpoint".into())
         })
-    })
-    .as_ref()
-    .map(Arc::clone)
-    .map_err(|message| MunaError::InvalidInput(message.clone()))
 }
 
 #[cfg(test)]
@@ -114,7 +111,7 @@ mod tests {
                     scope.spawn(|| {
                         cached(&slot, || {
                             calls.fetch_add(1, Ordering::SeqCst);
-                            Ok(42)
+                            Some(42)
                         })
                         .unwrap()
                     })
@@ -129,21 +126,47 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_surfaces_are_cached_without_changing_the_error() {
+    fn unsupported_surfaces_are_cached_as_invalid_input() {
         let slot = Slot::<usize>::new();
         let mut calls = 0;
         for _ in 0..2 {
             let error = cached(&slot, || {
                 calls += 1;
-                Err(MunaError::InvalidInput("unsupported signature".into()))
+                None
             })
             .unwrap_err();
             assert!(
-                matches!(error, MunaError::InvalidInput(message) if message == "unsupported signature")
+                matches!(error, MunaError::InvalidInput(message) if message == "Predictor signature is incompatible with this endpoint")
             );
         }
         assert_eq!(calls, 1);
     }
+    #[test]
+    fn chat_surfaces_require_explicit_messages_denotation() {
+        let mut signature: Signature = serde_json::from_value(serde_json::json!({
+            "inputs":[{"name":"conversation", "dtype":"list"}],
+            "outputs":[{"name":"chunk", "dtype":"dict", "schema":{"title":"ChatCompletionChunk"}}],
+        }))
+        .unwrap();
+        let unannotated = Adapters::new(signature.clone());
+        assert!(matches!(
+            unannotated.completions(),
+            Err(MunaError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            unannotated.messages(),
+            Err(MunaError::InvalidInput(_))
+        ));
+
+        signature.inputs[0].denotation = Some("openai.chat.completions.messages".into());
+        let annotated = Adapters::new(signature);
+        assert_eq!(
+            annotated.completions().unwrap().messages.name,
+            "conversation"
+        );
+        assert_eq!(annotated.messages().unwrap().messages.name, "conversation");
+    }
+
     fn signature(input: &str) -> Signature {
         serde_json::from_value(serde_json::json!({
             "inputs":[{"name":input, "dtype":"list"}],

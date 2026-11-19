@@ -131,6 +131,10 @@ impl From<&BatchPlan> for DispatchMode {
 pub(crate) struct ModelStatus {
     /// Predictor tag.
     pub tag: String,
+    /// Lowercase hex SHA-256 of the deployment key used for this actual state.
+    /// Never copied from a newer goal while an old engine is still draining.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_hash: Option<String>,
     /// Model lifecycle state.
     pub state: ModelLifecycle,
     /// Load failure message, when `state` is `failed`.
@@ -382,8 +386,9 @@ fn collect_model_status(
         .snapshot()
         .into_iter()
         .map(|(tag, state)| match state {
-            ModelState::Loading { devices, .. } => ModelStatus {
+            ModelState::Loading { devices, key_hash, .. } => ModelStatus {
                 device_ids: devices,
+                key_hash,
                 ..empty_status(tag, ModelLifecycle::Loading, None)
             },
             ModelState::Ready(model) => {
@@ -391,6 +396,7 @@ fn collect_model_status(
                 let telemetry = model.stats.telemetry.summarize().unwrap_or_default();
                 ModelStatus {
                     tag,
+                    key_hash: model.key_hash.clone(),
                     state: if model.execution.is_retired() { ModelLifecycle::Loading } else { ModelLifecycle::Ready },
                     error: None,
                     batch_mode: Some((&model.plan).into()),
@@ -417,30 +423,33 @@ fn collect_model_status(
                     build: model.build.clone(),
                 }
             },
-            ModelState::Failed { error, .. } => {
-                empty_status(tag, ModelLifecycle::Failed, Some(error))
+            ModelState::Failed { error, key_hash, .. } => ModelStatus {
+                key_hash,
+                ..empty_status(tag, ModelLifecycle::Failed, Some(error))
             }
         })
         .collect();
-    let cached: std::collections::HashSet<_> = cache.snapshot().into_iter()
-        .filter(|(_, state)| matches!(state, CacheState::Cached))
-        .map(|(tag, _)| tag).collect();
-    for (tag, state) in cache.snapshot() {
-        if statuses.iter().any(|status| status.tag == tag) {
+    let cached: HashMap<_, _> = cache.snapshot().into_iter().collect();
+    for (tag, entry) in &cached {
+        if statuses.iter().any(|status| &status.tag == tag) {
             continue;
         }
-        let status = match state {
-            CacheState::Caching => empty_status(tag, ModelLifecycle::Caching, None),
-            CacheState::Cached => empty_status(tag, ModelLifecycle::Cached, None),
+        let mut status = match &entry.state {
+            CacheState::Caching => empty_status(tag.clone(), ModelLifecycle::Caching, None),
+            CacheState::Cached => empty_status(tag.clone(), ModelLifecycle::Cached, None),
             CacheState::Failed { error, .. } => {
-                empty_status(tag, ModelLifecycle::Failed, Some(error))
+                empty_status(tag.clone(), ModelLifecycle::Failed, Some(error.clone()))
             }
         };
+        status.key_hash = entry.key_hash.clone();
         statuses.push(status);
     }
     for status in &mut statuses {
-        if status.build.is_none() { status.build = cache.build(&status.tag); }
-        apply_preparation(status, cache.progress(&status.tag), cache.failure(&status.tag), cached.contains(&status.tag));
+        if cached.get(&status.tag).is_some_and(|entry| entry.key_hash == status.key_hash) {
+            if status.build.is_none() { status.build = cache.build(&status.tag); }
+            apply_preparation(status, cache.progress(&status.tag), cache.failure(&status.tag),
+                matches!(cached[&status.tag].state, CacheState::Cached));
+        }
     }
     statuses
 }
@@ -472,6 +481,7 @@ fn empty_status(
 ) -> ModelStatus {
     ModelStatus {
         tag,
+        key_hash: None,
         state,
         error,
         batch_mode: None,
@@ -575,4 +585,15 @@ mod tests {
         assert_eq!(value["build"], json!("9f2c41aa"));
         assert!(value.get("device_ids").is_none());
     }
+
+    #[test]
+    fn deployment_fingerprint_is_reported_without_the_credential() {
+        let key = "private-deployment-credential";
+        let mut status = empty_status("@test/model".into(), ModelLifecycle::Cached, None);
+        status.key_hash = Some(crate::client::key_hash(key));
+        let body = serde_json::to_value(status).unwrap();
+        assert_eq!(body["key_hash"], crate::client::key_hash(key));
+        assert!(!body.to_string().contains(key));
+    }
+
 }

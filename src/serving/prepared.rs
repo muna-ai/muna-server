@@ -5,7 +5,9 @@
 
 //! Reuse disk preparation when promoting a predictor to process residency.
 //! This owns metadata and a download-only client, never creates an engine.
-//! Native loading still performs the SDK's normal token refresh and validation.
+//! Managed metadata is pinned by deployment key; unkeyed standalone metadata
+//! retains a short TTL. Native loading uses the server transport's disk metadata
+//! cache, while runtime tokens still receive expiry checks and validation.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,7 +24,7 @@ use super::predict;
 use super::downloads::{Downloads, Priority};
 use super::preparation::PreparationTracker;
 
-const MAX_AGE: Duration = Duration::from_secs(300);
+const STANDALONE_MAX_AGE: Duration = Duration::from_secs(300);
 
 /// Priority and cancellation follow the preparation, even while its caller
 /// waits on a blocking worker. Retirement never cancels a native invocation.
@@ -70,7 +72,7 @@ struct Snapshot {
 
 impl Snapshot {
     fn reusable(&self, key: &Option<String>) -> bool {
-        self.key == *key && self.at.elapsed() < MAX_AGE
+        self.key == *key && (key.is_some() || self.at.elapsed() < STANDALONE_MAX_AGE)
     }
 }
 
@@ -86,8 +88,12 @@ impl PreparedModels {
         key: Option<String>,
         progress: PreparationTracker
     ) -> Result<Arc<PreparedModel>, String> {
-        let slot = self.slots.entry(tag.to_owned()).or_default().clone();
-        let mut snapshot = slot.snapshot.lock().await;
+        let (slot, progress) = {
+            let entry = self.slots.entry(tag.to_owned()).or_default();
+            (entry.clone(), progress.scoped(tag))
+        };
+        let mut snapshot = slot.run(async { Ok(slot.snapshot.lock().await) }).await.map_err(|error| error.to_string())?;
+        if slot.cancellation.is_cancelled() { return Err("Model preparation retired.".into()); }
         if let Some(cached) = snapshot.as_ref().filter(|cached| cached.reusable(&key)) {
             return Ok(cached.model.clone());
         }
@@ -170,13 +176,16 @@ mod tests {
     }
 
     #[test]
-    fn rotated_credentials_and_expired_metadata_require_fresh_preparation() {
+    fn managed_metadata_is_pinned_and_unkeyed_metadata_keeps_its_ttl() {
         let mut cached = snapshot(Some("old-deployment-key".into()));
         assert!(!cached.reusable(&Some("new-deployment-key".into())));
         assert!(!cached.reusable(&None));
         assert!(cached.reusable(&cached.key));
-        cached.at -= MAX_AGE;
-        assert!(!cached.reusable(&cached.key));
+        cached.at -= STANDALONE_MAX_AGE;
+        assert!(cached.reusable(&cached.key));
+        let mut standalone = snapshot(None);
+        standalone.at -= STANDALONE_MAX_AGE;
+        assert!(!standalone.reusable(&None));
     }
 
     #[tokio::test]

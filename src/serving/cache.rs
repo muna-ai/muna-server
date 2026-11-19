@@ -58,10 +58,17 @@ type Downloader = Arc<
         + Sync
 >;
 
+#[derive(Clone)]
+pub(crate) struct CacheEntry {
+    pub state: CacheState,
+    pub key_hash: Option<String>,
+}
+
 /// Tracks which tags have complete resources on disk. Cloneable handle;
 /// state is shared.
 #[derive(Clone)]
 pub(crate) struct CacheTracker {
+    keys: KeyStore,
     /// Performs the download for one tag.
     downloader: Downloader,
     preparation: PreparationTracker,
@@ -69,7 +76,7 @@ pub(crate) struct CacheTracker {
     /// Per-tag disk state. Absent-from-map means never requested (or
     /// retired by the control plane); shared with the download tasks, which
     /// write the terminal `Cached` / `Failed` state on completion.
-    states: Arc<DashMap<String, CacheState>>,
+    states: Arc<DashMap<String, CacheEntry>>,
     /// Serializes task completion with retirement so late downloads cannot reannounce tags.
     downloads: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// Poked on every tier write so the heartbeat reports it at once.
@@ -84,6 +91,7 @@ impl CacheTracker {
         preparation: PreparationTracker,
         prepared: PreparedModels
     ) -> Self {
+        let identities = keys.clone();
         let progress = preparation.clone();
         let models = prepared.clone();
         let downloader: Downloader = Arc::new(move |tag| {
@@ -93,6 +101,7 @@ impl CacheTracker {
             Box::pin(async move { models.prepare(&tag, key, progress).await.map(|_| ()) })
         });
         let mut tracker = Self::with_downloader(downloader, notifications);
+        tracker.keys = identities;
         tracker.preparation = preparation;
         tracker.prepared = prepared;
         tracker
@@ -103,6 +112,7 @@ impl CacheTracker {
         notifications: Arc<NotificationCenter>
     ) -> Self {
         Self {
+            keys: Arc::default(),
             downloader,
             preparation: PreparationTracker::new(notifications.clone()),
             prepared: PreparedModels::default(),
@@ -119,25 +129,26 @@ impl CacheTracker {
     pub(crate) fn ensure_cached(&self, tag: &str, priority: CachePriority) {
         self.prepared.set_process(tag, priority == CachePriority::Immediate);
         let mut downloads = self.downloads.lock().unwrap();
+        let key_hash = self.keys.get(tag).map(|key| crate::client::key_hash(key.value()));
         match self.states.entry(tag.to_string()) {
             dashmap::Entry::Occupied(mut entry) => {
-                match entry.get() {
+                match &entry.get().state {
                     CacheState::Caching | CacheState::Cached => return,
                     CacheState::Failed { at, .. } => {
                         if at.elapsed() < FAILED_RETRY_BACKOFF {
                             return;
                         }
-                        entry.insert(CacheState::Caching);
+                        entry.insert(CacheEntry { state: CacheState::Caching, key_hash: key_hash.clone() });
                     }
                 }
             }
             dashmap::Entry::Vacant(entry) => {
-                entry.insert(CacheState::Caching);
+                entry.insert(CacheEntry { state: CacheState::Caching, key_hash: key_hash.clone() });
             }
         }
         self.preparation.begin(tag);
         self.notifications.status_changed();
-        let task = self.spawn_download(tag.to_string());
+        let task = self.spawn_download(tag.to_string(), key_hash);
         downloads.insert(tag.to_string(), task);
     }
 
@@ -148,13 +159,13 @@ impl CacheTracker {
             task.abort();
         }
         self.states.remove(tag);
-        self.preparation.forget(tag);
         self.prepared.forget(tag);
+        self.preparation.forget(tag);
         self.notifications.status_changed();
     }
 
     /// Snapshot every tracked tag for status reporting.
-    pub(crate) fn snapshot(&self) -> Vec<(String, CacheState)> {
+    pub(crate) fn snapshot(&self) -> Vec<(String, CacheEntry)> {
         self.states
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
@@ -173,15 +184,18 @@ impl CacheTracker {
         self.preparation.failure(tag)
     }
 
-    fn spawn_download(&self, tag: String) -> tokio::task::JoinHandle<()> {
+    fn spawn_download(&self, tag: String, key_hash: Option<String>) -> tokio::task::JoinHandle<()> {
         let downloads = self.downloads.clone();
         let downloader = self.downloader.clone();
         let states = self.states.clone();
         let notifications = self.notifications.clone();
-        let progress = self.preparation.clone();
+        let progress = self.preparation.scoped(&tag);
+        // Capture the credential before scheduling; changing the goal later
+        // must not pair a new key's resources with the previous attempt's hash.
+        let downloading = downloader(tag.clone());
         tokio::spawn(async move {
             let start = Instant::now();
-            let result = downloader(tag.clone()).await;
+            let result = downloading.await;
             let mut downloads = downloads.lock().unwrap();
             let state = match result {
                 Ok(()) => {
@@ -200,7 +214,7 @@ impl CacheTracker {
                 }
             };
             downloads.remove(&tag);
-            states.insert(tag, state);
+            states.insert(tag, CacheEntry { state, key_hash });
             notifications.status_changed();
         })
     }
@@ -236,7 +250,7 @@ mod tests {
     ) -> bool {
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
-            if tracker.states.get(tag).is_some_and(|state| predicate(state.value())) {
+            if tracker.states.get(tag).is_some_and(|state| predicate(&state.state)) {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -315,4 +329,21 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(starts.load(Ordering::SeqCst), 1);
     }
+
+    #[tokio::test]
+    async fn cache_observations_keep_their_attempts_deployment_fingerprint() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let tracker = tracker(starts.clone());
+        tracker.keys.insert("@a/x".into(), "old-key".into());
+        tracker.ensure_cached("@a/x", CachePriority::Immediate);
+        assert!(wait_until(&tracker, "@a/x", |state| matches!(state, CacheState::Cached)).await);
+        tracker.keys.insert("@a/x".into(), "new-key".into());
+        assert_eq!(tracker.snapshot()[0].1.key_hash, Some(crate::client::key_hash("old-key")));
+        tracker.forget("@a/x");
+        tracker.ensure_cached("@a/x", CachePriority::Prefetch);
+        assert!(wait_until(&tracker, "@a/x", |state| matches!(state, CacheState::Cached)).await);
+        assert_eq!(tracker.snapshot()[0].1.key_hash, Some(crate::client::key_hash("new-key")));
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
 }

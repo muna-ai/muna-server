@@ -51,6 +51,8 @@ pub(crate) struct ReadyModel {
     /// Also carries the model's deployment key when the control plane
     /// supplied one.
     pub muna: Arc<Muna>,
+    /// Deployment whose metadata and native engine this handle owns.
+    pub key_hash: Option<String>,
     /// Native execution must drain before this assignment can be retired.
     pub execution: Arc<ModelExecution>,
     pub lease: Option<ModelLease>,
@@ -118,6 +120,10 @@ impl ModelExecution {
         Ok(guard)
     }
 
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+    }
+
     pub(crate) fn is_retired(&self) -> bool {
         self.retired.load(Ordering::Acquire)
     }
@@ -130,13 +136,13 @@ pub(crate) enum ModelState {
     /// Single-flight warmup in progress since the given instant (used to
     /// derive `Retry-After` for requests that give up waiting), on the
     /// given devices.
-    Loading { since: Instant, devices: Option<Vec<u32>> },
+    Loading { since: Instant, devices: Option<Vec<u32>>, key_hash: Option<String> },
     /// Engine warm, signature and batch plan known; shared with every
     /// request currently predicting against the model.
     Ready(Arc<ReadyModel>),
     /// The warmup failed at the given instant; `error` is surfaced to the
     /// requester (and the control plane) verbatim.
-    Failed { error: String, at: Instant },
+    Failed { error: String, at: Instant, key_hash: Option<String> },
 }
 
 /// One tag's entry in the registry map: the model's current lifecycle state
@@ -210,6 +216,7 @@ struct RegistryInner {
     loader: Loader,
     /// Control-plane device assignments, read when a load starts.
     devices: DeviceStore,
+    keys: KeyStore,
     /// Pinned model set (`--models`): the only tags this server will load.
     /// `None` means open behavior (any tag loadable on demand).
     pinned: Option<HashSet<String>>,
@@ -241,6 +248,7 @@ impl ModelRegistry {
         preparation: PreparationTracker,
         prepared: PreparedModels
     ) -> Self {
+        let identities = keys.clone();
         let load_lease = lease.clone();
         let load_policies = policies.clone();
         let loader: Loader = Arc::new(move |tag, devices| {
@@ -271,6 +279,7 @@ impl ModelRegistry {
         let mut registry = Self::with_loader(loader, devices, pinned, notifications, platform);
         let inner = Arc::get_mut(&mut registry.inner).unwrap();
         inner.lease = lease;
+        inner.keys = identities;
         inner.policies = policies;
         registry
     }
@@ -287,6 +296,7 @@ impl ModelRegistry {
                 models: DashMap::new(),
                 loader,
                 devices,
+                keys: Arc::default(),
                 pinned,
                 last_load_secs: AtomicU64::new(DEFAULT_LOAD_SECS),
                 notifications,
@@ -336,7 +346,7 @@ impl ModelRegistry {
                     let (watch, rx) = tokio::sync::watch::channel(());
                     let devices = self.assigned_devices(tag);
                     entry.insert(Slot {
-                        state: ModelState::Loading { since: Instant::now(), devices: devices.clone() },
+                        state: ModelState::Loading { since: Instant::now(), devices: devices.clone(), key_hash: self.current_key_hash(tag) },
                         watch,
                         unload_requested: false
                     });
@@ -395,7 +405,7 @@ impl ModelRegistry {
                 let (watch, _rx) = tokio::sync::watch::channel(());
                 let devices = self.assigned_devices(tag);
                 entry.insert(Slot {
-                    state: ModelState::Loading { since: Instant::now(), devices: devices.clone() },
+                    state: ModelState::Loading { since: Instant::now(), devices: devices.clone(), key_hash: self.current_key_hash(tag) },
                     watch,
                     unload_requested: false
                 });
@@ -414,6 +424,10 @@ impl ModelRegistry {
             ModelState::Ready(model) => Some(model.devices.clone()),
             ModelState::Failed { .. } => None,
         })
+    }
+
+    fn current_key_hash(&self, tag: &str) -> Option<String> {
+        self.inner.keys.get(tag).map(|key| crate::client::key_hash(key.value()))
     }
 
     fn assigned_devices(&self, tag: &str) -> Option<Vec<u32>> {
@@ -435,36 +449,52 @@ impl ModelRegistry {
         self.warm(tag);
     }
 
-    /// Unload a model. Idempotent: an absent tag (or a repeated unload of a
-    /// still-loading tag) is a no-op. Unloading a `Loading` tag defers the
-    /// delete to the load task (see `Slot::unload_requested`).
-    ///
-    /// Retire the assignment, drain native executions, delete through the
-    /// owning Muna client, then free the slot for a replacement engine.
+    /// Stop new admissions synchronously, before waiting on any engine drain.
+    pub(crate) fn retire(&self, tag: &str) {
+        if let Some(mut slot) = self.inner.models.get_mut(tag) {
+            slot.unload_requested = true;
+            if let ModelState::Ready(model) = &slot.state {
+                model.execution.retire();
+            }
+        }
+        self.inner.notifications.status_changed();
+    }
+
+    /// Drain native execution and delete through the owning SDK client. An
+    /// initializing engine is deleted by its load task; wait for that deletion
+    /// before making the tag available for another deployment.
     pub(crate) async fn unload(&self, tag: &str) {
-        let model = {
+        let (model, mut completion) = {
             let Some(mut slot) = self.inner.models.get_mut(tag) else { return; };
             match &slot.state {
                 ModelState::Loading { .. } => {
                     slot.unload_requested = true;
-                    return;
+                    (None, Some(slot.watch.subscribe()))
                 }
-                ModelState::Ready(model) => Some(model.clone()),
-                ModelState::Failed { .. } => None,
+                ModelState::Ready(model) => (Some(model.clone()), None),
+                ModelState::Failed { .. } => (None, None),
             }
         };
+        if let Some(waiter) = &mut completion {
+            // Native initialization is not cancellable. Its task deletes the
+            // resulting handle before closing the slot, then replacement is safe.
+            while waiter.changed().await.is_ok() {}
+            return;
+        }
         let Some(model) = model else {
             self.inner.models.remove(tag);
             self.inner.notifications.status_changed();
             return;
         };
-        if model.execution.retired.swap(true, Ordering::AcqRel) {
-            return;
-        }
+        model.execution.retire();
         self.inner.notifications.status_changed();
         // Keep the slot occupied until the old engine is gone. Neither a request
         // nor the next heartbeat can start a second copy during this drain.
         let _exclusive = model.execution.gate.clone().write_owned().await;
+        if !self.inner.models.get(tag).is_some_and(|slot|
+            matches!(&slot.state, ModelState::Ready(current) if Arc::ptr_eq(current, &model))) {
+            return;
+        }
         delete_predictor(&model.muna, tag).await;
         self.inner.models.remove(tag);
         self.inner.notifications.status_changed();
@@ -475,14 +505,16 @@ impl ModelRegistry {
         self.inner.models.iter()
             .map(|entry| {
                 let state = match &entry.state {
-                    ModelState::Loading { since, devices } => ModelState::Loading {
+                    ModelState::Loading { since, devices, key_hash } => ModelState::Loading {
                         since: *since,
-                        devices: devices.clone()
+                        devices: devices.clone(),
+                        key_hash: key_hash.clone()
                     },
                     ModelState::Ready(model) => ModelState::Ready(model.clone()),
-                    ModelState::Failed { error, at } => ModelState::Failed {
+                    ModelState::Failed { error, at, key_hash } => ModelState::Failed {
                         error: error.clone(),
-                        at: *at
+                        at: *at,
+                        key_hash: key_hash.clone()
                     },
                 };
                 (entry.key().clone(), state)
@@ -522,6 +554,7 @@ impl ModelRegistry {
         tag: String,
         devices: Option<Vec<u32>>
     ) {
+        let key_hash = self.current_key_hash(&tag);
         let inner = self.inner.clone();
         let loading = (inner.loader)(tag.clone(), devices.clone());
         tokio::spawn(async move {
@@ -572,6 +605,7 @@ impl ModelRegistry {
                             })
                         }),
                         execution: Arc::default(),
+                        key_hash: key_hash.clone(),
                         muna,
                         loaded_at: Instant::now(),
                         plan: BatchPlan::from_signature(&signature),
@@ -584,7 +618,7 @@ impl ModelRegistry {
                 }
                 Err(error) => {
                     tracing::error!(tag = %tag, error = %error, "model load failed");
-                    ModelState::Failed { error, at: Instant::now() }
+                    ModelState::Failed { error, at: Instant::now(), key_hash }
                 }
             };
             let mut delete_after_load = false;
@@ -644,6 +678,7 @@ async fn load_model(
     // token validation and refresh through the SDK's persistent cache.
     let download_started = Instant::now();
     let prepared = prepared.prepare(tag, key, preparation.clone()).await?;
+    let preparation = preparation.scoped(tag);
     // A fresh service owns exactly this engine's handles; the shared prepared
     // snapshot retains only its HTTP transport and cannot extend engine life.
     let muna = Arc::new(Muna::with_client(prepared.client.clone()));
@@ -988,3 +1023,7 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+#[path = "registry_rollout_tests.rs"]
+mod rollout_tests;

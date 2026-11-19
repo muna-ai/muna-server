@@ -132,6 +132,20 @@ async fn reconcile(
 /// Diff the goal residency map against local state. Every arm is
 /// idempotent, so re-applying the same goal each beat is free.
 async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
+    // Fence all superseded engines before waiting for any one drain. Status
+    // collection remains independent and reports each old attempt's own hash.
+    let changed: Vec<_> = reconcile.models.iter().filter(|descriptor| {
+        let old = state.keys.get(&descriptor.tag).map(|key| key.value().clone());
+        old != descriptor.key
+    }).collect();
+    for descriptor in &changed {
+        state.registry.retire(&descriptor.tag);
+        state.dispatcher.remove(&descriptor.tag);
+    }
+    for descriptor in &changed {
+        state.registry.unload(&descriptor.tag).await;
+        state.cache.forget(&descriptor.tag);
+    }
     state.lease.retain_reservations(|tag| state.registry.devices(tag).is_some());
     let mut rejected = std::collections::HashSet::new();
     for descriptor in &reconcile.models {
@@ -184,6 +198,8 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
         let tag = &descriptor.tag;
         if let Some(key) = &descriptor.key {
             state.keys.insert(tag.clone(), key.clone());
+        } else {
+            state.keys.remove(tag);
         }
         if let Some(devices) = &descriptor.devices {
             state.devices.insert(tag.clone(), devices.clone());

@@ -21,12 +21,17 @@ use muna::MunaClient;
 use crate::serving::preparation::{FailureStage, PreparationTracker};
 use crate::serving::downloads::{Downloads, Priority};
 
+mod metadata;
+pub(crate) use metadata::key_hash;
+use metadata::DeploymentCache;
+
 /// Server transport. All keyed clients on a node share a resource scheduler;
 /// only the active transfer updates physical bytes in the preparation tracker.
 /// Cache publication uses eventual durability so loading can read page cache
 /// without waiting for a slow ephemeral disk's writeback.
 pub(crate) struct ServerClient {
     inner: MunaClient,
+    deployment: Option<DeploymentCache>,
     /// Dedicated CDN client for `download`. The API client's pool is
     /// unrelated to CDN traffic, and the durability policy lives with the
     /// caller of `muna::download`, not with `MunaClient`.
@@ -43,10 +48,13 @@ impl ServerClient {
     /// `None` falls back to `$MUNA_ACCESS_KEY` (standalone `muna deploy`
     /// behavior).
     pub fn with_key(key: Option<String>) -> Self {
-        let access_key = key.or_else(|| std::env::var("MUNA_ACCESS_KEY").ok());
+        let access_key = key.clone().or_else(|| std::env::var("MUNA_ACCESS_KEY").ok());
         let url = std::env::var("MUNA_API_URL").ok();
+        let inner = MunaClient::new(access_key.as_deref(), url.as_deref());
+        let deployment = key.map(|key| DeploymentCache::new(inner.cache_path(), &key));
         Self {
-            inner: MunaClient::new(access_key.as_deref(), url.as_deref()),
+            inner,
+            deployment,
             http: cdn_client(),
             preparation: None,
             downloads: Downloads::default(),
@@ -66,7 +74,7 @@ impl ServerClient {
         downloads: Downloads,
         priority: Priority
     ) -> Self {
-        tracker.begin(tag);
+        let tracker = tracker.scoped(tag);
         let mut client = Self::with_key(key);
         client.preparation = Some((tag.to_owned(), tracker));
         client.downloads = downloads;
@@ -95,7 +103,7 @@ impl Client for ServerClient {
     }
 
     fn cache_path(&self) -> &Path {
-        self.inner.cache_path()
+        self.deployment.as_ref().map(DeploymentCache::sdk).unwrap_or_else(|| self.inner.cache_path())
     }
 
     async fn request(&self, input: RequestInput) -> Result<serde_json::Value> {
@@ -104,14 +112,28 @@ impl Client for ServerClient {
             base.trim_end_matches('/') == self.url().trim_end_matches('/') &&
             self.preparation.as_ref().is_some_and(|(tag, _)|
                 input.body.as_ref().and_then(|body| body.get("tag")).and_then(|tag| tag.as_str()) == Some(tag.as_str()));
-        let response = Client::request(&self.inner, input).await;
+        let entry = self.deployment.as_ref().and_then(|cache| cache.entry(&input, self.url()));
+        let cached = match (&self.deployment, &entry) {
+            (Some(cache), Some(path)) => cache.read(path, &input).await,
+            _ => None,
+        };
+        let fetched = cached.is_none();
+        let response = match cached {
+            Some(body) => Ok(body),
+            None => Client::request(&self.inner, input).await,
+        };
+        if fetched {
+            if let (Some(cache), Some(path), Ok(body)) = (&self.deployment, entry, &response) {
+                cache.write(&path, body).await;
+            }
+        }
         if resolving {
             if let Some((tag, tracker)) = &self.preparation {
                 match &response {
                     Ok(body) => {
                         let resources = body.get("resources").cloned().unwrap_or(serde_json::json!([]));
                         if let Ok(resources) = serde_json::from_value::<Vec<muna::types::PredictionResource>>(resources) {
-                            tracker.manifest(tag, self.cache_path(), &resources).await;
+                            tracker.manifest(tag, self.inner.cache_path(), &resources).await;
                         }
                     }
                     Err(_) => tracker.failed(tag, FailureStage::Resolve),
@@ -135,12 +157,13 @@ impl Client for ServerClient {
         path: &Path,
         progress: Option<DownloadProgressFn>,
     ) -> Result<()> {
+        let shared = self.deployment.as_ref().map(|cache| cache.shared_path(path)).unwrap_or_else(|| path.into());
         let http = self.http.clone();
         let url = url.to_owned();
-        let destination = path.to_owned();
+        let destination = shared.clone();
         let observer = self.preparation.clone();
         let draw_progress = progress.is_none();
-        let result = self.downloads.download(path, self.priority.clone(), progress, move |subscribers| {
+        let result = self.downloads.download(&shared, self.priority.clone(), progress, move |subscribers| {
             Box::pin(async move {
                 if let Some((_, tracker)) = &observer { tracker.started(&destination); }
                 let presentation = draw_progress.then(|| DownloadProgress::new(&destination));
@@ -163,12 +186,23 @@ impl Client for ServerClient {
         }).await;
         if let Some((tag, tracker)) = &self.preparation {
             if result.is_ok() {
-                tracker.finished(path, tokio::fs::metadata(path).await.ok().map(|m| m.len()));
+                tracker.finished(&shared, tokio::fs::metadata(&shared).await.ok().map(|m| m.len()));
             } else {
                 tracker.failed(tag, FailureStage::Download);
             }
         }
-        result.map_err(muna::MunaError::Native)
+        result.map_err(muna::MunaError::Native)?;
+        if path != shared {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|error| muna::MunaError::Native(error.to_string()))?;
+            }
+            match tokio::fs::hard_link(&shared, path).await {
+                Ok(()) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(error) => return Err(muna::MunaError::Native(format!("Failed to link predictor resource: {error}"))),
+            }
+        }
+        Ok(())
     }
 
     async fn upload(&self, path: &Path) -> Result<String> {
@@ -315,6 +349,7 @@ mod tests {
     fn test_client() -> ServerClient {
         ServerClient {
             inner: MunaClient::new(None, None),
+            deployment: None,
             http: cdn_client(),
             preparation: None,
             downloads: Downloads::default(),

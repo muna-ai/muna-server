@@ -38,12 +38,13 @@ use muna::MunaError;
 
 use crate::serving::batch::{compute_batch_key, item_count, BatchPlan};
 use crate::serving::predict;
-use crate::serving::registry::ReadyModel;
+use crate::serving::registry::{ModelExecution, ReadyModel};
 use crate::serving::stats::{PredictionSample, SampleDetail};
 use worker::{BufferedWorker, PredictFn, PredictItem, CHANNEL_BUFFER};
 
 /// Per-model dispatch state, derived from the model's `BatchPlan` on first
 /// use and cached in `Dispatcher::entries` for the model's lifetime.
+#[derive(Clone)]
 enum Entry {
     /// The model tolerates no concurrent invocation: requests serialize on a
     /// per-model mutex.
@@ -62,6 +63,11 @@ enum Entry {
     Continuous,
 }
 
+struct Binding {
+    execution: Arc<ModelExecution>,
+    entry: Entry,
+}
+
 /// Routes predictions through each model's batch plan.
 ///
 /// One dispatcher serves the whole process; it is cheap to clone (a shared
@@ -72,7 +78,7 @@ enum Entry {
 #[derive(Clone)]
 pub(crate) struct Dispatcher {
     /// Lazily-populated dispatch state per model tag.
-    entries: Arc<DashMap<String, Entry>>,
+    entries: Arc<DashMap<String, Binding>>,
 }
 
 impl Dispatcher {
@@ -91,7 +97,8 @@ impl Dispatcher {
         acceleration: Acceleration
     ) -> Result<Prediction, MunaError> {
         let _admission = model.admit().await?;
-        self.ensure_entry(tag, model);
+        let entry = self.ensure_entry(tag, model).ok_or_else(||
+            MunaError::Native("Model deployment retired; retry the request.".into()))?;
         // Snapshot the entry's dispatch handle without holding the shard
         // lock across an await.
         enum Route {
@@ -99,10 +106,10 @@ impl Dispatcher {
             Locked(Arc<tokio::sync::Mutex<()>>),
             Queued(async_channel::Sender<PredictItem>),
         }
-        let route = match &*self.entries.get(tag).expect("entry just ensured") {
+        let route = match entry {
             Entry::Continuous               => Route::Direct,
-            Entry::Sequential { lock }      => Route::Locked(lock.clone()),
-            Entry::Buffered { tx, .. }      => Route::Queued(tx.clone()),
+            Entry::Sequential { lock }      => Route::Locked(lock),
+            Entry::Buffered { tx, .. }      => Route::Queued(tx),
         };
         match route {
             Route::Direct => {
@@ -162,10 +169,9 @@ impl Dispatcher {
         tag: &str,
         model: &Arc<ReadyModel>
     ) -> predict::Guard {
-        self.ensure_entry(tag, model);
-        let lock = match &*self.entries.get(tag).expect("entry just ensured") {
-            Entry::Sequential { lock }      => Some(lock.clone()),
-            Entry::Buffered { lock, .. }    => Some(lock.clone()),
+        let lock = match self.ensure_entry(tag, model)? {
+            Entry::Sequential { lock }      => Some(lock),
+            Entry::Buffered { lock, .. }    => Some(lock),
             Entry::Continuous               => None,
         }?;
         Some(lock.lock_owned().await)
@@ -176,9 +182,15 @@ impl Dispatcher {
         self.entries.remove(tag);
     }
 
-    fn ensure_entry(&self, tag: &str, model: &Arc<ReadyModel>) {
-        if self.entries.contains_key(tag) {
-            return;
+    fn ensure_entry(&self, tag: &str, model: &Arc<ReadyModel>) -> Option<Entry> {
+        let slot = self.entries.entry(tag.to_owned());
+        // Fence a delayed caller holding an old ReadyModel before it can
+        // recreate a retired queue or replace the new deployment's queue.
+        if model.execution.is_retired() { return None; }
+        if let dashmap::Entry::Occupied(slot) = &slot {
+            if Arc::ptr_eq(&slot.get().execution, &model.execution) {
+                return Some(slot.get().entry.clone());
+            }
         }
         let entry = match &model.plan {
             BatchPlan::Sequential => Entry::Sequential {
@@ -233,7 +245,13 @@ impl Dispatcher {
                 Entry::Buffered { tx, lock }
             }
         };
-        self.entries.entry(tag.to_string()).or_insert(entry);
+        let route = entry.clone();
+        let binding = Binding { execution: model.execution.clone(), entry };
+        match slot {
+            dashmap::Entry::Occupied(mut slot) => { slot.insert(binding); }
+            dashmap::Entry::Vacant(slot) => { slot.insert(binding); }
+        }
+        Some(route)
     }
 
     async fn predict(
@@ -288,6 +306,7 @@ mod tests {
         Arc::new(ReadyModel {
             lease: None,
             execution: Arc::default(),
+            key_hash: None,
             muna: Arc::new(Muna::new(None, None)),
             loaded_at: Instant::now(),
             signature: Signature { inputs: vec![], outputs: vec![] },
@@ -351,8 +370,8 @@ mod tests {
         let dispatcher = Dispatcher::new();
         let model = ready_model(buffered_plan());
         let tag = "@test/buffered";
-        dispatcher.ensure_entry(tag, &model);
-        let lock = match &*dispatcher.entries.get(tag).expect("entry") {
+        let entry = dispatcher.ensure_entry(tag, &model).unwrap();
+        let lock = match &entry {
             Entry::Buffered { lock, .. } => lock.clone(),
             _ => panic!("expected a buffered entry"),
         };
@@ -362,4 +381,19 @@ mod tests {
         drop(guard);
         assert!(lock.try_lock().is_ok());
     }
+
+    #[tokio::test]
+    async fn a_delayed_old_request_cannot_recreate_a_retired_dispatcher() {
+        let dispatcher = Dispatcher::new();
+        let tag = "@test/redeployed";
+        let old = ready_model(buffered_plan());
+        assert!(matches!(dispatcher.ensure_entry(tag, &old), Some(Entry::Buffered { .. })));
+        old.execution.retire();
+        dispatcher.remove(tag);
+        let current = ready_model(BatchPlan::Sequential);
+        assert!(matches!(dispatcher.ensure_entry(tag, &current), Some(Entry::Sequential { .. })));
+        assert!(dispatcher.ensure_entry(tag, &old).is_none());
+        assert!(Arc::ptr_eq(&dispatcher.entries.get(tag).unwrap().execution, &current.execution));
+    }
+
 }

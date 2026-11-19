@@ -121,6 +121,7 @@ struct ManifestResource {
 }
 
 struct Attempt {
+    identity: Arc<()>,
     stage: PreparationStage,
     manifest: Option<Vec<ManifestResource>>,
     failure: Option<PreparationFailure>,
@@ -137,6 +138,7 @@ struct Tracking {
 pub(crate) struct PreparationTracker {
     tracking: Arc<Mutex<Tracking>>,
     notifications: Arc<NotificationCenter>,
+    scope: Option<(String, Arc<()>)>,
 }
 
 impl PreparationTracker {
@@ -145,13 +147,29 @@ impl PreparationTracker {
         Self {
             tracking: Arc::default(),
             notifications,
+            scope: None,
         }
     }
 
+    /// Bind asynchronous observations to the current preparation attempt.
+    /// Forgetting a tag invalidates this scope without affecting shared files.
+    pub(crate) fn scoped(&self, tag: &str) -> Self {
+        if self.scope.is_some() { return self.clone(); }
+        self.begin(tag);
+        let identity = self.tracking.lock().unwrap().attempts.get(tag).map(|attempt| attempt.identity.clone()).unwrap_or_default();
+        Self { scope: Some((tag.into(), identity)), ..self.clone() }
+    }
+
+    fn matches(&self, tag: &str, attempt: &Attempt) -> bool {
+        self.scope.as_ref().is_none_or(|(name, identity)| name == tag && Arc::ptr_eq(identity, &attempt.identity))
+    }
+
     pub(crate) fn begin(&self, tag: &str) {
+        if self.scope.is_some() { return; }
         let mut tracking = self.tracking.lock().unwrap();
         // Cache and process-tier clients may resolve the same tag concurrently.
         tracking.attempts.entry(tag.into()).or_insert(Attempt {
+            identity: Arc::new(()),
             stage: PreparationStage::Resolving,
             manifest: None,
             failure: None,
@@ -159,6 +177,7 @@ impl PreparationTracker {
     }
 
     pub(crate) async fn manifest(&self, tag: &str, root: &Path, resources: &[PredictionResource]) {
+        self.begin(tag);
         let mut manifest = Vec::new();
         let mut seen = HashSet::new();
         for source in resources {
@@ -198,18 +217,11 @@ impl PreparationTracker {
         let complete = manifest
             .iter()
             .all(|item| item.resource.lock().unwrap().complete);
-        self.tracking.lock().unwrap().attempts.insert(
-            tag.into(),
-            Attempt {
-                stage: if complete {
-                    PreparationStage::Cached
-                } else {
-                    PreparationStage::Downloading
-                },
-                manifest: Some(manifest),
-                failure: None,
-            },
-        );
+        let mut tracking = self.tracking.lock().unwrap();
+        let Some(attempt) = tracking.attempts.get_mut(tag).filter(|attempt| self.matches(tag, attempt)) else { return; };
+        attempt.stage = if complete { PreparationStage::Cached } else { PreparationStage::Downloading };
+        attempt.manifest = Some(manifest);
+        attempt.failure = None;
         self.notifications.status_changed();
     }
 
@@ -275,7 +287,7 @@ impl PreparationTracker {
     }
 
     pub(crate) fn cached(&self, tag: &str) {
-        if let Some(attempt) = self.tracking.lock().unwrap().attempts.get_mut(tag) {
+        if let Some(attempt) = self.tracking.lock().unwrap().attempts.get_mut(tag).filter(|attempt| self.matches(tag, attempt)) {
             attempt.stage = PreparationStage::Cached;
             attempt.failure = None;
         }
@@ -288,13 +300,9 @@ impl PreparationTracker {
         stage: FailureStage
     ) {
         self.begin(tag);
-        self.tracking
-            .lock()
-            .unwrap()
-            .attempts
-            .get_mut(tag)
-            .unwrap()
-            .failure = Some(PreparationFailure::new(stage));
+        if let Some(attempt) = self.tracking.lock().unwrap().attempts.get_mut(tag).filter(|attempt| self.matches(tag, attempt)) {
+            attempt.failure = Some(PreparationFailure::new(stage));
+        }
         self.notifications.status_changed();
     }
 
@@ -534,4 +542,28 @@ mod tests {
         .unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[tokio::test]
+    async fn retired_observers_cannot_replace_a_new_manifest_or_failure() {
+        let tracker = tracker();
+        let root = root("retired-observer");
+        let old = tracker.scoped("model");
+        old.manifest("model", &root, &[resource("old", Some(100))]).await;
+        tracker.forget("model");
+        let current = tracker.scoped("model");
+        current.manifest("model", &root, &[resource("new", Some(200))]).await;
+        old.manifest("model", &root, &[resource("late-old", Some(1))]).await;
+        old.failed("model", FailureStage::Download);
+        old.cached("model");
+        assert_eq!(tracker.build("model").as_deref(), Some("new"));
+        assert!(tracker.failure("model").is_none());
+        assert_eq!(tracker.snapshot("model").unwrap().bytes_total, Some(200));
+        assert_eq!(tracker.snapshot("model").unwrap().stage, PreparationStage::Downloading);
+        tracker.forget("model");
+        old.failed("model", FailureStage::Resolve);
+        old.manifest("model", &root, &[]).await;
+        assert!(tracker.snapshot("model").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 }
