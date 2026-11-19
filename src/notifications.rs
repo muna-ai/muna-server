@@ -18,7 +18,8 @@ pub(crate) struct NotificationCenter {
     /// drain flag, plus throttled resource-download progress. Awaited by the control-plane heartbeat loop so a
     /// transition is reported immediately instead of on the next tick.
     /// `notify_one` stores at most one permit, so any number of changes
-    /// during an in-flight beat collapse into exactly one follow-up beat.
+    /// before a report collapse into one snapshot. During a request, a new
+    /// notification interrupts the wait and sends fresh state immediately.
     pub status: Notify,
 }
 

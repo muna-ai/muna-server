@@ -31,8 +31,26 @@ use crate::serving::registry::{ModelRegistry, ModelState};
 use crate::state::AppState;
 use crate::serving::preparation::{FailureStage, PreparationFailure, PreparationProgress};
 
+/// Orders full snapshots and their replies. The session is a monotonically
+/// allocated process epoch, persisted beside the node's resource cache and
+/// seeded from Unix nanoseconds. A restarted process may reset its sequence;
+/// neither clock adjustments nor delayed previous-session reports can regress it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct HeartbeatVersion {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub session: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sequence: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Serialize)]
 pub(crate) struct NodeStatus {
+    #[serde(flatten)]
+    pub heartbeat: HeartbeatVersion,
     /// Node identity assigned by the control plane; absent in standalone mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
@@ -212,7 +230,7 @@ pub(crate) enum Residency {
 /// Goal descriptor for one model in a heartbeat response -- the GOAL
 /// mirror of `ModelStatus` (the ACTUAL half): both sides of the protocol
 /// are flat, tag-keyed lists.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub(crate) struct ModelDescriptor {
     /// Predictor tag.
     pub tag: String,
@@ -255,8 +273,11 @@ pub(crate) struct LeasePolicy {
 /// `event_callback_urls` are GONE: the node diffs the goal residency map
 /// against its own state, and the KV relay derives its single target from
 /// the control-plane URL it already has (well-known `/v1/kv/events` route).
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Clone, Default)]
 pub(crate) struct HeartbeatResponse {
+    /// Echo the snapshot version; superseded replies must never apply goals.
+    #[serde(flatten)]
+    pub heartbeat: HeartbeatVersion,
     /// Goal descriptor (residency + download credential) per tag. An
     /// ABSENT tag means "no opinion" -- the node keeps its current state
     /// -- so an empty list (also the parse-failure / standalone default)
@@ -303,6 +324,7 @@ impl NodeStatus {
     pub(crate) fn collect(state: &AppState) -> NodeStatus {
         let disk = state.platform.disk_space_mb(&state.cache_path);
         NodeStatus {
+            heartbeat: HeartbeatVersion::default(),
             node_id: state.mode.node().map(|n| n.node_id.clone()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_s: state.start_time.elapsed().as_secs(),

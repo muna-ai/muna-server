@@ -362,7 +362,7 @@ dependencies = [
 [[package]]
 name = "corby"
 version = "0.0.1"
-source = "git+https://github.com/muna-ai/libcorby.git?branch=main#b03ef99322e0ccb12da7e87cdb6aa356e678b363"
+source = "git+https://github.com/muna-ai/libcorby.git?branch=main#88dd7b9f7b06095d0c47bd3b71dcbb866b071825"
 
 [[package]]
 name = "core-foundation"

@@ -16,7 +16,9 @@
 
 use std::sync::Arc;
 
-use crate::control::protocol::{HeartbeatResponse, ModelDescriptor, NodeStatus, Residency};
+use tokio::sync::watch;
+
+use crate::control::protocol::{HeartbeatResponse, HeartbeatVersion, ModelDescriptor, NodeStatus, Residency};
 use crate::serving::cache::CachePriority;
 use crate::state::AppState;
 
@@ -32,61 +34,99 @@ pub(crate) async fn run(state: Arc<AppState>) {
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("failed to build heartbeat client");
-    let mut interval = tokio::time::interval(node.heartbeat_interval);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        // Periodic cadence OR a state transition. `Notify::notify_one`
-        // stores at most one permit, so any number of transitions that
-        // land while a beat is in flight collapse into exactly one
-        // follow-up beat; no explicit coalescing needed.
-        tokio::select! {
-            _ = state.shutdown.cancelled() => break,
-            _ = interval.tick() => {}
-            _ = state.notifications.status.notified() => {}
+    let cache = state.cache_path.clone();
+    let session = match tokio::task::spawn_blocking(move || super::session::next(&cache)).await {
+        Ok(Ok(session)) => session,
+        result => {
+            tracing::error!(?result, "cannot allocate heartbeat session; refusing unsequenced reports");
+            return;
         }
-        beat(&state, &client, &url, token.as_deref()).await;
-    }
-    // One last report (`draining: true`) so the plane stops routing here
-    // now rather than after the heartbeat timeout.
-    beat(&state, &client, &url, token.as_deref()).await;
+    };
+    let (goals, updates) = watch::channel(None);
+    // Goal application can wait for an engine to unload. Keep reporting state
+    // throughout that wait; applies remain serialized and are never cancelled.
+    tokio::join!(
+        report(&state, &client, &url, token.as_deref(), session, goals),
+        reconcile(&state, updates)
+    );
 }
 
-/// One heartbeat: report status, apply the goals that come back.
-async fn beat(
+async fn report(
     state: &Arc<AppState>,
     client: &reqwest::Client,
     url: &str,
-    token: Option<&str>
+    token: Option<&str>,
+    session: u64,
+    goals: watch::Sender<Option<HeartbeatResponse>>
 ) {
-    let payload = NodeStatus::collect(state);
+    use super::reporting::{self, Report};
+
+    let mut version = HeartbeatVersion { session, sequence: 0 };
+    let mut interval = tokio::time::interval(state.mode.node().unwrap().heartbeat_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    'reporting: loop {
+        tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => break,
+            _ = state.notifications.status.notified() => {},
+            _ = interval.tick() => {},
+        }
+        loop {
+            version.sequence += 1;
+            let request = request(state, client, url, token, version);
+            match reporting::exchange(request, version, &state.notifications.status, &state.shutdown).await {
+                // The previous HTTP request is dropped. Its server-side work
+                // may survive, so the plane must also reject stale versions.
+                Report::Changed => continue,
+                Report::Stopped => break 'reporting,
+                Report::Complete(response) => {
+                    if let Some(response) = response {
+                        goals.send_replace(Some(response));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    // Shutdown has already cancelled the token, so send this final draining
+    // snapshot directly. Never apply its response or start new loads.
+    version.sequence += 1;
+    let _ = reporting::send(request(state, client, url, token, version), version).await;
+}
+
+fn request(
+    state: &AppState,
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+    version: HeartbeatVersion
+) -> reqwest::RequestBuilder {
+    let mut payload = NodeStatus::collect(state);
+    payload.heartbeat = version;
     let mut request = client.post(url).json(&payload);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(e) => {
-            tracing::warn!(error = %e, "heartbeat failed");
-            return;
+    request
+}
+
+async fn reconcile(
+    state: &Arc<AppState>,
+    mut updates: watch::Receiver<Option<HeartbeatResponse>>
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => break,
+            changed = updates.changed() => if changed.is_err() { break; },
         }
-    };
-    if !response.status().is_success() {
-        tracing::warn!(status = %response.status(), "heartbeat rejected");
-        return;
-    }
-    let reconcile: HeartbeatResponse = match response.json().await {
-        Ok(reconcile) => reconcile,
-        Err(e) => {
-            tracing::warn!(error = %e, "malformed heartbeat response");
-            return;
+        // Keep only the newest completed response while a previous apply waits.
+        let response = updates.borrow_and_update().clone();
+        if let Some(response) = response {
+            if state.shutdown.is_cancelled() { break; }
+            apply(state, response).await;
         }
-    };
-    // Once shutdown starts, goals would start loads that cannot finish
-    // and could un-drain the node.
-    if state.shutdown.is_cancelled() {
-        return;
     }
-    apply(state, reconcile).await;
 }
 
 /// Diff the goal residency map against local state. Every arm is
@@ -157,6 +197,9 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
         }
     }
     for descriptor in process_first(&reconcile.models) {
+        if state.shutdown.is_cancelled() {
+            return;
+        }
         let tag = &descriptor.tag;
         if rejected.contains(tag) {
             continue;
@@ -217,6 +260,9 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
                 // resources needed by process-tier models.
                 state.dispatcher.remove(tag);
                 state.registry.unload(tag).await;
+                if state.shutdown.is_cancelled() {
+                    return;
+                }
                 state.cache.ensure_cached(tag, CachePriority::Prefetch);
             }
             Residency::None => {
@@ -230,6 +276,10 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
                 state.policies.remove(tag);
             }
         }
+    }
+    // An unload may have waited across shutdown; never undo the final drain.
+    if state.shutdown.is_cancelled() {
+        return;
     }
     if reconcile.drain != state.is_draining() {
         tracing::info!(drain = reconcile.drain, "drain state changed by control plane");
@@ -290,6 +340,18 @@ mod tests {
         assert!(!valid_devices(Some(&[0, 0])));
         assert!(!valid_devices(Some(&[u32::MAX])));
         assert!(valid_devices(Some(&[2, 0])));
+    }
+
+    #[tokio::test]
+    async fn shutdown_cannot_be_undrained_by_a_pending_goal_response() {
+        let _serial = crate::serving::lease::RUNTIME_TEST_LOCK.lock().unwrap();
+        let state = Arc::new(AppState::new(None, crate::state::ServerMode::Standalone).unwrap());
+        state.set_draining(true);
+        state.shutdown.cancel();
+        apply(&state, HeartbeatResponse { drain: false, ..Default::default() }).await;
+        assert!(state.is_draining());
+        assert!(state.registry.snapshot().is_empty());
+        state.lease.shutdown().unwrap();
     }
 
 }

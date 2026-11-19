@@ -127,7 +127,7 @@ async fn heartbeat(
     Json(payload): Json<Value>,
 ) -> Json<Value> {
     let mut state = state.lock().unwrap();
-    state.heartbeats.push(payload);
+    state.heartbeats.push(payload.clone());
     let directives = &state.directives;
     // Wire shape: a flat list of goal descriptors, one per tag.
     let models: Vec<Value> = directives
@@ -136,6 +136,8 @@ async fn heartbeat(
         .cloned()
         .collect();
     Json(json!({
+        "session": payload["session"],
+        "sequence": payload["sequence"],
         "models": models,
         "drain": directives.drain,
     }))
