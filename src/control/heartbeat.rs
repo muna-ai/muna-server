@@ -101,6 +101,7 @@ fn request(
     token: Option<&str>,
     version: HeartbeatVersion
 ) -> reqwest::RequestBuilder {
+    state.cache.disk_changed();
     let mut payload = NodeStatus::collect(state);
     payload.heartbeat = version;
     let mut request = client.post(url).json(&payload);

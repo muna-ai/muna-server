@@ -1,5 +1,5 @@
 ## 0.0.35
-*INCOMPLETE*
++ Improved resource accounting when establishing disk residency for models.
 
 ## 0.0.34
 + Upgraded `muna` to 0.0.41.

@@ -54,6 +54,7 @@ type Slot = Arc<Preparation>;
 pub(crate) struct PreparedModels {
     slots: Arc<DashMap<String, Slot>>,
     downloads: Downloads,
+    available_gpus: Option<u32>,
 }
 
 pub(crate) struct PreparedModel {
@@ -77,6 +78,12 @@ impl Snapshot {
 }
 
 impl PreparedModels {
+    pub(crate) fn new(available_gpus: u32) -> Self {
+        Self { available_gpus: Some(available_gpus), ..Self::default() }
+    }
+
+    pub(crate) fn disk_changed(&self) { self.downloads.disk().wake(); }
+
 
     pub(crate) fn set_process(&self, tag: &str, process: bool) {
         self.slots.entry(tag.to_owned()).or_default().priority.set_process(process);
@@ -104,7 +111,7 @@ impl PreparedModels {
             progress,
             self.downloads.clone(),
             priority
-        ));
+        ).with_gpu_capacity(self.available_gpus));
         let client = Arc::new(Muna::with_client(transport.clone()));
         let tag = tag.to_owned();
         let preparation = slot.clone();

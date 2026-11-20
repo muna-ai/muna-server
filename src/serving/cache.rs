@@ -84,6 +84,8 @@ pub(crate) struct CacheTracker {
 }
 
 impl CacheTracker {
+    pub(crate) fn disk_changed(&self) { self.prepared.disk_changed(); }
+
 
     pub(crate) fn new(
         keys: KeyStore,
@@ -135,6 +137,7 @@ impl CacheTracker {
                 match &entry.get().state {
                     CacheState::Caching | CacheState::Cached => return,
                     CacheState::Failed { at, .. } => {
+                        if self.preparation.failure(tag).is_some_and(|failure| !failure.retrying) { return; }
                         if at.elapsed() < FAILED_RETRY_BACKOFF {
                             return;
                         }
@@ -170,6 +173,10 @@ impl CacheTracker {
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect()
+    }
+
+    pub(crate) fn requirements(&self, tag: &str) -> Option<super::preparation::ModelRequirements> {
+        self.preparation.requirements(tag)
     }
 
     pub(crate) fn build(&self, tag: &str) -> Option<String> {

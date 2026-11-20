@@ -8,7 +8,7 @@ use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -22,6 +22,7 @@ use crate::serving::preparation::{FailureStage, PreparationTracker};
 use crate::serving::downloads::{Downloads, Priority};
 
 mod metadata;
+mod preparation;
 pub(crate) use metadata::key_hash;
 use metadata::DeploymentCache;
 
@@ -39,6 +40,8 @@ pub(crate) struct ServerClient {
     preparation: Option<(String, PreparationTracker)>,
     downloads: Downloads,
     priority: Priority,
+    reservations: Mutex<Vec<crate::serving::downloads::disk::Reservation>>,
+    available_gpus: Option<u32>,
 }
 
 impl ServerClient {
@@ -59,6 +62,8 @@ impl ServerClient {
             preparation: None,
             downloads: Downloads::default(),
             priority: Priority::default(),
+            reservations: Mutex::default(),
+            available_gpus: None,
         }
     }
 
@@ -80,6 +85,11 @@ impl ServerClient {
         client.downloads = downloads;
         client.priority = priority;
         client
+    }
+
+    pub(crate) fn with_gpu_capacity(mut self, count: Option<u32>) -> Self {
+        self.available_gpus = count;
+        self
     }
 }
 
@@ -130,13 +140,8 @@ impl Client for ServerClient {
         if resolving {
             if let Some((tag, tracker)) = &self.preparation {
                 match &response {
-                    Ok(body) => {
-                        let resources = body.get("resources").cloned().unwrap_or(serde_json::json!([]));
-                        if let Ok(resources) = serde_json::from_value::<Vec<muna::types::PredictionResource>>(resources) {
-                            tracker.manifest(tag, self.inner.cache_path(), &resources).await;
-                        }
-                    }
-                    Err(_) => tracker.failed(tag, FailureStage::Resolve),
+                    Ok(body) => self.admit(tag, tracker, body).await?,
+                    Err(error) => tracker.resolution_failed(tag, error),
                 }
             }
         }
@@ -163,6 +168,7 @@ impl Client for ServerClient {
         let destination = shared.clone();
         let observer = self.preparation.clone();
         let draw_progress = progress.is_none();
+        let disk = self.downloads.disk().clone();
         let result = self.downloads.download(&shared, self.priority.clone(), progress, move |subscribers| {
             Box::pin(async move {
                 if let Some((_, tracker)) = &observer { tracker.started(&destination); }
@@ -172,6 +178,7 @@ impl Client for ServerClient {
                 let draw = presentation.clone();
                 let callback: DownloadProgressFn = Arc::new(move |increment, total| {
                     if let Some((_, tracker)) = &tracked { tracker.advance(&observed_path, increment, total); }
+                    disk.advance(&observed_path, increment);
                     subscribers(increment, total);
                     if let Some(draw) = &draw { draw.advance(increment, total); }
                 });
@@ -354,6 +361,8 @@ mod tests {
             preparation: None,
             downloads: Downloads::default(),
             priority: Priority::default(),
+            reservations: Mutex::default(),
+            available_gpus: None,
         }
     }
 

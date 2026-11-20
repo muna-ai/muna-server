@@ -11,11 +11,15 @@
 /// Free and total space in MB of the filesystem containing `path`, walking
 /// up to the nearest existing ancestor.
 pub(super) fn disk_space_mb(path: &std::path::Path) -> Option<(u64, u64)> {
-    path.ancestors().find_map(statvfs_mb)
+    disk_space_bytes(path).map(|(free, total)| (free / (1024 * 1024), total / (1024 * 1024)))
+}
+
+pub(crate) fn disk_space_bytes(path: &std::path::Path) -> Option<(u64, u64)> {
+    path.ancestors().find_map(statvfs_bytes)
 }
 
 #[cfg(unix)]
-fn statvfs_mb(path: &std::path::Path) -> Option<(u64, u64)> {
+fn statvfs_bytes(path: &std::path::Path) -> Option<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -23,12 +27,11 @@ fn statvfs_mb(path: &std::path::Path) -> Option<(u64, u64)> {
         return None;
     }
     let frsize = if stat.f_frsize > 0 { stat.f_frsize } else { stat.f_bsize } as u64;
-    let to_mb = |blocks: u64| blocks.saturating_mul(frsize) / (1024 * 1024);
-    Some((to_mb(stat.f_bavail as u64), to_mb(stat.f_blocks as u64)))
+    Some(((stat.f_bavail as u64).saturating_mul(frsize), (stat.f_blocks as u64).saturating_mul(frsize)))
 }
 
 #[cfg(not(unix))]
-fn statvfs_mb(_path: &std::path::Path) -> Option<(u64, u64)> {
+fn statvfs_bytes(_path: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
 

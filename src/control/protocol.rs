@@ -135,6 +135,8 @@ pub(crate) struct ModelStatus {
     /// Never copied from a newer goal while an old engine is still draining.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requirements: Option<crate::serving::preparation::ModelRequirements>,
     /// Model lifecycle state.
     pub state: ModelLifecycle,
     /// Load failure message, when `state` is `failed`.
@@ -402,6 +404,7 @@ fn collect_model_status(
                     batch_mode: Some((&model.plan).into()),
                     progress_pct: None,
                     preparation: None,
+                    requirements: None,
                     failure: None,
                     disk_ready: true,
                     queue_depth: model.stats.queue_depth.load(Ordering::Relaxed),
@@ -446,6 +449,7 @@ fn collect_model_status(
     }
     for status in &mut statuses {
         if cached.get(&status.tag).is_some_and(|entry| entry.key_hash == status.key_hash) {
+            status.requirements = cache.requirements(&status.tag);
             if status.build.is_none() { status.build = cache.build(&status.tag); }
             apply_preparation(status, cache.progress(&status.tag), cache.failure(&status.tag),
                 matches!(cached[&status.tag].state, CacheState::Cached));
@@ -462,6 +466,7 @@ fn apply_preparation(
     cached: bool
 ) {
     status.preparation = progress;
+    status.failure = failure.clone();
     status.disk_ready |= cached || status.state == ModelLifecycle::Cached ||
         status.preparation.as_ref().is_some_and(|p| p.stage == crate::serving::preparation::PreparationStage::Cached);
     status.progress_pct = status.preparation.as_ref().and_then(|p| p.percent());
@@ -487,6 +492,7 @@ fn empty_status(
         batch_mode: None,
         progress_pct: None,
         preparation: None,
+        requirements: None,
         failure: None,
         disk_ready: false,
         queue_depth: 0,
@@ -514,6 +520,24 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn selected_requirements_and_capacity_blocker_are_reported_while_caching() {
+        use crate::serving::preparation::{ModelRequirements, PreparationStage};
+        let mut status = empty_status("@a/model".into(), ModelLifecycle::Caching, None);
+        status.requirements = Some(ModelRequirements { gpu_count: 2, bin_bytes: Some(123456) });
+        apply_preparation(&mut status, Some(PreparationProgress {
+            stage: PreparationStage::Waiting, resources_completed: 1, resources_total: Some(2),
+            bytes_available: 100, bytes_total: Some(1000), active_resources: vec![],
+        }), Some(PreparationFailure {
+            stage: FailureStage::Download, code: "insufficient_disk".into(),
+            message: "Waiting for sufficient disk space.".into(), retrying: true,
+        }), false);
+        let wire = serde_json::to_value(status).unwrap();
+        assert_eq!(wire["requirements"], json!({ "gpu_count": 2, "bin_bytes": 123456 }));
+        assert_eq!(wire["preparation"]["stage"], "waiting");
+        assert_eq!(wire["failure"]["code"], "insufficient_disk");
+    }
 
     #[test]
     fn load_failure_keeps_disk_readiness_and_preparation_on_the_wire() {

@@ -81,9 +81,8 @@ pub(crate) trait Platform: Send + Sync {
     }
 
     /// Free and total space in MB of the filesystem containing `path`.
-    /// Feeds capacity reporting: resources are never deleted, so the
-    /// control plane must see remaining disk to know when to stop placing
-    /// models on this node.
+    /// Operational reporting only. Disk admission measures free bytes locally
+    /// against the selected manifest and outstanding download reservations.
     fn disk_space_mb(&self, path: &Path) -> Option<(u64, u64)> {
         host::disk_space_mb(path)
     }

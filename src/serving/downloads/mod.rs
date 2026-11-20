@@ -17,6 +17,8 @@ use futures_util::future::BoxFuture;
 use muna::client::DownloadProgressFn;
 use tokio::sync::watch;
 
+pub(crate) mod disk;
+
 #[cfg(test)]
 mod tests;
 
@@ -87,6 +89,7 @@ struct Queue {
 #[derive(Default)]
 struct Inner {
     queue: Mutex<Queue>,
+    disk: disk::DiskBudget,
 }
 
 #[derive(Clone, Default)]
@@ -106,6 +109,8 @@ impl Drop for Subscription {
 }
 
 impl Downloads {
+    pub(crate) fn disk(&self) -> &disk::DiskBudget { &self.0.disk }
+
     pub(crate) async fn download(
         &self,
         path: &Path,
@@ -176,6 +181,7 @@ impl Downloads {
                 // A separate join boundary converts an unexpected transfer panic
                 // into a failure for every waiter and releases the queue slot.
                 let active = job.clone();
+                scheduler.0.disk.started(&job.path);
                 let outcome = tokio::spawn(async move {
                     if tokio::fs::metadata(&active.path)
                         .await
@@ -191,6 +197,7 @@ impl Downloads {
                 })
                 .await
                 .unwrap_or_else(|_| Err("Resource download task failed.".into()));
+                scheduler.0.disk.finished(&job.path, outcome.is_ok());
                 {
                     let mut queue = scheduler.0.queue.lock().unwrap();
                     job.done

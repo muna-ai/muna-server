@@ -14,6 +14,8 @@ mod cpu;
 mod cuda;
 mod family;
 mod host;
+pub(crate) use family::GpuFamily;
+pub(crate) use host::disk_space_bytes;
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(test)]

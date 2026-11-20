@@ -23,6 +23,7 @@ const MAX_ACTIVE_RESOURCES: usize = 4;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PreparationStage {
     Resolving,
+    Waiting,
     Downloading,
     Cached,
 }
@@ -44,6 +45,15 @@ pub(crate) struct PreparationFailure {
 }
 
 impl PreparationFailure {
+
+    pub(crate) fn incompatible() -> Self {
+        Self {
+            stage: FailureStage::Resolve,
+            code: "no_compatible_implementation".into(),
+            message: "No compatible implementation is available on this node.".into(),
+            retrying: false,
+        }
+    }
 
     pub(crate) fn new(stage: FailureStage) -> Self {
         let (code, message) = match stage {
@@ -104,6 +114,13 @@ impl PreparationProgress {
     }
 }
 
+/// Requirements of the implementation resolved by this preparation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ModelRequirements {
+    pub gpu_count: u32,
+    pub bin_bytes: Option<u64>,
+}
+
 #[derive(Default)]
 struct Resource {
     available: u64,
@@ -123,6 +140,7 @@ struct ManifestResource {
 struct Attempt {
     identity: Arc<()>,
     stage: PreparationStage,
+    requirements: Option<ModelRequirements>,
     manifest: Option<Vec<ManifestResource>>,
     failure: Option<PreparationFailure>,
 }
@@ -171,6 +189,7 @@ impl PreparationTracker {
         tracking.attempts.entry(tag.into()).or_insert(Attempt {
             identity: Arc::new(()),
             stage: PreparationStage::Resolving,
+            requirements: None,
             manifest: None,
             failure: None,
         });
@@ -195,7 +214,7 @@ impl PreparationTracker {
             };
             {
                 let mut value = resource.lock().unwrap();
-                if let Some(metadata) = metadata {
+                if let Some(metadata) = metadata.filter(|meta| source.size.is_none_or(|size| meta.len() == size)) {
                     value.available = metadata.len();
                     value.total = Some(metadata.len());
                     value.complete = true;
@@ -222,6 +241,55 @@ impl PreparationTracker {
         attempt.stage = if complete { PreparationStage::Cached } else { PreparationStage::Downloading };
         attempt.manifest = Some(manifest);
         attempt.failure = None;
+        self.notifications.status_changed();
+    }
+
+    pub(crate) fn resolved(&self, tag: &str, gpu_count: u32, resources: &[PredictionResource]) {
+        let mut bins = HashSet::new();
+        let bin_bytes = resources.iter().filter(|r| r.kind == "bin")
+            .filter(|r| bins.insert(resource_path(Path::new(""), r).1))
+            .try_fold(0u64, |total, resource| total.checked_add(resource.size?));
+        if let Some(attempt) = self.tracking.lock().unwrap().attempts.get_mut(tag).filter(|attempt| self.matches(tag, attempt)) {
+            attempt.requirements = Some(ModelRequirements { gpu_count, bin_bytes });
+        }
+        self.notifications.status_changed();
+    }
+
+    pub(crate) fn requirements(&self, tag: &str) -> Option<ModelRequirements> {
+        self.tracking.lock().unwrap().attempts.get(tag)?.requirements.clone()
+    }
+
+    pub(crate) fn waiting(&self, tag: &str, blocked: bool) {
+        let mut tracking = self.tracking.lock().unwrap();
+        let Some(attempt) = tracking.attempts.get_mut(tag).filter(|attempt| self.matches(tag, attempt)) else { return; };
+        let complete = attempt.manifest.as_ref().is_some_and(|items|
+            items.iter().all(|item| item.resource.lock().unwrap().complete));
+        let stage = if blocked { PreparationStage::Waiting }
+            else if complete { PreparationStage::Cached }
+            else { PreparationStage::Downloading };
+        if attempt.stage == stage { return; }
+        attempt.stage = stage;
+        attempt.failure = blocked.then(|| PreparationFailure {
+            stage: FailureStage::Download,
+            code: "insufficient_disk".into(),
+            message: "Waiting for sufficient disk space.".into(),
+            retrying: true,
+        });
+        drop(tracking);
+        self.notifications.status_changed();
+    }
+
+    pub(crate) fn resolution_failed(&self, tag: &str, error: &muna::MunaError) {
+        self.failed(tag, FailureStage::Resolve);
+        if error.api_status() == Some(400) && error.to_string().contains("active implementation") {
+            self.rejected(tag, PreparationFailure::incompatible());
+        }
+    }
+
+    pub(crate) fn rejected(&self, tag: &str, failure: PreparationFailure) {
+        if let Some(attempt) = self.tracking.lock().unwrap().attempts.get_mut(tag).filter(|attempt| self.matches(tag, attempt)) {
+            attempt.failure = Some(failure);
+        }
         self.notifications.status_changed();
     }
 
@@ -317,7 +385,7 @@ impl PreparationTracker {
     }
 
     /// Content identity of the compiled predictor, for matching cached reports
-    /// to the implementation the plane resolved (including after recompiles).
+    /// to the implementation selected on this node (including after recompiles).
     pub(crate) fn build(&self, tag: &str) -> Option<String> {
         let tracking = self.tracking.lock().unwrap();
         let manifest = tracking.attempts.get(tag)?.manifest.as_ref()?;
@@ -375,7 +443,7 @@ impl PreparationTracker {
 
 // Mirrors muna-rs PredictionService::get_resource_path. Signed query strings
 // never enter the identity or the heartbeat payload.
-fn resource_path(root: &Path, resource: &PredictionResource) -> (String, PathBuf) {
+pub(crate) fn resource_path(root: &Path, resource: &PredictionResource) -> (String, PathBuf) {
     let url = reqwest::Url::parse(&resource.url).ok();
     let stem = url
         .as_ref()

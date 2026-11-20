@@ -147,8 +147,10 @@ impl AppState {
         let cache_path = MunaClient::new(None, None).cache_path().to_path_buf();
         let notifications = Arc::new(NotificationCenter::default());
         let preparation = PreparationTracker::new(notifications.clone());
-        let prepared = PreparedModels::default();
         let platform = platform::detect();
+        let available_gpus = platform.devices().iter()
+            .filter(|device| device.family != Some(platform::GpuFamily::Cpu)).count() as u32;
+        let prepared = PreparedModels::new(available_gpus);
         let compute_architecture = match muna::c::Configuration::get_compute_architecture() {
             Ok(architecture) => architecture,
             Err(e) => {
