@@ -84,7 +84,7 @@ pub(crate) struct NodeStatus {
 
 /// Lifecycle state of a model on this node -- the ACTUAL half of the
 /// protocol. Serializes as a lowercase string on the wire (`"caching"`,
-/// `"cached"`, `"loading"`, `"ready"`, `"failed"`).
+/// `"cached"`, `"loading"`, `"ready"`, `"ineligible"`, `"failed"`).
 #[derive(Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ModelLifecycle {
@@ -97,6 +97,8 @@ pub(crate) enum ModelLifecycle {
     Loading,
     /// Engine loaded and serving.
     Ready,
+    /// No compatible implementation exists for this deployment on this node.
+    Ineligible,
     /// Last load (or cache) attempt failed; see `ModelStatus::error`.
     Failed,
 }
@@ -440,6 +442,9 @@ fn collect_model_status(
         let mut status = match &entry.state {
             CacheState::Caching => empty_status(tag.clone(), ModelLifecycle::Caching, None),
             CacheState::Cached => empty_status(tag.clone(), ModelLifecycle::Cached, None),
+            CacheState::Ineligible { error } => {
+                empty_status(tag.clone(), ModelLifecycle::Ineligible, Some(error.clone()))
+            }
             CacheState::Failed { error, .. } => {
                 empty_status(tag.clone(), ModelLifecycle::Failed, Some(error.clone()))
             }
@@ -470,6 +475,10 @@ fn apply_preparation(
     status.disk_ready |= cached || status.state == ModelLifecycle::Cached ||
         status.preparation.as_ref().is_some_and(|p| p.stage == crate::serving::preparation::PreparationStage::Cached);
     status.progress_pct = status.preparation.as_ref().and_then(|p| p.percent());
+    if status.state == ModelLifecycle::Failed && !status.disk_ready &&
+        failure.as_ref().is_some_and(PreparationFailure::is_ineligible) {
+        status.state = ModelLifecycle::Ineligible;
+    }
     // Process state wins lifecycle precedence, but its failure must not
     // erase independently achieved disk residency.
     if status.state == ModelLifecycle::Failed {
@@ -537,6 +546,17 @@ mod tests {
         assert_eq!(wire["requirements"], json!({ "gpu_count": 2, "bin_bytes": 123456 }));
         assert_eq!(wire["preparation"]["stage"], "waiting");
         assert_eq!(wire["failure"]["code"], "insufficient_disk");
+    }
+
+    #[test]
+    fn incompatible_resolution_is_ineligible_on_the_wire() {
+        let mut status = empty_status("@a/model".into(), ModelLifecycle::Failed, Some("No active implementation".into()));
+        apply_preparation(&mut status, None, Some(PreparationFailure::incompatible()), false);
+        let wire = serde_json::to_value(status).unwrap();
+        assert_eq!(wire["state"], "ineligible");
+        assert!(wire.get("disk_ready").is_none());
+        assert_eq!(wire["failure"]["code"], "no_compatible_implementation");
+        assert_eq!(wire["failure"]["retrying"], false);
     }
 
     #[test]

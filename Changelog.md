@@ -1,5 +1,5 @@
 ## 0.0.36
-*INCOMPLETE*
++ Minor updates.
 
 ## 0.0.35
 + Improved resource accounting when establishing disk residency for models.

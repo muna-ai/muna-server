@@ -46,6 +46,11 @@ pub(crate) struct PreparationFailure {
 
 impl PreparationFailure {
 
+    pub(crate) fn is_ineligible(&self) -> bool {
+        self.stage == FailureStage::Resolve &&
+            self.code == "no_compatible_implementation" && !self.retrying
+    }
+
     pub(crate) fn incompatible() -> Self {
         Self {
             stage: FailureStage::Resolve,

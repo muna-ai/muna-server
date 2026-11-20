@@ -37,6 +37,9 @@ pub(crate) enum CacheState {
     Caching,
     /// Resources complete on disk.
     Cached,
+    /// This deployment has no implementation compatible with the node.
+    /// Rechecked only after retirement or a changed deployment key.
+    Ineligible { error: String },
     /// The last cache attempt failed; retried after backoff.
     Failed { error: String, at: Instant },
 }
@@ -75,7 +78,7 @@ pub(crate) struct CacheTracker {
     prepared: PreparedModels,
     /// Per-tag disk state. Absent-from-map means never requested (or
     /// retired by the control plane); shared with the download tasks, which
-    /// write the terminal `Cached` / `Failed` state on completion.
+    /// write the terminal `Cached` / `Ineligible` / `Failed` state on completion.
     states: Arc<DashMap<String, CacheEntry>>,
     /// Serializes task completion with retirement so late downloads cannot reannounce tags.
     downloads: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
@@ -135,7 +138,7 @@ impl CacheTracker {
         match self.states.entry(tag.to_string()) {
             dashmap::Entry::Occupied(mut entry) => {
                 match &entry.get().state {
-                    CacheState::Caching | CacheState::Cached => return,
+                    CacheState::Caching | CacheState::Cached | CacheState::Ineligible { .. } => return,
                     CacheState::Failed { at, .. } => {
                         if self.preparation.failure(tag).is_some_and(|failure| !failure.retrying) { return; }
                         if at.elapsed() < FAILED_RETRY_BACKOFF {
@@ -215,9 +218,14 @@ impl CacheTracker {
                     CacheState::Cached
                 }
                 Err(error) => {
-                    tracing::warn!(tag = %tag, error = %error, "cache download failed");
-                    if progress.failure(&tag).is_none() { progress.failed(&tag, FailureStage::Resolve); }
-                    CacheState::Failed { error, at: Instant::now() }
+                    if progress.failure(&tag).is_some_and(|failure| failure.is_ineligible()) {
+                        tracing::info!(tag = %tag, "model is ineligible on this node");
+                        CacheState::Ineligible { error }
+                    } else {
+                        tracing::warn!(tag = %tag, error = %error, "cache download failed");
+                        if progress.failure(&tag).is_none() { progress.failed(&tag, FailureStage::Resolve); }
+                        CacheState::Failed { error, at: Instant::now() }
+                    }
                 }
             };
             downloads.remove(&tag);
@@ -263,6 +271,56 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         false
+    }
+
+    #[tokio::test]
+    async fn ineligible_deployment_is_memoized_until_its_key_changes() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let notifications = Arc::new(NotificationCenter::default());
+        let preparation = PreparationTracker::new(notifications.clone());
+        let downloader: Downloader = {
+            let starts = starts.clone();
+            let preparation = preparation.clone();
+            Arc::new(move |tag| {
+                let starts = starts.clone();
+                let preparation = preparation.clone();
+                Box::pin(async move {
+                    if starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        preparation.rejected(&tag, PreparationFailure::incompatible());
+                        return Err("No active implementation for this architecture".into());
+                    }
+                    Ok(())
+                })
+            })
+        };
+        let mut tracker = CacheTracker::with_downloader(downloader, notifications);
+        tracker.preparation = preparation;
+        tracker.keys.insert("@a/x".into(), "old-key".into());
+        tracker.ensure_cached("@a/x", CachePriority::Prefetch);
+        assert!(wait_until(&tracker, "@a/x", |s| matches!(s, CacheState::Ineligible { .. })).await);
+        assert_eq!(tracker.snapshot()[0].1.key_hash, Some(crate::client::key_hash("old-key")));
+        tracker.ensure_cached("@a/x", CachePriority::Immediate);
+        assert!(matches!(tracker.snapshot()[0].1.state, CacheState::Ineligible { .. }));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(!tracker.failure("@a/x").unwrap().retrying);
+
+        // The heartbeat retires preparation when it receives a new deployment key.
+        tracker.forget("@a/x");
+        tracker.keys.insert("@a/x".into(), "new-key".into());
+        tracker.ensure_cached("@a/x", CachePriority::Prefetch);
+        assert!(wait_until(&tracker, "@a/x", |s| matches!(s, CacheState::Cached)).await);
+        assert_eq!(tracker.snapshot()[0].1.key_hash, Some(crate::client::key_hash("new-key")));
+        assert!(tracker.failure("@a/x").is_none());
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn download_errors_remain_failures() {
+        let downloader: Downloader = Arc::new(|_| Box::pin(async { Err("HTTP 503".into()) }));
+        let tracker = CacheTracker::with_downloader(downloader, Arc::new(NotificationCenter::default()));
+        tracker.ensure_cached("@a/x", CachePriority::Prefetch);
+        assert!(wait_until(&tracker, "@a/x", |s| matches!(s, CacheState::Failed { .. })).await);
+        assert_eq!(tracker.failure("@a/x").unwrap().code, "resource_resolution_failed");
     }
 
     #[tokio::test]
