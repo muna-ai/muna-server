@@ -1,3 +1,6 @@
+## 0.0.34
+*INCOMPLETE*
+
 ## 0.0.33
 + Added support for deploying new revisions of a given compiled model in managed mode.
 + Upgraded `muna` to 0.0.40.
