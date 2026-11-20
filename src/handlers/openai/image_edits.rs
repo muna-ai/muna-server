@@ -12,7 +12,10 @@ use axum::extract::{FromRequest, Multipart, Request, State};
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use muna::beta::adapters::{Adapter, DepthFormat, OpenAIDepthOptions, OpenAIImageOptions};
+use muna::beta::adapters::{
+    Adapter, DepthFormat, OpenAIDepthOptions, OpenAIImageOptions,
+    OpenAIModel3DOptions,
+};
 use muna::beta::openai::ImageEditParams;
 
 use crate::handlers::error::{AppError, Json};
@@ -34,9 +37,27 @@ pub(crate) async fn image_edits(
         .outputs
         .iter()
         .any(|p| p.denotation.as_deref() == Some("depth_map"));
+    let model3d = !depth
+        && model
+            .signature
+            .outputs
+            .iter()
+            .any(|p| p.denotation.as_deref() == Some("3d"));
     let depth_adapter = depth.then(|| model.adapters.depth()).transpose()?;
-    let image_adapter = (!depth).then(|| model.adapters.edits()).transpose()?;
-    let encoding = depth_options(depth, &params)?;
+    let model3d_adapter = model3d.then(|| model.adapters.model3d()).transpose()?;
+    let image_adapter = (!depth && !model3d)
+        .then(|| model.adapters.edits())
+        .transpose()?;
+    let encoding = if !model3d {
+        Some(depth_options(depth, &params)?)
+    } else {
+        None
+    };
+    let model3d_encoding = if model3d {
+        Some(model3d_options(&params)?)
+    } else {
+        None
+    };
     params.image = state
         .image_fetcher
         .resolve_images(urls)
@@ -62,6 +83,8 @@ pub(crate) async fn image_edits(
             .dimensions();
         let inputs = if let Some(adapter) = &depth_adapter {
             adapter.inputs(params.image, params.prompt, params.n, width, height)?
+        } else if let Some(adapter) = &model3d_adapter {
+            adapter.inputs(params.image, params.prompt, params.n, width, height)?
         } else {
             image_adapter
                 .as_ref()
@@ -82,7 +105,9 @@ pub(crate) async fn image_edits(
             )
             .await?;
         if let Some(adapter) = depth_adapter {
-            adapter.adapt(prediction, Some(encoding)).await
+            adapter.adapt(prediction, encoding).await
+        } else if let Some(adapter) = model3d_adapter {
+            adapter.adapt(prediction, model3d_encoding).await
         } else {
             image_adapter
                 .expect("image adapter selected")
@@ -152,7 +177,7 @@ impl ImageEditsRequest {
         if self
             .output_format
             .as_deref()
-            .is_some_and(|s| !matches!(s, "png" | "jpeg" | "webp" | "npy" | "npz"))
+            .is_some_and(|s| !matches!(s, "png" | "jpeg" | "webp" | "npy" | "npz" | "ply"))
         {
             return Err(bad("Unsupported image output format."));
         }
@@ -296,6 +321,27 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn ply_assets_use_the_3d_response_path_and_reject_image_encoding_options() {
+        let body = json!({
+            "model":"@test/idol", "prompt":"", "output_format":"ply",
+            "images":[{"image_url":"https://example.com/input.png"}]
+        });
+        let request: ImageEditsRequest = serde_json::from_value(body).unwrap();
+        let (mut params, _) = request.into_params().ok().unwrap();
+        assert_eq!(model3d_options(&params).ok().unwrap().format, "ply");
+        assert!(depth_options(false, &params).is_err());
+        params.output_format = Some("png".into());
+        assert!(model3d_options(&params).is_err());
+        params.output_format = None;
+        assert_eq!(model3d_options(&params).ok().unwrap().format, "ply");
+        params.output_compression = Some(90);
+        assert!(model3d_options(&params).is_err());
+        params.output_compression = None;
+        params.background = Some("auto".into());
+        assert!(model3d_options(&params).is_err());
+    }
+
+    #[test]
     fn parses_scalar_prompt_and_multiple_image_references() {
         let request: ImageEditsRequest = serde_json::from_value(json!({
             "model": "owner/albedo", "prompt": "", "n": 2, "size": "512x512",
@@ -361,7 +407,7 @@ mod tests {
         let body = concat!(
             "--test\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nowner/depth\r\n",
             "--test\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n\r\n",
-            "--test\r\nContent-Disposition: form-data; name=\"output_format\"\r\n\r\nnpy\r\n",
+            "--test\r\nContent-Disposition: form-data; name=\"output_format\"\r\n\r\nply\r\n",
             "--test\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nimage bytes\r\n",
             "--test--\r\n"
         );
@@ -374,7 +420,7 @@ mod tests {
             .ok()
             .unwrap();
         let (params, images) = parsed.into_params().ok().unwrap();
-        assert_eq!(params.output_format.as_deref(), Some("npy"));
+        assert_eq!(params.output_format.as_deref(), Some("ply"));
         assert_eq!(images.len(), 1);
         let duplicate = body.replace(
             "--test--",
@@ -394,6 +440,7 @@ fn depth_options(depth: bool, params: &ImageEditParams) -> Result<OpenAIDepthOpt
         Some("npy") if depth => DepthFormat::Npy,
         Some("npz") if depth => DepthFormat::Npz,
         _ if depth => return Err(bad("Depth output requires output_format=npy or npz.")),
+        Some("ply") => return Err(bad("PLY output requires a binary output annotated as 3d.")),
         Some("npy" | "npz") => {
             return Err(bad(
                 "NumPy output requires an array_list annotated as depth_map.",
@@ -407,4 +454,17 @@ fn depth_options(depth: bool, params: &ImageEditParams) -> Result<OpenAIDepthOpt
         ));
     }
     Ok(OpenAIDepthOptions { format })
+}
+
+fn model3d_options(params: &ImageEditParams) -> Result<OpenAIModel3DOptions, AppError> {
+    if params.background.is_some() || params.output_compression.is_some() {
+        return Err(bad(
+            "3D output does not accept background or output_compression.",
+        ));
+    }
+    let options = OpenAIModel3DOptions {
+        format: params.output_format.clone().unwrap_or_else(|| "ply".into()),
+    };
+    options.validate()?;
+    Ok(options)
 }

@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 use muna::beta::adapters::{
     AnthropicMessagesAdapter, OpenAICompletionsAdapter, OpenAIDepthAdapter,
     OpenAIEmbeddingsAdapter, OpenAIImageEditAdapter, OpenAIImageGenerationAdapter,
-    OpenAITranscriptionsAdapter,
+    OpenAIModel3DAdapter, OpenAITranscriptionsAdapter,
 };
 use muna::client::{MunaError, Result};
 use muna::Signature;
@@ -27,6 +27,7 @@ pub(crate) struct Adapters {
     images: Slot<OpenAIImageGenerationAdapter>,
     edits: Slot<OpenAIImageEditAdapter>,
     depth: Slot<OpenAIDepthAdapter>,
+    model3d: Slot<OpenAIModel3DAdapter>,
     transcriptions: Slot<OpenAITranscriptionsAdapter>,
 }
 
@@ -40,6 +41,7 @@ impl Adapters {
             images: OnceLock::new(),
             edits: OnceLock::new(),
             depth: OnceLock::new(),
+            model3d: OnceLock::new(),
             transcriptions: OnceLock::new(),
         }
     }
@@ -80,6 +82,12 @@ impl Adapters {
         })
     }
 
+    pub fn model3d(&self) -> Result<Arc<OpenAIModel3DAdapter>> {
+        cached(&self.model3d, || {
+            OpenAIModel3DAdapter::from_signature(&self.signature)
+        })
+    }
+
     pub fn transcriptions(&self) -> Result<Arc<OpenAITranscriptionsAdapter>> {
         cached(&self.transcriptions, || {
             OpenAITranscriptionsAdapter::from_signature(&self.signature)
@@ -100,6 +108,21 @@ fn cached<T>(slot: &Slot<T>, create: impl FnOnce() -> Option<T>) -> Result<Arc<T
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn model3d_adapter_is_cached_for_the_signature() {
+        let adapters = Adapters::new(serde_json::from_value(serde_json::json!({
+            "inputs":[
+                {"name":"images","dtype":"image_list","denotation":"openai.chat.completions.images"},
+                {"name":"prompt","dtype":"string","denotation":"openai.images.prompt","optional":true}
+            ],
+            "outputs":[{"name":"asset","dtype":"binary","denotation":"3d"}]
+        })).unwrap());
+        let first = adapters.model3d().unwrap();
+        assert!(Arc::ptr_eq(&first, &adapters.model3d().unwrap()));
+        assert!(adapters.edits().is_err());
+        assert!(adapters.depth().is_err());
+    }
 
     #[test]
     fn concurrent_requests_initialize_once_and_share_the_adapter() {
