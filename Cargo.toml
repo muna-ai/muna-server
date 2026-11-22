@@ -15,6 +15,7 @@ async-channel = "2"
 async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["json", "multipart"] }
 base64 = "0.22.1"
+bytes = "1"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 corby = { git = "https://github.com/muna-ai/libcorby.git", branch = "main" }
 dashmap = "6"
@@ -33,9 +34,6 @@ tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "ipc-transport", "tcp-transport"] }
-
-[dev-dependencies]
-bytes = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = "0.8"

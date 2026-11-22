@@ -1,5 +1,5 @@
 ## 0.0.37
-*INCOMPLETE*
++ Added resumable, priority-scheduled resource downloads for faster cold starts.
 
 ## 0.0.36
 + Minor updates.

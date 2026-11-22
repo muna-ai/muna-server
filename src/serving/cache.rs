@@ -49,6 +49,8 @@ pub(crate) enum CacheState {
 pub(crate) enum CachePriority {
     /// Process-tier resources take precedence over queued prefetch files.
     Immediate,
+    /// A deployment is waiting for its first disk-ready copy.
+    Deployment,
     /// Disk-only resources use the background queue priority.
     Prefetch,
 }
@@ -133,6 +135,7 @@ impl CacheTracker {
     /// are ordered by the shared resource scheduler.
     pub(crate) fn ensure_cached(&self, tag: &str, priority: CachePriority) {
         self.prepared.set_process(tag, priority == CachePriority::Immediate);
+        self.prepared.set_deployment(tag, priority == CachePriority::Deployment);
         let mut downloads = self.downloads.lock().unwrap();
         let key_hash = self.keys.get(tag).map(|key| crate::client::key_hash(key.value()));
         match self.states.entry(tag.to_string()) {

@@ -280,7 +280,9 @@ async fn apply(state: &Arc<AppState>, reconcile: HeartbeatResponse) {
                 if state.shutdown.is_cancelled() {
                     return;
                 }
-                state.cache.ensure_cached(tag, CachePriority::Prefetch);
+                state.cache.ensure_cached(tag, if descriptor.deployment_pending {
+                    CachePriority::Deployment
+                } else { CachePriority::Prefetch });
             }
             Residency::None => {
                 // Retirement only drops logical residency. Content-addressed
@@ -330,6 +332,7 @@ mod tests {
         ModelDescriptor {
             tag: tag.to_string(),
             residency,
+            deployment_pending: false,
             key: None,
             devices: None,
             policy: None

@@ -331,6 +331,30 @@ impl PreparationTracker {
         self.notify_progress(&mut tracking);
     }
 
+    /// Scheduling decisions use this model's entire manifest, including shared
+    /// files. Never substitute the size of just its currently queued resource.
+    pub(crate) fn remaining_bytes(&self, tag: &str) -> Option<u64> {
+        let tracking = self.tracking.lock().unwrap();
+        let manifest = tracking.attempts.get(tag)?.manifest.as_ref()?;
+        manifest.iter().try_fold(0_u64, |sum, item| {
+            let resource = item.resource.lock().unwrap();
+            let remaining = if resource.complete { 0 }
+                else { resource.total?.saturating_sub(resource.available) };
+            sum.checked_add(remaining)
+        })
+    }
+
+    /// A paused transfer retains its byte count but is not actively downloading.
+    pub(crate) fn activity(&self, path: &Path, active: bool) {
+        if let Some(resource) = self.tracking.lock().unwrap().resources.get(path) {
+            resource.lock().unwrap().active = active;
+        }
+    }
+
+    pub(crate) fn resource_size(&self, path: &Path) -> Option<u64> {
+        self.tracking.lock().unwrap().resources.get(path)?.lock().unwrap().total
+    }
+
     fn notify_progress(&self, tracking: &mut Tracking) {
         if tracking
             .last_progress

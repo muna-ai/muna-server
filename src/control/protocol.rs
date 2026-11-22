@@ -244,6 +244,10 @@ pub(crate) struct ModelDescriptor {
     pub tag: String,
     /// Desired residency.
     pub residency: Residency,
+    /// No current copy is disk-ready, so preparation is on the deployment's
+    /// critical path. Inference demand always takes precedence over this.
+    #[serde(default)]
+    pub deployment_pending: bool,
     /// Download credential: the predictor-bound deployment key
     /// (`muna_sk_...`) from the tag's shared deployment, sent with
     /// `process`/`disk` directives. The node uses it to retrieve and

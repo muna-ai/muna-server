@@ -89,6 +89,10 @@ impl PreparedModels {
         self.slots.entry(tag.to_owned()).or_default().priority.set_process(process);
     }
 
+    pub(crate) fn set_deployment(&self, tag: &str, pending: bool) {
+        self.slots.entry(tag.to_owned()).or_default().priority.set_deployment(pending);
+    }
+
     pub(crate) async fn prepare(
         &self,
         tag: &str,
