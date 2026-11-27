@@ -91,6 +91,8 @@ pub(crate) struct AppState {
     pub policies: PolicyStore,
     /// In-process wakeups (state transitions -> heartbeat, ...).
     pub notifications: Arc<NotificationCenter>,
+    /// Durable completion events, present only on managed nodes.
+    pub load_events: Option<Arc<crate::control::events::LoadEvents>>,
     /// The platform detected at boot (NVIDIA, Apple, or CPU), owning its
     /// vendor handles: device and host metrics, and the driver warm.
     pub platform: Arc<dyn Platform>,
@@ -146,6 +148,10 @@ impl AppState {
         // holds no credential and makes no requests.
         let cache_path = MunaClient::new(None, None).cache_path().to_path_buf();
         let notifications = Arc::new(NotificationCenter::default());
+        let load_events = mode.node().map(|node| {
+            crate::control::events::LoadEvents::open(&cache_path, &node.node_id, notifications.clone())
+                .map(Arc::new)
+        }).transpose().map_err(|error| format!("Cannot open load event outbox: {error}"))?;
         let preparation = PreparationTracker::new(notifications.clone());
         let platform = platform::detect();
         let available_gpus = platform.devices().iter()
@@ -169,7 +175,7 @@ impl AppState {
                 policies.clone(),
                 preparation.clone(),
                 prepared.clone()
-            ),
+            ).with_load_events(load_events.clone()),
             cache: CacheTracker::new(
                 keys.clone(),
                 notifications.clone(),
@@ -182,6 +188,7 @@ impl AppState {
             devices,
             policies,
             notifications,
+            load_events,
             platform,
             compute_architecture,
             cache_path,

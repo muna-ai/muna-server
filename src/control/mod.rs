@@ -8,6 +8,7 @@
 //! started with `--control-plane-url`.
 
 pub(crate) mod heartbeat;
+pub(crate) mod events;
 pub(crate) mod kv_relay;
 pub(crate) mod protocol;
 mod reporting;

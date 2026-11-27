@@ -154,7 +154,7 @@ async fn serve(cli: &Cli) -> Result<(), String> {
     loops.close();
     tokio::spawn(watch_signals(state.clone()));
     let app = {
-        let router = handlers::router();
+        let router = handlers::router(&state.mode);
         #[cfg(feature = "crash-reporting-tests")]
         let router = router.merge(crash_reporting_tests::router());
         router.with_state(state.clone())

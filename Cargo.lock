@@ -290,6 +290,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "num-traits",
+ "serde",
 ]
 
 [[package]]
@@ -1213,13 +1214,14 @@ dependencies = [
 
 [[package]]
 name = "muna-server"
-version = "0.0.37"
+version = "0.0.38"
 dependencies = [
  "async-channel",
  "async-trait",
  "axum",
  "base64",
  "bytes",
+ "chrono",
  "clap",
  "corby",
  "dashmap",
@@ -1241,6 +1243,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zeromq",
 ]
 

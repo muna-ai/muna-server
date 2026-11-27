@@ -134,8 +134,8 @@ async fn drain_directive_and_undrain() {
 
     // Draining rejects inference with 503 before any registry work.
     let response = client
-        .post(format!("{}/v1/chat/completions", server.url()))
-        .json(&json!({ "model": TAG_CHAT, "messages": [] }))
+        .post(format!("{}/v1/predictions", server.url()))
+        .json(&json!({ "tag": TAG_CHAT, "inputs": {} }))
         .send().await.unwrap();
     assert_eq!(response.status(), 503);
     assert!(response.headers().contains_key("Retry-After"));
@@ -198,8 +198,12 @@ async fn managed_models_require_residency_and_explicit_devices() {
     ] {
         let response = client.post(format!("{}{route}", server.url()))
             .json(&body).send().await.unwrap();
-        assert_eq!(response.status(), 429, "{route} must wait for managed preload");
-        assert!(response.headers().contains_key("Retry-After"));
+        if route == "/v1/predictions" {
+            assert_eq!(response.status(), 429, "raw inference must wait for managed preload");
+            assert!(response.headers().contains_key("Retry-After"));
+        } else {
+            assert_eq!(response.status(), 404, "compatibility routes are standalone-only");
+        }
     }
 
     // Deliberately malformed process goal: reject it rather than selecting GPUs.

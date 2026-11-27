@@ -46,6 +46,11 @@ pub(crate) async fn run(state: Arc<AppState>) {
     // Goal application can wait for an engine to unload. Keep reporting state
     // throughout that wait; applies remain serialized and are never cancelled.
     tokio::join!(
+        async {
+            if let Some(events) = &state.load_events {
+                events.clone().run(&state.shutdown).await;
+            }
+        },
         report(&state, &client, &url, token.as_deref(), session, goals),
         reconcile(&state, updates)
     );
@@ -81,6 +86,9 @@ async fn report(
                 Report::Stopped => break 'reporting,
                 Report::Complete(response) => {
                     if let Some(response) = response {
+                        if let Some(events) = &state.load_events {
+                            events.acknowledge(&response.event_acks);
+                        }
                         goals.send_replace(Some(response));
                     }
                     break;

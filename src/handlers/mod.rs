@@ -31,7 +31,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::state::AppState;
+use crate::state::{AppState, ServerMode};
 
 /// Request body limit for inference routes, which carry inline base64
 /// images. Twice Anthropic's 32 MB Messages API limit; other routes keep
@@ -39,17 +39,20 @@ use crate::state::AppState;
 pub(crate) const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 /// The complete route table. State is applied by the caller.
-pub(crate) fn router() -> Router<Arc<AppState>> {
+pub(crate) fn router(mode: &ServerMode) -> Router<Arc<AppState>> {
     let limit = || DefaultBodyLimit::max(MAX_REQUEST_BYTES);
-    Router::new()
+    let router = Router::new()
         // Health and management
         .route("/", get(health::health))
         .route("/health", get(health::health))
         .route("/status", get(status::status))
         .route("/drain", post(drain::drain))
         // Muna remote prediction
-        .route("/v1/predictions", post(predictions::predictions).layer(limit()))
-        // OpenAI compatibility
+        .route("/v1/predictions", post(predictions::predictions).layer(limit()));
+    // Managed inference has one wire protocol. Adapters and usage observation
+    // belong to the control plane; standalone servers retain compatibility APIs.
+    let router = if matches!(mode, ServerMode::Standalone) {
+        router
         .route("/v1/models", get(openai::models))
         .route("/v1/models/{*id}", get(openai::model))
         .route("/v1/chat/completions", post(openai::chat_completions).layer(limit()))
@@ -59,6 +62,10 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/v1/audio/transcriptions", post(openai::transcriptions).layer(limit()))
         // Anthropic compatibility
         .route("/v1/messages", post(anthropic::messages).layer(limit()))
+    } else {
+        router
+    };
+    router
         // Fallbacks
         .fallback(not_found::not_found)
         .layer(axum::middleware::from_fn(body::reject_device_headers))
@@ -96,7 +103,7 @@ mod tests {
         })).unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let app = router().with_state(state.clone());
+        let app = router(&state.mode).with_state(state.clone());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = reqwest::Client::new();
         let response = client.post(format!("{base}/v1/predictions"))
@@ -104,6 +111,16 @@ mod tests {
             .send().await.unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(state.registry.snapshot().is_empty());
+        for endpoint in ["/v1/chat/completions", "/v1/messages", "/v1/embeddings",
+            "/v1/images/generations", "/v1/images/edits", "/v1/audio/transcriptions"] {
+            let response = client.post(format!("{base}{endpoint}"))
+                .json(&serde_json::json!({})).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{endpoint}");
+        }
+        for endpoint in ["/v1/models", "/v1/models/test"] {
+            assert_eq!(client.get(format!("{base}{endpoint}")).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+        }
+        assert_eq!(client.get(format!("{base}/health")).send().await.unwrap().status(), StatusCode::OK);
         for endpoint in ["/v1/predictions", "/v1/chat/completions", "/v1/messages"] {
             let rejected = client.post(format!("{base}{endpoint}"))
                 .header("x-muna-device-ids", "0")
@@ -115,6 +132,27 @@ mod tests {
             .json(&serde_json::json!({"tag":"@test/not-loaded", "inputs":{}}))
             .send().await.unwrap();
         assert_eq!(removed.status(), StatusCode::NOT_FOUND);
+        server.abort();
+        let _ = server.await;
+        state.lease.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn standalone_keeps_compatibility_routes() {
+        let _serial = crate::serving::lease::RUNTIME_TEST_LOCK.lock().unwrap();
+        let state = Arc::new(AppState::new(None, ServerMode::Standalone).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = router(&state.mode).with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        for endpoint in ["/v1/chat/completions", "/v1/messages", "/v1/embeddings",
+            "/v1/images/generations", "/v1/images/edits", "/v1/audio/transcriptions"] {
+            let response = client.post(format!("{base}{endpoint}"))
+                .json(&serde_json::json!({})).send().await.unwrap();
+            assert_ne!(response.status(), StatusCode::NOT_FOUND, "{endpoint}");
+        }
+        assert_eq!(client.get(format!("{base}/v1/models")).send().await.unwrap().status(), StatusCode::OK);
         server.abort();
         let _ = server.await;
         state.lease.shutdown().unwrap();

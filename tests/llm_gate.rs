@@ -16,6 +16,7 @@
 mod common;
 
 use std::time::Duration;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -71,12 +72,25 @@ async fn wait_until_ready(client: &reqwest::Client, server_url: &str, tag: &str)
     .expect("engine never became ready");
 }
 
-fn chat_request(tag: &str, prompt: &str) -> Value {
-    json!({
+fn inference_client(server: &ServerGuard) -> Arc<muna::Muna> {
+    let key = common::resolved_access_key();
+    let mut client = muna::client::MunaClient::new(key.as_deref(), None);
+    client.inference_url = format!("{}/v1", server.url());
+    Arc::new(muna::Muna::with_client(Arc::new(client)))
+}
+
+// Keep protocol adaptation in the client. Managed nodes only receive native
+// predictions; the SDK resolves signature bindings and uses that wire route.
+async fn chat(client: &muna::Muna, tag: &str, prompt: &str) -> Value {
+    let params = serde_json::from_value(json!({
         "model": tag,
         "messages": [{ "role": "user", "content": prompt }],
         "max_tokens": 32,
-    })
+        "acceleration": "remote_auto",
+    })).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(300),
+        client.beta.openai.chat.completions.create(params)).await.unwrap().unwrap();
+    serde_json::to_value(response).unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -86,6 +100,7 @@ async fn gpu_real_load_chat_and_cached_tokens() {
     let stub = StubControlPlane::start().await;
     let server = ServerGuard::spawn(&stub).await;
     let client = reqwest::Client::new();
+    let muna = inference_client(&server);
 
     // Real loading window: the engine takes minutes; a chat that arrives
     // mid-load must 429 with Retry-After.
@@ -102,8 +117,8 @@ async fn gpu_real_load_chat_and_cached_tokens() {
     .await
     .expect("load never started");
     let mid_load = client
-        .post(format!("{}/v1/chat/completions", server.url()))
-        .json(&chat_request(&tag, "hello"))
+        .post(format!("{}/v1/predictions", server.url()))
+        .json(&json!({"tag":tag,"inputs":{}}))
         .send().await.unwrap();
     assert_eq!(mid_load.status(), 429, "chat mid-load must 429");
     assert!(mid_load.headers().contains_key("Retry-After"));
@@ -113,21 +128,11 @@ async fn gpu_real_load_chat_and_cached_tokens() {
     // Real cached_tokens: a long shared prefix, twice. The second response
     // must report prefix-cache hits.
     let long_prompt = "Repeat this carefully. ".repeat(64);
-    let first: Value = client
-        .post(format!("{}/v1/chat/completions", server.url()))
-        .json(&chat_request(&tag, &long_prompt))
-        .timeout(Duration::from_secs(120))
-        .send().await.unwrap()
-        .json().await.unwrap();
+    let first = chat(&muna, &tag, &long_prompt).await;
     assert!(first["usage"]["prompt_tokens"].as_i64().unwrap() > 0);
     // Zero-fill guarantee: garbage but valid output, no NaN poisoning.
     assert!(first["choices"][0]["message"]["content"].is_string());
-    let second: Value = client
-        .post(format!("{}/v1/chat/completions", server.url()))
-        .json(&chat_request(&tag, &long_prompt))
-        .timeout(Duration::from_secs(120))
-        .send().await.unwrap()
-        .json().await.unwrap();
+    let second = chat(&muna, &tag, &long_prompt).await;
     let cached = second["usage"]["prompt_tokens_details"]["cached_tokens"]
         .as_i64()
         .expect("second response must carry cached_tokens");
@@ -141,17 +146,13 @@ async fn gpu_concurrent_chats_overlap() {
     let stub = StubControlPlane::start().await;
     let server = ServerGuard::spawn(&stub).await;
     let client = reqwest::Client::new();
+    let muna = inference_client(&server);
     stub.set_process_residency(&tag, &gate_devices());
     wait_until_ready(&client, &server.url(), &tag).await;
 
     // Baseline single-request latency.
     let single_start = std::time::Instant::now();
-    let response = client
-        .post(format!("{}/v1/chat/completions", server.url()))
-        .json(&chat_request(&tag, "warmup prompt"))
-        .timeout(Duration::from_secs(120))
-        .send().await.unwrap();
-    assert_eq!(response.status(), 200);
+    chat(&muna, &tag, "warmup prompt").await;
     let single = single_start.elapsed();
 
     // N concurrent chats: engine-internal continuous batching must overlap
@@ -160,19 +161,14 @@ async fn gpu_concurrent_chats_overlap() {
     let concurrent_start = std::time::Instant::now();
     let mut handles = Vec::new();
     for i in 0..N {
-        let client = client.clone();
-        let url = format!("{}/v1/chat/completions", server.url());
-        let body = chat_request(&tag, &format!("prompt number {i}"));
+        let muna = muna.clone();
+        let tag = tag.clone();
         handles.push(tokio::spawn(async move {
-            client.post(&url)
-                .json(&body)
-                .timeout(Duration::from_secs(300))
-                .send().await.unwrap()
-                .status()
+            chat(&muna, &tag, &format!("prompt number {i}")).await
         }));
     }
     for handle in handles {
-        assert_eq!(handle.await.unwrap(), 200);
+        handle.await.unwrap();
     }
     let concurrent = concurrent_start.elapsed();
     assert!(
@@ -196,18 +192,14 @@ async fn gpu_kv_relay_snapshot_delta_need_snapshot_unload() {
     let stub = StubControlPlane::start().await;
     let server = ServerGuard::spawn(&stub).await;
     let client = reqwest::Client::new();
+    let muna = inference_client(&server);
     // v2: no callback registration -- the relay derives the well-known
     // `/v1/kv/events` ingest route from the control-plane URL by itself.
     stub.set_process_residency(&tag, &gate_devices());
     wait_until_ready(&client, &server.url(), &tag).await;
 
     // Drive KV traffic so the engine admits blocks.
-    let response = client
-        .post(format!("{}/v1/chat/completions", server.url()))
-        .json(&chat_request(&tag, &"KV relay test prompt. ".repeat(32)))
-        .timeout(Duration::from_secs(120))
-        .send().await.unwrap();
-    assert_eq!(response.status(), 200);
+    chat(&muna, &tag, &"KV relay test prompt. ".repeat(32)).await;
 
     // First batch for this model begins with a snapshot.
     wait_for(Duration::from_secs(60), || async {
@@ -241,12 +233,7 @@ async fn gpu_kv_relay_snapshot_delta_need_snapshot_unload() {
     // Armed need_snapshot forces a fresh snapshot on a later batch.
     let batches_before = stub.state().kv_batches.len();
     stub.state().need_snapshot_armed = true;
-    let response = client
-        .post(format!("{}/v1/chat/completions", server.url()))
-        .json(&chat_request(&tag, &"Another prompt for more KV events. ".repeat(32)))
-        .timeout(Duration::from_secs(120))
-        .send().await.unwrap();
-    assert_eq!(response.status(), 200);
+    chat(&muna, &tag, &"Another prompt for more KV events. ".repeat(32)).await;
     wait_for(Duration::from_secs(60), || async {
         stub.state().kv_batches[batches_before..]
             .iter()
@@ -273,11 +260,10 @@ async fn gpu_kv_relay_snapshot_delta_need_snapshot_unload() {
     })
     .await
     .expect("unload never completed");
-    let models: Value = client
+    let models = client
         .get(format!("{}/v1/models", server.url()))
-        .send().await.unwrap().json().await.unwrap();
-    assert!(!models["data"].as_array().unwrap().iter().any(|model| model["id"] == json!(tag)),
-        "unloaded model must disappear from /v1/models");
+        .send().await.unwrap();
+    assert_eq!(models.status(), 404, "managed model discovery uses /status");
     let count_after_unload = stub.state().kv_batches.len();
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(

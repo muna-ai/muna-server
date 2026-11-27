@@ -11,6 +11,7 @@ travels in each request's `model` field, so one server can serve any predictor o
 | Method | Path                   | Description                                              |
 | ------ | ---------------------- | -------------------------------------------------------- |
 | `GET`  |  `/health`             | Health check (`{"status":"ok"}`).                        |
+| `POST` | `/v1/predictions`      | Muna remote predictions (JSON or SSE stream).            |
 | `GET`  | `/v1/models`           | Lists models this process has loaded so far.             |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat completion (JSON or SSE stream).  |
 | `POST` | `/v1/images/generations` | OpenAI-compatible image generation. |
@@ -19,10 +20,6 @@ travels in each request's `model` field, so one server can serve any predictor o
 | `POST` | `/v1/audio/transcriptions` | OpenAI-compatible audio transcriptions. |
 
 ## Start the Server
-
-Managed fleet nodes receive explicit device assignments through process residency
-goals before loading. Standalone servers retain eager/on-demand loading with
-their configured engine defaults.
 
 ```bash
 # Provide your Muna access key (or put it in a .env file)
@@ -35,7 +32,7 @@ cargo run
 cargo run -- --models @huggingface/smollm2-360m
 ```
 
-## Creating Chat Completions
+## Create a Chat Completion
 
 The `model` field is the Muna predictor tag — e.g. `@huggingface/smollm2-360m`.
 

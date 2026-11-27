@@ -1,6 +1,6 @@
 [package]
 name = "muna-server"
-version = "0.0.37"
+version = "0.0.38"
 edition = "2021"
 description = "OpenAI- and Anthropic-compatible Muna inference server."
 license = "Apache-2.0"
@@ -16,6 +16,7 @@ async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["json", "multipart"] }
 base64 = "0.22.1"
 bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 corby = { git = "https://github.com/muna-ai/libcorby.git", branch = "main" }
 dashmap = "6"
@@ -33,6 +34,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "ipc-transport", "tcp-transport"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

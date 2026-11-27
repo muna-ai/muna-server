@@ -79,6 +79,10 @@ pub(crate) struct NodeStatus {
     /// Warmth tier and counters for every known model, including models
     /// cached on disk with no engine loaded.
     pub models: Vec<ModelStatus>,
+    /// Some(empty) advertises explicit completion reporting. Older nodes omit
+    /// this field and the plane continues inferring their load transitions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_events: Option<Vec<super::events::ModelLoadEvent>>,
 }
 
 
@@ -287,6 +291,9 @@ pub(crate) struct LeasePolicy {
 /// the control-plane URL it already has (well-known `/v1/kv/events` route).
 #[derive(Deserialize, Clone, Default)]
 pub(crate) struct HeartbeatResponse {
+    /// IDs committed by the control plane, never merely received.
+    #[serde(default)]
+    pub event_acks: Vec<String>,
     /// Echo the snapshot version; superseded replies must never apply goals.
     #[serde(flatten)]
     pub heartbeat: HeartbeatVersion,
@@ -337,6 +344,7 @@ impl NodeStatus {
         let disk = state.platform.disk_space_mb(&state.cache_path);
         NodeStatus {
             heartbeat: HeartbeatVersion::default(),
+            load_events: state.load_events.as_ref().map(|events| events.batch()),
             node_id: state.mode.node().map(|n| n.node_id.clone()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_s: state.start_time.elapsed().as_secs(),

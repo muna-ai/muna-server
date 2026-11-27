@@ -224,6 +224,7 @@ struct RegistryInner {
     last_load_secs: AtomicU64,
     /// Poked on every lifecycle write so the heartbeat reports it at once.
     notifications: Arc<NotificationCenter>,
+    load_events: Option<Arc<crate::control::events::LoadEvents>>,
     /// Device memory source for the load-time VRAM delta.
     platform: Arc<dyn Platform>,
     lease: Option<Arc<LeaseSupervisor>>,
@@ -300,11 +301,17 @@ impl ModelRegistry {
                 pinned,
                 last_load_secs: AtomicU64::new(DEFAULT_LOAD_SECS),
                 notifications,
+                load_events: None,
                 platform,
                 lease: None,
                 policies: Arc::new(DashMap::new())
             })
         }
+    }
+
+    pub(crate) fn with_load_events(mut self, events: Option<Arc<crate::control::events::LoadEvents>>) -> Self {
+        Arc::get_mut(&mut self.inner).expect("registry already shared").load_events = events;
+        self
     }
 
     /// Get the model's `Ready` handle, warming it if necessary.
@@ -568,6 +575,7 @@ impl ModelRegistry {
             let vram_before = memory_used_mb();
             let stats = Arc::new(ModelStats::new());
             let outcome = loading.await;
+            let completed = std::time::SystemTime::now().into();
             let vram_after = memory_used_mb();
             if let (Some(before), Some(after)) = (vram_before, vram_after) {
                 if after > before {
@@ -579,6 +587,27 @@ impl ModelRegistry {
             let mut loaded_muna: Option<Arc<Muna>> = None;
             let state = match outcome {
                 Ok(Loaded { signature, muna, download, load, build }) => {
+                    if let Some(events) = &inner.load_events {
+                        let gpus = inner.platform.devices();
+                        events.record(crate::control::events::ModelLoadEvent {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            tag: tag.clone(),
+                            created: completed,
+                            duration_ms: load.as_secs_f64() * 1000.0,
+                            download_ms: download.as_secs_f64() * 1000.0,
+                            server_version: env!("CARGO_PKG_VERSION").to_string(),
+                            device_ids: devices.clone(),
+                            build: build.clone(),
+                            vram_mb: stats.vram_mb(),
+                            gpu_family: gpus.iter().find_map(|gpu| gpu.family)
+                                .and_then(|family| serde_json::to_value(family).ok())
+                                .and_then(|value| value.as_str().map(str::to_owned)),
+                            gpu_name: gpus.first().map(|gpu| gpu.name.clone()),
+                            concurrent_loads: inner.models.iter().filter(|entry| {
+                                entry.key() != &tag && matches!(entry.value().state, ModelState::Loading { .. })
+                            }).count() as u32,
+                        });
+                    }
                     stats.record_download_time(download);
                     stats.record_load_time(load);
                     // Retry-After covers the whole wait a caller sees,
@@ -801,6 +830,51 @@ mod tests {
             notifications,
             Arc::new(crate::platform::NullPlatform)
         )
+    }
+
+    #[tokio::test]
+    async fn fast_loads_and_same_build_reloads_each_emit_a_completion() {
+        let path = std::env::temp_dir().join(format!("muna-registry-events-{}", uuid::Uuid::new_v4()));
+        let notifications = Arc::new(NotificationCenter::default());
+        let events = Arc::new(crate::control::events::LoadEvents::open(&path, "node", notifications.clone()).unwrap());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let writer = tokio::spawn({
+            let events = events.clone();
+            let shutdown = shutdown.clone();
+            async move { events.run(&shutdown).await }
+        });
+        let registry = registry_notifying(Arc::default(), false, Duration::from_micros(125), None, notifications.clone())
+            .with_load_events(Some(events.clone()));
+        registry.ensure_ready("@test/fast").await.unwrap();
+        registry.unload("@test/fast").await;
+        // The first fact survives after its model has disappeared entirely.
+        assert!(registry.snapshot().is_empty());
+        registry.ensure_ready("@test/fast").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while events.batch().len() != 2 { notifications.status.notified().await; }
+        }).await.unwrap();
+        let batch = events.batch();
+        assert_ne!(batch[0].id, batch[1].id);
+        assert_eq!(batch[0].duration_ms, 0.125);
+        assert_eq!(batch[1].duration_ms, 0.125);
+        registry.unload("@test/fast").await;
+        shutdown.cancel();
+        writer.await.unwrap();
+        assert_eq!(crate::control::events::LoadEvents::open(&path, "node", Arc::default()).unwrap().batch().len(), 2);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_load_does_not_emit_a_successful_completion() {
+        let path = std::env::temp_dir().join(format!("muna-registry-events-{}", uuid::Uuid::new_v4()));
+        let events = Arc::new(crate::control::events::LoadEvents::open(&path, "node", Arc::default()).unwrap());
+        let registry = registry_with(Arc::default(), true, Duration::ZERO).with_load_events(Some(events.clone()));
+        assert!(registry.ensure_ready("@test/failed").await.is_err());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel();
+        events.clone().run(&shutdown).await;
+        assert!(events.batch().is_empty());
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[tokio::test]
