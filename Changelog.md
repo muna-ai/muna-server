@@ -1,3 +1,6 @@
+## 0.0.39
+*INCOMPLETE*
+
 ## 0.0.38
 + Fixed cold start telemetry events not being reported for models that cold start very quickly.
 + Disabled OpenAI and Anthropic inference endpoints when running in standalone mode.
